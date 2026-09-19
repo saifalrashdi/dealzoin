@@ -49,6 +49,25 @@ CREATE TABLE IF NOT EXISTS deals (
   status TEXT NOT NULL DEFAULT 'pending',   -- pending | approved | rejected
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );`);
+db.exec(`
+CREATE TABLE IF NOT EXISTS posts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  company_id INTEGER NOT NULL REFERENCES companies(id),
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS likes (
+  post_id INTEGER NOT NULL REFERENCES posts(id),
+  company_id INTEGER NOT NULL REFERENCES companies(id),
+  PRIMARY KEY (post_id, company_id)
+);
+CREATE TABLE IF NOT EXISTS comments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  post_id INTEGER NOT NULL REFERENCES posts(id),
+  company_id INTEGER NOT NULL REFERENCES companies(id),
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);`);
 
 /* ---------- security helpers ---------- */
 function hashPassword(password) {
@@ -161,11 +180,20 @@ td{padding:10px 6px;border-top:1px solid #223155;vertical-align:middle}
 .kpi .v{font-size:26px;font-weight:800;color:#fff}
 .kpi .l{font-size:12px;color:#94a3b8;font-weight:600}
 .center{max-width:440px;margin:8vh auto 0}
+.post{border:1px solid #243152;border-radius:12px;padding:16px;margin-bottom:12px;background:#111a2e}
+.post .who{font-weight:700;color:#fff}
+.post .body{margin:10px 0;font-size:14.5px;line-height:1.55;white-space:pre-wrap}
+.like-on{background:#831843;border-color:#be185d;color:#fff}
+.cmt{border-top:1px solid #1e2b47;padding:8px 0;font-size:13px;color:#94a3b8}
+.cmt b{color:#cbd5e1}
+.deal-card{border:1px solid #3b2f63;border-left:4px solid #7c3aed;border-radius:10px;padding:12px 14px;margin-top:10px}
+.cform{display:flex;gap:8px;margin-top:10px}
+.cform input{flex:1}
 </style></head><body><div class="wrap">${body}</div></body></html>`;
 }
 function navFor(session) {
   if (session.adminId) return `<div class="nav"><div class="logo" style="width:30px;height:30px;font-size:16px">D</div><b style="color:#fff">Owner dashboard</b><span style="flex:1"></span><a href="/admin">Approvals</a><a href="/admin/password">Change password</a><a href="/signout">Sign out</a></div>`;
-  if (session.companyId) return `<div class="nav"><div class="logo" style="width:30px;height:30px;font-size:16px">D</div><b style="color:#fff">Dealzoin</b><span style="flex:1"></span><a href="/dashboard">My deals</a><a href="/password">Change password</a><a href="/signout">Sign out</a></div>`;
+  if (session.companyId) return `<div class="nav"><div class="logo" style="width:30px;height:30px;font-size:16px">D</div><b style="color:#fff">Dealzoin</b><span style="flex:1"></span><a href="/feed">Timeline</a><a href="/dashboard">My deals</a><a href="/password">Change password</a><a href="/signout">Sign out</a></div>`;
   return '';
 }
 function banner(status) {
@@ -177,7 +205,7 @@ const flashBox = (req) => req.session.flash ? `<div class="flash">${esc(req.sess
 /* ---------- AUTH PAGES (first page = sign in / sign up) ---------- */
 app.get('/', (req, res) => {
   if (req.session.adminId) return res.redirect('/admin');
-  if (req.session.companyId) return res.redirect('/dashboard');
+  if (req.session.companyId) return res.redirect('/feed');
   res.redirect('/signin');
 });
 
@@ -211,7 +239,7 @@ app.post('/signin', (req, res) => {
   }
   const company = db.prepare('SELECT * FROM companies WHERE email = ?').get(email);
   if (company && verifyPassword(password, company.salt, company.pass_hash)) {
-    req.session.regenerate(() => { req.session.companyId = company.id; res.redirect('/dashboard'); });
+    req.session.regenerate(() => { req.session.companyId = company.id; res.redirect('/feed'); });
     return;
   }
   recordFail(key);
@@ -290,6 +318,75 @@ app.post('/deals', requireApprovedCompany, (req, res) => {
   res.redirect('/dashboard');
 });
 
+/* ---------- TIMELINE / FEED ---------- */
+app.get('/feed', requireApprovedCompany, (req, res) => {
+  const posts = db.prepare(`SELECT p.*, c.name AS company, c.industry FROM posts p JOIN companies c ON c.id=p.company_id ORDER BY p.id DESC LIMIT 50`).all();
+  const deals = db.prepare(`SELECT d.*, c.name AS company FROM deals d JOIN companies c ON c.id=d.company_id WHERE d.status='approved' ORDER BY d.id DESC LIMIT 20`).all();
+  const comments = db.prepare(`SELECT cm.*, c.name AS company FROM comments cm JOIN companies c ON c.id=cm.company_id ORDER BY cm.id`).all();
+  const myLikes = new Set(db.prepare('SELECT post_id FROM likes WHERE company_id=?').all(req.company.id).map(r => r.post_id));
+  const likeCounts = {};
+  db.prepare('SELECT post_id, COUNT(*) n FROM likes GROUP BY post_id').all().forEach(r => likeCounts[r.post_id] = r.n);
+  const commentsByPost = {};
+  comments.forEach(cm => { (commentsByPost[cm.post_id] = commentsByPost[cm.post_id] || []).push(cm); });
+
+  const dealHtml = deals.length ? deals.map(d => `<div class="deal-card">
+      <div class="row" style="justify-content:space-between"><b style="color:#fff">\u25C8 ${esc(d.title)}</b><span class="pill ok">$${Number(d.value_usd).toLocaleString()}</span></div>
+      <p class="mut" style="margin-top:6px">${esc(d.terms)}</p>
+      <p class="mut" style="font-size:12px;margin-top:4px">by <b style="color:#cbd5e1">${esc(d.company)}</b> \u00B7 ${d.created_at}</p>
+    </div>`).join('') : '<p class="mut">No approved deals yet — approved deals from all companies appear here.</p>';
+
+  const postHtml = posts.length ? posts.map(p => {
+    const liked = myLikes.has(p.id);
+    const cms = (commentsByPost[p.id] || []).map(cm => `<div class="cmt"><b>${esc(cm.company)}</b> \u2014 ${esc(cm.body)}</div>`).join('');
+    return `<div class="post">
+      <div><span class="who">${esc(p.company)}</span> <span class="mut" style="font-size:12px">\u00B7 ${esc(p.industry)} \u00B7 ${p.created_at}</span></div>
+      <div class="body">${esc(p.body)}</div>
+      <form method="POST" action="/feed/like/${p.id}" style="display:inline">
+        <button class="btn sm ghost ${liked ? 'like-on' : ''}">\u2764 ${likeCounts[p.id] || 0}</button>
+      </form>
+      ${cms}
+      <form class="cform" method="POST" action="/feed/comment/${p.id}">
+        <input name="body" placeholder="Write a comment..." maxlength="300" required>
+        <button class="btn sm">Comment</button>
+      </form>
+    </div>`;
+  }).join('') : '<p class="mut">No posts yet — be the first to share an update.</p>';
+
+  res.send(layout('Timeline', navFor(req.session) + flashBox(req) + `
+    <div class="card">
+      <h2>Timeline</h2><p class="mut">Share updates with the network. Approved deals appear below the composer.</p>
+      <form method="POST" action="/feed/post">
+        <textarea name="body" rows="3" maxlength="600" placeholder="Share an update from ${esc(req.company.name)}..." required></textarea>
+        <button class="btn">Post</button>
+      </form>
+    </div>
+    <div class="card">
+      <h2>Open deals</h2>
+      ${dealHtml}
+    </div>
+    ${postHtml}`));
+});
+
+app.post('/feed/post', requireApprovedCompany, (req, res) => {
+  const body = String(req.body.body || '').trim();
+  if (body) db.prepare('INSERT INTO posts (company_id, body) VALUES (?,?)').run(req.company.id, body);
+  res.redirect('/feed');
+});
+
+app.post('/feed/like/:id', requireApprovedCompany, (req, res) => {
+  const postId = Number(req.params.id);
+  const existing = db.prepare('SELECT 1 FROM likes WHERE post_id=? AND company_id=?').get(postId, req.company.id);
+  if (existing) db.prepare('DELETE FROM likes WHERE post_id=? AND company_id=?').run(postId, req.company.id);
+  else db.prepare('INSERT INTO likes (post_id, company_id) VALUES (?,?)').run(postId, req.company.id);
+  res.redirect('/feed');
+});
+
+app.post('/feed/comment/:id', requireApprovedCompany, (req, res) => {
+  const body = String(req.body.body || '').trim();
+  if (body) db.prepare('INSERT INTO comments (post_id, company_id, body) VALUES (?,?,?)').run(Number(req.params.id), req.company.id, body);
+  res.redirect('/feed');
+});
+
 /* ---------- ADMIN (OWNER) AREA ---------- */
 app.get('/admin', requireAdmin, (req, res) => {
   const pendingCos = db.prepare("SELECT * FROM companies WHERE status='pending' ORDER BY id").all();
@@ -358,7 +455,7 @@ app.post('/admin/company/:id/reject', requireAdmin, (req, res) => {
 });
 app.post('/admin/deal/:id/approve', requireAdmin, (req, res) => {
   db.prepare("UPDATE deals SET status='approved' WHERE id=? AND status='pending'").run(req.params.id);
-  req.session.flash = 'Contract approved — it now appears in the marketplace.';
+  req.session.flash = 'Contract approved — it now appears in the company timeline (/feed).';
   res.redirect('/admin');
 });
 app.post('/admin/deal/:id/reject', requireAdmin, (req, res) => {
