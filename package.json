@@ -1,0 +1,13 @@
+{
+  "name": "dealzoin",
+  "version": "1.0.0",
+  "description": "Dealzoin - B2B company network with admin-approved registration and contracts",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "express": "^4.19.2",
+    "express-session": "^1.18.0",
+    "better-sqlite3": "^11.3.0"
+  }
+}
