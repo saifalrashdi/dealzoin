@@ -153,6 +153,25 @@ CREATE TABLE IF NOT EXISTS media (
   data       BLOB NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS counter_offers (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  deal_id         INTEGER NOT NULL,
+  from_company_id INTEGER NOT NULL,
+  new_value       TEXT DEFAULT '',
+  new_currency    TEXT DEFAULT 'USD',
+  new_terms       TEXT DEFAULT '',
+  status          TEXT NOT NULL DEFAULT 'pending',     -- pending | accepted | refused
+  created_at      TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS notifications (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  company_id INTEGER NOT NULL,
+  type       TEXT NOT NULL,
+  text       TEXT NOT NULL,
+  link       TEXT DEFAULT '',
+  is_read    INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
 `);
 
 // Graceful upgrades for databases created before media support existed.
@@ -169,6 +188,45 @@ try { db.exec('ALTER TABLE companies ADD COLUMN avatar_media_id INTEGER'); } cat
 try { db.exec('ALTER TABLE companies ADD COLUMN header_media_id INTEGER'); } catch (e) { /* column already exists */ }
 try { db.exec("ALTER TABLE companies ADD COLUMN bio TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
 try { db.exec("ALTER TABLE companies ADD COLUMN about TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+// v4 upgrades: reputation scale, Research Agent intel, OTP payloads for signing/counter flows.
+try { db.exec('ALTER TABLE companies ADD COLUMN reputation INTEGER DEFAULT 0'); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE companies ADD COLUMN market_value TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE companies ADD COLUMN field TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE companies ADD COLUMN employees TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE companies ADD COLUMN research_source TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE verification_codes ADD COLUMN payload TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+
+// ============================= PLATFORM COMMISSION =============================
+const PLATFORM_FEE_PCT = 1; // transparent 1% Dealzoin commission on every deal
+/** Parse a numeric amount out of a free-text deal value ("50,000 / year" -> 50000). NaN if none. */
+function parseDealValue(value) {
+  const m = String(value || '').replace(/[,\s]/g, '').match(/\d+(\.\d+)?/);
+  return m ? parseFloat(m[0]) : NaN;
+}
+function fmtAmount(n) {
+  const r = Math.round(n * 100) / 100;
+  return (r % 1 === 0 ? r.toString() : r.toFixed(2)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+/** "Platform fee: 1% (100 EUR) — transparent Dealzoin commission" line for deal surfaces. */
+function feeLineHtml(deal, style) {
+  const cur = deal.currency || 'USD';
+  const num = parseDealValue(deal.value);
+  const amount = isFinite(num) && num > 0
+    ? `${fmtAmount(num * PLATFORM_FEE_PCT / 100)} ${esc(cur)}`
+    : `1% of deal value`;
+  const inner = isFinite(num) && num > 0
+    ? `Platform fee: ${PLATFORM_FEE_PCT}% (${amount}) — transparent Dealzoin commission`
+    : `Platform fee: ${PLATFORM_FEE_PCT}% of deal value — transparent Dealzoin commission`;
+  return `<div class="muted" style="font-size:12px;${style || ''}">🏦 ${inner}</div>`;
+}
+/** Plain-text fee line for the downloadable contract document. */
+function feeLineText(deal) {
+  const cur = deal.currency || 'USD';
+  const num = parseDealValue(deal.value);
+  return isFinite(num) && num > 0
+    ? `Platform fee: ${PLATFORM_FEE_PCT}% (${fmtAmount(num * PLATFORM_FEE_PCT / 100)} ${cur}) — transparent Dealzoin commission`
+    : `Platform fee: ${PLATFORM_FEE_PCT}% of deal value — transparent Dealzoin commission`;
+}
 
 // ============================= MEDIA UPLOADS (MULTER) =============================
 // Images: jpg/jpeg/png/gif/webp up to 5 MB. Videos: mp4/webm up to 25 MB.
@@ -314,6 +372,36 @@ function audit(agent, action, result, details) {
   db.prepare('INSERT INTO agent_audit (agent, action, result, details, created_at) VALUES (?,?,?,?,?)')
     .run(agent, action, result, String(details || '').slice(0, 500), now());
 }
+
+// ============================= NOTIFICATIONS =============================
+/** Insert an in-app notification for a company (bell icon + /notifications page). */
+function notify(companyId, type, text, link) {
+  if (!companyId) return;
+  db.prepare('INSERT INTO notifications (company_id, type, text, link, is_read, created_at) VALUES (?,?,?,?,0,?)')
+    .run(companyId, String(type || 'info').slice(0, 40), String(text || '').slice(0, 500), String(link || '').slice(0, 200), now());
+}
+function unreadNotifications(companyId) {
+  return db.prepare('SELECT COUNT(*) AS n FROM notifications WHERE company_id = ? AND is_read = 0').get(companyId).n;
+}
+
+// ============================= REPUTATION STARS =============================
+/** Gold star rating for a reputation score (1–5); 0/NULL renders muted "Unrated". */
+function starsHtml(rep, small) {
+  const r = parseInt(rep, 10) || 0;
+  const size = small ? 'font-size:12px;' : 'font-size:14px;';
+  if (r < 1 || r > 5) return `<span class="muted" style="${size}">Unrated</span>`;
+  const stars = '★'.repeat(r) + '<span style="opacity:0.35">' + '★'.repeat(5 - r) + '</span>';
+  return `<span style="color:var(--gold);${size};letter-spacing:1px" title="Reputation ${r}/5" aria-label="Reputation ${r} out of 5 stars">${stars}</span>`;
+}
+/** Reputation score for a company id (0 = unrated). */
+function companyReputation(companyId) {
+  const row = db.prepare('SELECT reputation FROM companies WHERE id = ?').get(companyId);
+  return row ? (row.reputation || 0) : 0;
+}
+
+// ----- Contract state machine: pending_owner -> pending_admin -> finalized (row deleted) -----
+const LIVE_CONTRACT_STATUSES = ['pending', 'pending_owner', 'pending_admin']; // 'pending' = legacy pre-v4 rows
+function isLiveContract(ct) { return !!ct && LIVE_CONTRACT_STATUSES.includes(ct.status); }
 
 // ============================= SECURITY AGENTS =============================
 // --- ONBOARDING AGENT data ---
@@ -692,6 +780,29 @@ const CSS = `
   .avatar-lg, .avatar-lg.avatar-img { width: 96px; height: 96px; border-radius: 24px; font-size: 40px; border: 1px solid var(--border-gold); }
   .profile-bio { margin-top: 8px; font-size: 15px; color: var(--ink-primary); }
   .profile-about { margin-top: 10px; white-space: pre-wrap; }
+
+  /* Two-stage contract states */
+  .badge-pending_owner, .badge-pending_admin { background: var(--warn-bg); color: var(--warning); border-color: var(--warn-badge-border); }
+  .badge-accepted { background: var(--ok-badge-bg); color: var(--success); border-color: var(--ok-badge-border); }
+  .badge-refused { background: var(--err-bg); color: var(--danger); border-color: var(--err-badge-border); }
+
+  /* Signing room tabs (Sign | Counter offer) */
+  .tab-row { display: flex; gap: 8px; margin: 14px 0 16px; }
+  .tab-row a { flex: 1; text-align: center; padding: 0.65rem 1rem; border-radius: 10px; border: 1px solid var(--border-soft); color: var(--ink-muted); font: 600 0.875rem var(--font-body); background: var(--bg-elevated); }
+  .tab-row a:hover { color: var(--ink-primary); border-color: var(--border-gold); }
+  .tab-row a.tab-active { color: var(--gold); background: var(--gold-glow); border-color: var(--border-gold); }
+
+  /* Company intelligence card (Research Agent) */
+  .intel-card { border: 1px solid var(--ok-border); background: linear-gradient(160deg, var(--ok-badge-bg) 0%, var(--surface-card) 55%); }
+  .intel-card .kicker { color: var(--mint); }
+  .intel-row { display: flex; justify-content: space-between; gap: 12px; padding: 7px 0; border-bottom: 1px solid var(--border-soft); font-size: 14px; }
+  .intel-row:last-of-type { border-bottom: none; }
+  .intel-row .k { color: var(--ink-muted); font-weight: 600; }
+  .intel-src { font-size: 12px; margin-top: 10px; }
+
+  /* Reputation star selector (admin) */
+  .rep-form { display: inline-flex; gap: 6px; align-items: center; }
+  .rep-form select { width: auto; margin-bottom: 0; padding: 4px 8px; font-size: 13px; }
 `;
 
 /** Inline SVG icons for the company nav (no emoji in the nav bar). */
@@ -701,10 +812,11 @@ const NAV_ICONS = {
   search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m20 20-4.8-4.8"/></svg>',
   profile: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="7.5" r="3.5"/><path d="M3.5 20v-1.5a5.5 5.5 0 0 1 5.5-5.5h0a5.5 5.5 0 0 1 5.5 5.5V20"/><path d="M16 4h5v7h-5z"/><path d="M17.5 7.5h1"/></svg>',
   dashboard: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 21h18"/><path d="M6 21v-7M11 21V9M16 21v-11M21 21V5"/></svg>',
-  plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>'
+  plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
+  bell: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8.5a6 6 0 0 0-12 0c0 6.5-2.5 7.5-2.5 7.5h17S18 15 18 8.5z"/><path d="M10 20a2.2 2.2 0 0 0 4 0"/></svg>'
 };
 function navIcon(key, href, label, active, badge) {
-  const badgeHtml = badge > 0 ? `<span class="nav-badge" aria-label="${badge} unread messages">${badge > 99 ? '99+' : badge}</span>` : '';
+  const badgeHtml = badge > 0 ? `<span class="nav-badge" aria-label="${badge} unread">${badge > 99 ? '99+' : badge}</span>` : '';
   return `<a class="nav-ic${active === key ? ' active' : ''}" href="${href}" title="${label}" aria-label="${label}">${NAV_ICONS[key]}${badgeHtml}</a>`;
 }
 
@@ -723,6 +835,7 @@ const THEME_TOGGLE_BTN = '<button class="nav-ic theme-toggle" id="theme-toggle" 
 /** Render the full HTML page shell. */
 function page(title, body, user, msg, err, active, headExtra) {
   const unread = (user && !user.isAdmin) ? totalUnread(user.id) : 0;
+  const notifUnread = (user && !user.isAdmin) ? unreadNotifications(user.id) : 0;
   const navLinks = user && user.isAdmin
     ? `${THEME_TOGGLE_BTN}
        <a class="navlink" href="/admin">Dashboard</a>
@@ -731,6 +844,7 @@ function page(title, body, user, msg, err, active, headExtra) {
     ? `<span class="nav-icons">
          ${navIcon('home', '/home', 'Home', active)}
          ${navIcon('chats', '/chats', 'Chats', active, unread)}
+         ${navIcon('bell', '/notifications', 'Notifications', active, notifUnread)}
          ${navIcon('search', '/search', 'Search', active)}
          ${navIcon('profile', '/profile', 'Profile', active)}
          ${navIcon('dashboard', '/dashboard', 'Dashboard', active)}
@@ -784,7 +898,7 @@ ${headExtra || ''}
 }
 
 function statusBadge(status) {
-  return `<span class="badge badge-${esc(status)}">${esc(status)}</span>`;
+  return `<span class="badge badge-${esc(status)}">${esc(String(status).replace(/_/g, ' '))}</span>`;
 }
 function resultBadge(result) {
   return `<span class="badge badge-${esc(result)}">${esc(result)}</span>`;
@@ -1106,12 +1220,12 @@ function feedCard(item, user, names) {
     head = `${avatarHtml(ownerName, companyAvatarMediaId(item.company_id))} <a href="/company/${item.company_id}"><b>${esc(ownerName)}</b></a> <span class="muted">posted</span>`;
     bodyHtml = `<p style="margin-top:8px;white-space:pre-wrap">${esc(item.body)}</p>`;
   } else if (item.kind === 'deal') {
-    head = `${avatarHtml(ownerName, companyAvatarMediaId(item.company_id))} <a href="/company/${item.company_id}"><b>${esc(ownerName)}</b></a> <span class="muted">posted a deal</span>`;
+    head = `${avatarHtml(ownerName, companyAvatarMediaId(item.company_id))} <a href="/company/${item.company_id}"><b>${esc(ownerName)}</b></a> ${starsHtml(companyReputation(item.company_id), true)} <span class="muted">posted a deal</span>`;
     bodyHtml = `<h3 style="margin-top:8px"><a href="/deal/${item.ref_id}">${esc(item.title)}</a></h3>
       <p style="margin-top:6px;white-space:pre-wrap">${esc(item.body)}</p>`;
   } else { // repost
     const origName = names.get(item.orig_company) || 'Unknown';
-    head = `🔁 Reposted from <a href="/company/${item.orig_company}"><b>${esc(origName)}</b></a>
+    head = `🔁 Reposted from <a href="/company/${item.orig_company}"><b>${esc(origName)}</b></a> ${starsHtml(companyReputation(item.orig_company), true)}
             by <a href="/company/${item.company_id}"><b>${esc(ownerName)}</b></a>`;
     bodyHtml = `<h3 style="margin-top:8px"><a href="/deal/${item.repost_of}">${esc(item.title)}</a></h3>
       <p style="margin-top:6px;white-space:pre-wrap">${esc(item.body)}</p>`;
@@ -1121,8 +1235,9 @@ function feedCard(item, user, names) {
   let headRight;
   if (item.kind !== 'post') {
     const valLine = item.value ? `<div class="deal-value">💰 ${esc(item.value)} ${esc(item.currency || 'USD')}</div>` : '';
+    const feeLine = item.value ? feeLineHtml(item) : '';
     const tpLine = item.time_period ? `<span class="muted">⏳ ${esc(item.time_period)}</span>` : '';
-    headRight = `<div style="text-align:right">${valLine}${tpLine}${tpLine ? '<br>' : ''}<span class="muted">${timeStamp}</span></div>`;
+    headRight = `<div style="text-align:right">${valLine}${feeLine}${tpLine}${tpLine ? '<br>' : ''}<span class="muted">${timeStamp}</span></div>`;
   } else {
     headRight = `<span class="muted">${timeStamp}</span>`;
   }
@@ -1358,15 +1473,30 @@ app.get('/company/:id', requireCompany, (req, res) => {
     ? deals.map(d => feedCard(dealFeedItem(d), req.user, names)).join('')
     : '<div class="card"><p class="muted">No deals yet.</p></div>';
 
+  // Research Agent intelligence card — shown only when at least one intel field is set.
+  const hasIntel = !!(c.market_value || c.field || c.employees);
+  const intelCard = hasIntel ? `
+  <div class="card intel-card">
+    <div class="kicker">Researched by Dealzoin Research Agent</div>
+    <h3 style="margin:6px 0 8px">📊 Company intelligence</h3>
+    ${c.market_value ? `<div class="intel-row"><span class="k">Market value</span><span>${esc(c.market_value)}</span></div>` : ''}
+    ${c.field ? `<div class="intel-row"><span class="k">Field</span><span style="text-align:right">${esc(c.field)}</span></div>` : ''}
+    ${c.employees ? `<div class="intel-row"><span class="k">Employees</span><span>${esc(c.employees)}</span></div>` : ''}
+    ${c.research_source ? `<div class="muted intel-src">Source: <a href="${esc(c.research_source)}" rel="noopener noreferrer nofollow">${esc(c.research_source)}</a></div>` : ''}
+    <div class="muted intel-src">Data provided by platform admin &amp; public sources.</div>
+  </div>` : '';
+
   const body = `
   <div class="card">
     ${c.header_media_id ? `<img class="profile-cover" src="/media/${c.header_media_id}" alt="${esc(c.name)} header image" loading="lazy">` : ''}
     <div class="feed-head"><h2>${avatarHtml(c.name, c.avatar_media_id, 'avatar-lg')}${esc(c.name)}</h2>${followButton(req.user, c.id)}</div>
+    <p style="margin-top:6px">${starsHtml(c.reputation)}</p>
     ${c.bio ? `<p class="profile-bio">${esc(c.bio)}</p>` : ''}
     <p class="muted">${fc.followers} followers · ${fc.following} following · member since ${esc(c.created_at.slice(0, 10))}</p>
     ${c.website ? `<p style="margin-top:8px">🌐 <a href="${esc(c.website)}" rel="noopener noreferrer nofollow">${esc(c.website)}</a></p>` : ''}
     <p style="margin-top:10px;white-space:pre-wrap">${esc(c.description || '')}</p>
   </div>
+  ${intelCard}
   ${c.about ? `<div class="card"><h3>About</h3><p class="profile-about">${esc(c.about)}</p></div>` : ''}
   <h2 class="sec-h">Deals by ${esc(c.name)}</h2>
   ${dealsHtml}`;
@@ -1384,7 +1514,8 @@ const CONTRACT_CLAUSES = [
   '6. LIABILITY. Neither party shall be liable for indirect, incidental, or consequential damages arising from this agreement.',
   '7. TERMINATION. Either party may terminate this agreement with thirty (30) days written notice, subject to settlement of outstanding obligations.',
   '8. GOVERNING LAW. This agreement shall be governed by the laws of the jurisdiction in which the Provider is registered.',
-  '9. ENTIRE AGREEMENT. This document constitutes the entire agreement between the parties and supersedes all prior discussions.'
+  '9. ENTIRE AGREEMENT. This document constitutes the entire agreement between the parties and supersedes all prior discussions.',
+  '10. PLATFORM FEE. A transparent platform commission of 1% of the stated deal value is payable to Dealzoin. This fee is disclosed to both parties — including the deal issuer — before signing and is separate from the deal value exchanged between the parties.'
 ];
 
 function getDealOr404(req, res) {
@@ -1425,7 +1556,7 @@ app.get('/deal/:id', requireCompany, (req, res) => {
   }
 
   const dealValueHtml = deal.value
-    ? `<div style="text-align:right"><div class="deal-value">💰 ${esc(deal.value)} ${esc(deal.currency || 'USD')}</div>${deal.time_period ? `<span class="muted">⏳ ${esc(deal.time_period)}</span><br>` : ''}<span class="muted">${esc(deal.created_at.slice(0, 16).replace('T', ' '))}</span></div>`
+    ? `<div style="text-align:right"><div class="deal-value">💰 ${esc(deal.value)} ${esc(deal.currency || 'USD')}</div>${feeLineHtml(deal)}${deal.time_period ? `<span class="muted">⏳ ${esc(deal.time_period)}</span><br>` : ''}<span class="muted">${esc(deal.created_at.slice(0, 16).replace('T', ' '))}</span></div>`
     : `<div style="text-align:right">${deal.time_period ? `<span class="muted">⏳ ${esc(deal.time_period)}</span><br>` : ''}<span class="muted">${esc(deal.created_at.slice(0, 16).replace('T', ' '))}</span></div>`;
 
   const signBtn = req.user.id !== deal.company_id && deal.contract_state !== 'approved'
@@ -1434,7 +1565,7 @@ app.get('/deal/:id', requireCompany, (req, res) => {
   <div class="card card-deal">
     <div class="feed-head"><h2>${esc(deal.title)}</h2>
       ${dealValueHtml}</div>
-    <p class="muted">by ${avatarHtml(owner ? owner.name : '?', owner ? owner.avatar_media_id : null)}<a href="/company/${deal.company_id}"><b>${esc(owner ? owner.name : 'Unknown')}</b></a></p>
+    <p class="muted">by ${avatarHtml(owner ? owner.name : '?', owner ? owner.avatar_media_id : null)}<a href="/company/${deal.company_id}"><b>${esc(owner ? owner.name : 'Unknown')}</b></a> ${starsHtml(companyReputation(deal.company_id), true)}</p>
     <p style="margin-top:12px;white-space:pre-wrap">${esc(deal.description)}</p>
     ${deal.contract_state === 'approved' ? `<div style="margin-top:12px"><span class="badge badge-contract">Contract approved ✓${deal.contract_party ? ' (with ' + esc(deal.contract_party) + ')' : ''}</span></div>` : ''}
     ${mediaHtml(deal.media_id)}
@@ -1454,8 +1585,8 @@ app.get('/deal/:id/contract', requireCompany, (req, res) => {
   const contract = latestContract(deal.id);
 
   const clauses = CONTRACT_CLAUSES.map(c => `<p style="margin-bottom:10px">${esc(c)}</p>`).join('');
-  const existing = contract && (contract.status === 'pending' || contract.status === 'approved')
-    ? `<p class="muted" style="margin-top:10px">A contract for this deal is currently <b>${esc(contract.status)}</b>.</p>` : '';
+  const existing = isLiveContract(contract)
+    ? `<p class="muted" style="margin-top:10px">A contract for this deal is currently <b>${esc(contract.status.replace(/_/g, ' '))}</b>.</p>` : '';
   const finalizedNote = deal.contract_state === 'approved'
     ? `<p style="margin-top:10px"><span class="badge badge-contract">Contract approved ✓${deal.contract_party ? ' (with ' + esc(deal.contract_party) + ')' : ''}</span></p>` : '';
 
@@ -1474,6 +1605,7 @@ app.get('/deal/:id/contract', requireCompany, (req, res) => {
     <p><b>Provider:</b> ${esc(owner ? owner.name : 'Unknown')}</p>
     <p><b>Counterparty:</b> ${esc(me.name)}</p>
     ${deal.value ? `<p><b>Deal value:</b> <span class="deal-value" style="font-size:1.05rem">${esc(deal.value)} ${esc(deal.currency || 'USD')}</span>${deal.time_period ? ` <span class="muted">· ⏳ ${esc(deal.time_period)}</span>` : ''}</p>` : ''}
+    ${feeLineHtml(deal, 'margin-top:6px')}
     <h3 style="margin:14px 0 6px">Deal terms</h3>
     <p style="white-space:pre-wrap">${esc(deal.description)}</p>
     <h3 style="margin:14px 0 6px">Standard B2B terms</h3>
@@ -1499,7 +1631,8 @@ app.get('/deal/:id/contract/download', requireCompany, (req, res) => {
   <h2>${esc(deal.title)}</h2>
   <p><b>Provider:</b> ${esc(owner ? owner.name : 'Unknown')}<br>
      <b>Counterparty:</b> ${esc(me.name)}<br>
-     ${deal.value ? `<b>Deal value:</b> ${esc(deal.value)}<br>` : ''}
+     ${deal.value ? `<b>Deal value:</b> ${esc(deal.value)} ${esc(deal.currency || 'USD')}<br>` : ''}
+     <b>${esc(feeLineText(deal))}</b><br>
      <b>Generated:</b> ${esc(now())}</p>
   <h3>Deal terms</h3><p>${esc(deal.description)}</p>
   <h3>Standard B2B terms</h3>${clauses}
@@ -1537,12 +1670,27 @@ app.get('/deal/:id/sign', (req, res) => {
   }
   const owner = db.prepare('SELECT id, name FROM companies WHERE id = ?').get(deal.company_id);
   const isOwn = !user.isAdmin && user.id === deal.company_id;
-
   const finalized = deal.contract_state === 'approved';
-  const signForm = finalized
-    ? `<p style="margin-top:14px"><span class="badge badge-contract">Contract approved ✓${deal.contract_party ? ' (with ' + esc(deal.contract_party) + ')' : ''}</span></p>
-       <p class="muted" style="margin-top:10px">This deal's contract is finalized.</p>`
-    : ((!user.isAdmin && !isOwn && !(contract && contract.status !== 'rejected')) ? `
+  const live = isLiveContract(contract);
+  const myCounter = (!user.isAdmin && user.id)
+    ? db.prepare(`SELECT * FROM counter_offers WHERE deal_id = ? AND from_company_id = ? AND status = 'pending'`).get(deal.id, user.id)
+    : null;
+  const canAct = !user.isAdmin && !isOwn && !finalized;
+  const tab = req.query.tab === 'counter' ? 'counter' : 'sign';
+
+  // ---- Tab 1: SIGN — step 1: password re-entry + declarations (step 2 is the OTP page) ----
+  let signPanel;
+  if (finalized) {
+    signPanel = `<p style="margin-top:14px"><span class="badge badge-contract">Contract approved ✓${deal.contract_party ? ' (with ' + esc(deal.contract_party) + ')' : ''}</span></p>
+      <p class="muted" style="margin-top:10px">This deal's contract is finalized.</p>`;
+  } else if (user.isAdmin) {
+    signPanel = '<p class="muted" style="margin-top:14px">Admin view — signing is performed by the counterparty company.</p>';
+  } else if (isOwn) {
+    signPanel = '<p class="muted" style="margin-top:14px">This is your own deal — the counterparty signs here.</p>';
+  } else if (live) {
+    signPanel = `<p class="muted" style="margin-top:14px">A contract for this deal is currently <b>${esc(contract.status.replace(/_/g, ' '))}</b> — no new signature can be started.</p>`;
+  } else {
+    signPanel = `
     <form method="POST" action="/deal/${deal.id}/sign">
       <label>Re-enter your account password (signing authority check)</label>
       <input type="password" name="password" required>
@@ -1552,10 +1700,35 @@ app.get('/deal/:id/sign', (req, res) => {
       <label style="display:flex;gap:8px;align-items:center;margin:10px 0">
         <input type="checkbox" name="agree" value="yes" style="width:auto;margin:0" required>
         I agree to the terms of this contract</label>
-      <button class="btn btn-green" type="submit" onclick="this.textContent='Verifying signature…'">Verify &amp; sign</button>
-    </form>` : (user.isAdmin
-      ? '<p class="muted" style="margin-top:14px">Admin view — signing is performed by the counterparty company.</p>'
-      : '<p class="muted" style="margin-top:14px">This is your own deal — the counterparty signs here.</p>'));
+      <button class="btn btn-green" type="submit" onclick="this.textContent='Verifying…'">Verify &amp; continue →</button>
+      <p class="muted" style="margin-top:8px">Step 1 of 2 — next, the Authentication Agent sends a one-time signing code to your business email.</p>
+    </form>`;
+  }
+
+  // ---- Tab 2: COUNTER OFFER — propose new value/terms (same password + OTP authentication) ----
+  let counterPanel;
+  if (!canAct) {
+    counterPanel = `<p class="muted" style="margin-top:14px">${finalized ? "This deal's contract is finalized." : user.isAdmin ? 'Admin view — counter offers are made by counterparty companies.' : 'This is your own deal — counter offers come from counterparties.'}</p>`;
+  } else if (live) {
+    counterPanel = `<p class="muted" style="margin-top:14px">A contract for this deal is currently <b>${esc(contract.status.replace(/_/g, ' '))}</b> — counter offers are closed.</p>`;
+  } else if (myCounter) {
+    counterPanel = `<p class="muted" style="margin-top:14px">You already have a pending counter offer on this deal (${esc(myCounter.new_value)} ${esc(myCounter.new_currency)}). Wait for the deal owner's decision.</p>`;
+  } else {
+    const parsedVal = parseDealValue(deal.value);
+    counterPanel = `
+    <form method="POST" action="/deal/${deal.id}/counter">
+      <div class="grid2" style="gap:10px">
+        <div><label>Proposed new value</label><input type="number" name="new_value" min="0" step="any" required value="${isFinite(parsedVal) ? parsedVal : ''}"></div>
+        <div><label>Currency</label><select name="new_currency">${optionsHtml(DEAL_CURRENCIES, deal.currency || 'USD')}</select></div>
+      </div>
+      <label>Revised terms</label>
+      <textarea name="new_terms" rows="5" required maxlength="4000">${esc(deal.description)}</textarea>
+      <label>Re-enter your account password (signing authority check)</label>
+      <input type="password" name="password" required>
+      <button class="btn" type="submit">Send counter offer →</button>
+      <p class="muted" style="margin-top:8px">Step 1 of 2 — next, the Authentication Agent sends a one-time confirmation code to your business email.</p>
+    </form>`;
+  }
 
   const body = `
   <div class="card vault">
@@ -1564,19 +1737,23 @@ app.get('/deal/:id/sign', (req, res) => {
     <p class="muted">Access restricted to the contracting parties and the admin. All checks are logged by the Authentication Agent.</p>
     <hr class="sep">
     <p><b>Deal:</b> ${esc(deal.title)}</p>
-    ${deal.value ? `<p><b>Value:</b> <span class="deal-value" style="font-size:1.05rem">${esc(deal.value)}</span></p>` : ''}
-    <p><b>Provider:</b> ${esc(owner ? owner.name : 'Unknown')}</p>
+    ${deal.value ? `<p><b>Value:</b> <span class="deal-value" style="font-size:1.05rem">${esc(deal.value)} ${esc(deal.currency || 'USD')}</span></p>` : ''}
+    ${feeLineHtml(deal)}
+    <p><b>Provider:</b> ${esc(owner ? owner.name : 'Unknown')} ${starsHtml(companyReputation(deal.company_id), true)}</p>
     ${contract ? `<p><b>Counterparty (signer):</b> ${esc((db.prepare('SELECT name FROM companies WHERE id = ?').get(contract.signer_company_id) || {}).name || 'Unknown')}
       · status ${statusBadge(contract.status)} · signed at ${esc(contract.signed_at.slice(0, 16).replace('T', ' '))} UTC</p>` : ''}
     <h3 style="margin:12px 0 6px">Terms summary</h3>
     <p style="white-space:pre-wrap">${esc(deal.description)}</p>
-    <hr class="sep">
-    ${signForm}
+    <div class="tab-row">
+      <a href="/deal/${deal.id}/sign" class="${tab === 'sign' ? 'tab-active' : ''}">✍️ Sign</a>
+      <a href="/deal/${deal.id}/sign?tab=counter" class="${tab === 'counter' ? 'tab-active' : ''}">💱 Counter offer</a>
+    </div>
+    ${tab === 'sign' ? signPanel : counterPanel}
   </div>`;
   res.send(page('Signing room', body, user, req.query.msg, req.query.err));
 });
 
-// ----- Signing action: AUTHENTICATION AGENT re-verifies the signer -----
+// ----- Signing step 1: AUTHENTICATION AGENT re-verifies the signer, then issues a signing OTP -----
 app.post('/deal/:id/sign', requireCompany, (req, res) => {
   const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
   if (!deal) return res.redirect('/timeline?err=' + encodeURIComponent('Deal not found.'));
@@ -1592,8 +1769,13 @@ app.post('/deal/:id/sign', requireCompany, (req, res) => {
   }
   // One live contract per deal.
   const existing = latestContract(deal.id);
-  if (existing && (existing.status === 'pending' || existing.status === 'approved')) {
-    return res.redirect(`/deal/${deal.id}/sign?err=` + encodeURIComponent('A contract for this deal is already ' + existing.status + '.'));
+  if (isLiveContract(existing)) {
+    return res.redirect(`/deal/${deal.id}/sign?err=` + encodeURIComponent('A contract for this deal is already ' + existing.status.replace(/_/g, ' ') + '.'));
+  }
+  // One pending counter offer per company per deal.
+  const myCounter = db.prepare(`SELECT id FROM counter_offers WHERE deal_id = ? AND from_company_id = ? AND status = 'pending'`).get(deal.id, req.user.id);
+  if (myCounter) {
+    return res.redirect(`/deal/${deal.id}/sign?tab=counter&err=` + encodeURIComponent('You already have a pending counter offer on this deal.'));
   }
 
   // (a) signer must re-enter their account password (signing authority check)
@@ -1618,14 +1800,397 @@ app.post('/deal/:id/sign', requireCompany, (req, res) => {
   }
   audit('AUTHENTICATION AGENT', 'terms agreement checkbox', 'pass', `Terms accepted by ${me.email}`);
 
-  // (d) record timestamp + create the contract (pending admin approval)
-  const ts = now();
-  db.prepare(`INSERT INTO contracts (deal_id, signer_company_id, owner_company_id, status, signed_at, created_at)
-              VALUES (?,?,?, 'pending', ?, ?)`)
-    .run(deal.id, req.user.id, deal.company_id, ts, ts);
-  audit('AUTHENTICATION AGENT', 'contract signed', 'pass', `${me.name} signed deal #${deal.id} at ${ts} — pending admin approval`);
+  // (d) step 2 — issue a one-time signing code (Brevo email, or demo banner + server log without an API key)
+  const code = String(crypto.randomInt(100000, 1000000)); // 6-digit
+  const token = randomToken();
+  db.prepare(`DELETE FROM verification_codes WHERE company_id = ? AND purpose = 'sign'`).run(me.id);
+  db.prepare('INSERT INTO verification_codes (token, company_id, code, purpose, payload, expires_at, created_at) VALUES (?,?,?,?,?,?,?)')
+    .run(token, me.id, code, 'sign', JSON.stringify({ deal_id: deal.id }), new Date(Date.now() + CODE_TTL_MS).toISOString(), now());
+  sendVerificationCode(me.email, code);
+  audit('AUTHENTICATION AGENT', 'signing OTP issued', 'pass', `Signing code issued for ${me.email} (deal #${deal.id}, 10-min expiry)`);
 
-  res.redirect(`/deal/${deal.id}?msg=` + encodeURIComponent('Contract signed! It is now pending admin approval.'));
+  res.setHeader('Set-Cookie', `dz_sign=${signedCookieValue(token)}; HttpOnly; Path=/; Max-Age=600; SameSite=Lax${isSecureReq(req) ? '; Secure' : ''}`);
+  res.redirect(`/deal/${deal.id}/sign/verify`);
+});
+
+/** Shared loader for the signing/counter OTP pages: validates cookie, code row, payload and ownership. */
+function loadOtpContext(req, cookieName, purpose, dealId) {
+  const token = readSignedCookie(req, cookieName);
+  if (!token) return null;
+  const row = db.prepare('SELECT * FROM verification_codes WHERE token = ? AND purpose = ?').get(token, purpose);
+  if (!row || row.company_id !== req.user.id) return null;
+  let payload = {};
+  try { payload = JSON.parse(row.payload || '{}'); } catch (e) { payload = {}; }
+  if (payload.deal_id !== dealId) return null;
+  return { row, payload };
+}
+
+// ----- Signing step 2: enter the one-time code to execute the signature -----
+app.get('/deal/:id/sign/verify', requireCompany, (req, res) => {
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!deal) return res.redirect('/timeline?err=' + encodeURIComponent('Deal not found.'));
+  const ctx = loadOtpContext(req, 'dz_sign', 'sign', deal.id);
+  if (!ctx) return res.redirect(`/deal/${deal.id}/sign?err=` + encodeURIComponent('No signing verification in progress. Please start again.'));
+
+  const demo = BREVO_API_KEY ? '' : `
+    <div class="demo-banner">⚠️ <b>DEMO MODE</b> — no BREVO_API_KEY configured, so the email was not sent.
+    Your signing code is: <b style="font-size:18px;letter-spacing:3px">${esc(ctx.row.code)}</b></div>`;
+  const body = `
+  <div class="card vault" style="max-width:480px;margin:0 auto">
+    <div class="kicker" style="margin-bottom:6px">Step 2 of 2 · signing code</div>
+    <h2>✍️ Confirm your signature</h2>
+    <p class="muted" style="margin-bottom:12px">The Authentication Agent sent a 6-digit signing code to your business email. Enter it to sign <b>${esc(deal.title)}</b>.</p>
+    ${demo}
+    <form method="POST" action="/deal/${deal.id}/sign/verify">
+      <label>6-digit signing code</label><input type="text" name="code" required pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code">
+      <button class="btn btn-green" type="submit">Sign contract</button>
+    </form>
+    <p class="shield-note">🛡️ Protected by Dealzoin security agents</p>
+  </div>`;
+  res.send(page('Confirm signature', body, req.user, req.query.msg, req.query.err));
+});
+
+app.post('/deal/:id/sign/verify', requireCompany, (req, res) => {
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!deal) return res.redirect('/timeline?err=' + encodeURIComponent('Deal not found.'));
+  const code = String(req.body.code || '').trim();
+  const ctx = loadOtpContext(req, 'dz_sign', 'sign', deal.id);
+  if (!ctx || ctx.row.expires_at < now()) {
+    audit('AUTHENTICATION AGENT', 'signing OTP verify', 'fail', `Signing code expired or missing for ${req.user.name} (deal #${deal.id})`);
+    return res.redirect(`/deal/${deal.id}/sign?err=` + encodeURIComponent('Signing code expired. Please start signing again.'));
+  }
+  const a = Buffer.from(code.padEnd(6, ' '));
+  const b = Buffer.from(ctx.row.code.padEnd(6, ' '));
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    audit('AUTHENTICATION AGENT', 'signing OTP verify', 'fail', `Wrong signing code for ${req.user.name} (deal #${deal.id})`);
+    return res.redirect(`/deal/${deal.id}/sign/verify?err=` + encodeURIComponent('Incorrect code. Try again.'));
+  }
+
+  // Re-check the guards at commit time (the deal may have changed while the code was in flight).
+  if (deal.company_id === req.user.id) {
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — You cannot sign your own deal.</h2></div>', req.user));
+  }
+  if (deal.contract_state === 'approved') {
+    db.prepare('DELETE FROM verification_codes WHERE id = ?').run(ctx.row.id);
+    return res.redirect(`/deal/${deal.id}?err=` + encodeURIComponent("This deal's contract is finalized."));
+  }
+  const existing = latestContract(deal.id);
+  if (isLiveContract(existing)) {
+    db.prepare('DELETE FROM verification_codes WHERE id = ?').run(ctx.row.id);
+    return res.redirect(`/deal/${deal.id}/sign?err=` + encodeURIComponent('A contract for this deal is already ' + existing.status.replace(/_/g, ' ') + '.'));
+  }
+
+  db.prepare('DELETE FROM verification_codes WHERE id = ?').run(ctx.row.id);
+  const ts = now();
+  // State machine stage 1: the contract first awaits the DEAL OWNER's approval.
+  db.prepare(`INSERT INTO contracts (deal_id, signer_company_id, owner_company_id, status, signed_at, created_at)
+              VALUES (?,?,?, 'pending_owner', ?, ?)`)
+    .run(deal.id, req.user.id, deal.company_id, ts, ts);
+  res.setHeader('Set-Cookie', 'dz_sign=; HttpOnly; Path=/; Max-Age=0');
+  audit('AUTHENTICATION AGENT', 'signing OTP verify', 'pass', `Signing code verified for ${req.user.name} (deal #${deal.id})`);
+  audit('AUTHENTICATION AGENT', 'contract signed', 'pass', `${req.user.name} signed deal #${deal.id} at ${ts} — pending owner approval`);
+  notify(deal.company_id, 'contract_signed', `${req.user.name} signed the contract for your deal "${deal.title}". Review it in your deal inbox.`, '/deals/inbox');
+
+  res.redirect(`/deal/${deal.id}?msg=` + encodeURIComponent("Contract signed! It now awaits the deal owner's approval."));
+});
+
+// ----- Counter offer step 1: validate proposal + password, then issue a confirmation OTP -----
+app.post('/deal/:id/counter', requireCompany, (req, res) => {
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!deal) return res.redirect('/timeline?err=' + encodeURIComponent('Deal not found.'));
+
+  // Self-dealing guard: cannot counter your own deal.
+  if (deal.company_id === req.user.id) {
+    audit('AUTHENTICATION AGENT', 'counter self-deal guard', 'fail', `${req.user.name} attempted to counter own deal #${deal.id}`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — You cannot counter your own deal.</h2></div>', req.user));
+  }
+  if (deal.contract_state === 'approved') {
+    return res.redirect(`/deal/${deal.id}?err=` + encodeURIComponent("This deal's contract is finalized."));
+  }
+  // One pending contract/counter per company per deal (friendly duplicate errors).
+  const myContract = latestContract(deal.id);
+  if (isLiveContract(myContract) && myContract.signer_company_id === req.user.id) {
+    return res.redirect(`/deal/${deal.id}/sign?err=` + encodeURIComponent('You already have a pending contract on this deal.'));
+  }
+  const myCounter = db.prepare(`SELECT id FROM counter_offers WHERE deal_id = ? AND from_company_id = ? AND status = 'pending'`).get(deal.id, req.user.id);
+  if (myCounter) {
+    return res.redirect(`/deal/${deal.id}/sign?tab=counter&err=` + encodeURIComponent('You already have a pending counter offer on this deal.'));
+  }
+
+  const newValue = parseFloat(String(req.body.new_value || ''));
+  if (!isFinite(newValue) || newValue < 0) {
+    return res.redirect(`/deal/${deal.id}/sign?tab=counter&err=` + encodeURIComponent('Proposed value must be a valid number.'));
+  }
+  const newCurrency = DEAL_CURRENCIES.includes(req.body.new_currency) ? req.body.new_currency : (deal.currency || 'USD');
+  const newTerms = String(req.body.new_terms || '').trim().slice(0, 4000);
+  if (!newTerms) {
+    return res.redirect(`/deal/${deal.id}/sign?tab=counter&err=` + encodeURIComponent('Revised terms are required.'));
+  }
+
+  // Password re-entry (same signing-authority check as the sign path).
+  const me = db.prepare('SELECT * FROM companies WHERE id = ?').get(req.user.id);
+  if (!verifyPassword(String(req.body.password || ''), me.salt, me.password_hash)) {
+    audit('AUTHENTICATION AGENT', 'counter password re-verification', 'fail', `Wrong password at counter offer for ${me.email} (deal #${deal.id})`);
+    return res.redirect(`/deal/${deal.id}/sign?tab=counter&err=` + encodeURIComponent('Password verification failed.'));
+  }
+  audit('AUTHENTICATION AGENT', 'counter password re-verification', 'pass', `Password re-verified for counter offer by ${me.email} (deal #${deal.id})`);
+
+  // Step 2 — one-time confirmation code (Brevo email, or demo banner + server log without an API key).
+  const code = String(crypto.randomInt(100000, 1000000));
+  const token = randomToken();
+  db.prepare(`DELETE FROM verification_codes WHERE company_id = ? AND purpose = 'counter'`).run(me.id);
+  db.prepare('INSERT INTO verification_codes (token, company_id, code, purpose, payload, expires_at, created_at) VALUES (?,?,?,?,?,?,?)')
+    .run(token, me.id, code, 'counter',
+         JSON.stringify({ deal_id: deal.id, new_value: String(newValue), new_currency: newCurrency, new_terms: newTerms }),
+         new Date(Date.now() + CODE_TTL_MS).toISOString(), now());
+  sendVerificationCode(me.email, code);
+  audit('AUTHENTICATION AGENT', 'counter OTP issued', 'pass', `Counter-offer code issued for ${me.email} (deal #${deal.id}, 10-min expiry)`);
+
+  res.setHeader('Set-Cookie', `dz_counter=${signedCookieValue(token)}; HttpOnly; Path=/; Max-Age=600; SameSite=Lax${isSecureReq(req) ? '; Secure' : ''}`);
+  res.redirect(`/deal/${deal.id}/counter/verify`);
+});
+
+// ----- Counter offer step 2: enter the code to submit the counter offer -----
+app.get('/deal/:id/counter/verify', requireCompany, (req, res) => {
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!deal) return res.redirect('/timeline?err=' + encodeURIComponent('Deal not found.'));
+  const ctx = loadOtpContext(req, 'dz_counter', 'counter', deal.id);
+  if (!ctx) return res.redirect(`/deal/${deal.id}/sign?tab=counter&err=` + encodeURIComponent('No counter-offer verification in progress. Please start again.'));
+
+  const demo = BREVO_API_KEY ? '' : `
+    <div class="demo-banner">⚠️ <b>DEMO MODE</b> — no BREVO_API_KEY configured, so the email was not sent.
+    Your confirmation code is: <b style="font-size:18px;letter-spacing:3px">${esc(ctx.row.code)}</b></div>`;
+  const body = `
+  <div class="card vault" style="max-width:480px;margin:0 auto">
+    <div class="kicker" style="margin-bottom:6px">Step 2 of 2 · confirmation code</div>
+    <h2>💱 Confirm your counter offer</h2>
+    <p class="muted" style="margin-bottom:6px">You are proposing <b>${esc(ctx.payload.new_value)} ${esc(ctx.payload.new_currency)}</b> on <b>${esc(deal.title)}</b>.</p>
+    <p class="muted" style="margin-bottom:12px">The Authentication Agent sent a 6-digit code to your business email. Enter it to send the counter offer to the deal owner.</p>
+    ${demo}
+    <form method="POST" action="/deal/${deal.id}/counter/verify">
+      <label>6-digit confirmation code</label><input type="text" name="code" required pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code">
+      <button class="btn" type="submit">Send counter offer</button>
+    </form>
+    <p class="shield-note">🛡️ Protected by Dealzoin security agents</p>
+  </div>`;
+  res.send(page('Confirm counter offer', body, req.user, req.query.msg, req.query.err));
+});
+
+app.post('/deal/:id/counter/verify', requireCompany, (req, res) => {
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!deal) return res.redirect('/timeline?err=' + encodeURIComponent('Deal not found.'));
+  const code = String(req.body.code || '').trim();
+  const ctx = loadOtpContext(req, 'dz_counter', 'counter', deal.id);
+  if (!ctx || ctx.row.expires_at < now()) {
+    audit('AUTHENTICATION AGENT', 'counter OTP verify', 'fail', `Counter code expired or missing for ${req.user.name} (deal #${deal.id})`);
+    return res.redirect(`/deal/${deal.id}/sign?tab=counter&err=` + encodeURIComponent('Confirmation code expired. Please start again.'));
+  }
+  const a = Buffer.from(code.padEnd(6, ' '));
+  const b = Buffer.from(ctx.row.code.padEnd(6, ' '));
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    audit('AUTHENTICATION AGENT', 'counter OTP verify', 'fail', `Wrong counter code for ${req.user.name} (deal #${deal.id})`);
+    return res.redirect(`/deal/${deal.id}/counter/verify?err=` + encodeURIComponent('Incorrect code. Try again.'));
+  }
+
+  // Re-check guards at commit time.
+  if (deal.company_id === req.user.id) {
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — You cannot counter your own deal.</h2></div>', req.user));
+  }
+  if (deal.contract_state === 'approved') {
+    db.prepare('DELETE FROM verification_codes WHERE id = ?').run(ctx.row.id);
+    return res.redirect(`/deal/${deal.id}?err=` + encodeURIComponent("This deal's contract is finalized."));
+  }
+  const dup = db.prepare(`SELECT id FROM counter_offers WHERE deal_id = ? AND from_company_id = ? AND status = 'pending'`).get(deal.id, req.user.id);
+  if (dup) {
+    db.prepare('DELETE FROM verification_codes WHERE id = ?').run(ctx.row.id);
+    return res.redirect(`/deal/${deal.id}/sign?tab=counter&err=` + encodeURIComponent('You already have a pending counter offer on this deal.'));
+  }
+
+  db.prepare('DELETE FROM verification_codes WHERE id = ?').run(ctx.row.id);
+  db.prepare(`INSERT INTO counter_offers (deal_id, from_company_id, new_value, new_currency, new_terms, status, created_at)
+              VALUES (?,?,?,?,?, 'pending', ?)`)
+    .run(deal.id, req.user.id, String(ctx.payload.new_value || ''), String(ctx.payload.new_currency || deal.currency || 'USD'),
+         String(ctx.payload.new_terms || '').slice(0, 4000), now());
+  res.setHeader('Set-Cookie', 'dz_counter=; HttpOnly; Path=/; Max-Age=0');
+  audit('AUTHENTICATION AGENT', 'counter OTP verify', 'pass', `Counter code verified for ${req.user.name} (deal #${deal.id})`);
+  audit('AUTHENTICATION AGENT', 'counter offer submitted', 'pass', `${req.user.name} countered deal #${deal.id}: ${ctx.payload.new_value} ${ctx.payload.new_currency}`);
+  notify(deal.company_id, 'counter_offer', `${req.user.name} sent a counter offer on your deal "${deal.title}" (${ctx.payload.new_value} ${ctx.payload.new_currency}). Review it in your deal inbox.`, '/deals/inbox');
+
+  res.redirect(`/deal/${deal.id}?msg=` + encodeURIComponent('Counter offer sent to the deal owner.'));
+});
+
+// ============================= NOTIFICATIONS =============================
+app.get('/notifications', requireCompany, (req, res) => {
+  const rows = db.prepare('SELECT * FROM notifications WHERE company_id = ? ORDER BY id DESC LIMIT 100').all(req.user.id);
+  const list = rows.length ? rows.map(n => `
+    <div class="conv-row" style="${n.is_read ? 'opacity:0.65' : ''}">
+      <div style="flex:1;min-width:0">
+        <div>${n.is_read ? '' : '<span class="badge badge-pending" style="margin-right:8px">new</span>'}${esc(n.text)}</div>
+        <div class="muted" style="margin-top:2px">${esc(n.type.replace(/_/g, ' '))} · ${esc(n.created_at.slice(0, 16).replace('T', ' '))} UTC
+          ${n.link ? ` · <a href="${esc(n.link)}">Open →</a>` : ''}</div>
+      </div>
+    </div>`).join('')
+    : '<p class="muted">No notifications yet — signatures, counter offers and decisions will land here.</p>';
+  const body = `
+  <div class="card">
+    <h2>🔔 Notifications</h2>
+    <p class="muted" style="margin-bottom:10px">Viewing this page marks everything as read.</p>
+    ${list}
+  </div>`;
+  res.send(page('Notifications', body, req.user, req.query.msg, req.query.err, 'bell'));
+  // Mark all read on view (after rendering so the badge reflects what the user saw).
+  db.prepare('UPDATE notifications SET is_read = 1 WHERE company_id = ? AND is_read = 0').run(req.user.id);
+});
+
+// ============================= OWNER DECISION INBOX (/deals/inbox) =============================
+// The deal owner's decision center: contracts awaiting owner approval + pending counter offers.
+app.get('/deals/inbox', requireCompany, (req, res) => {
+  const myId = req.user.id;
+  const names = companyNameMap();
+
+  // Contracts on MY deals awaiting MY approval (state machine stage: pending_owner)
+  const pendingContracts = db.prepare(`
+    SELECT ct.*, d.title AS deal_title FROM contracts ct
+    JOIN deals d ON d.id = ct.deal_id
+    WHERE ct.owner_company_id = ? AND ct.status = 'pending_owner'
+    ORDER BY ct.signed_at ASC`).all(myId);
+  const contractsHtml = pendingContracts.length ? pendingContracts.map(ct => {
+    const signer = db.prepare('SELECT * FROM companies WHERE id = ?').get(ct.signer_company_id);
+    const signerName = signer ? signer.name : (names.get(ct.signer_company_id) || 'Unknown');
+    const flagHtml = signer && signer.flagged
+      ? `<br><span class="warn-badge"><i class="warn-ic">⚠️</i> flagged</span> <span class="flag-note">${esc(signer.flag_reasons || '')}</span>`
+      : '<br><span class="muted" style="font-size:12px">No flag history</span>';
+    return `<div class="card vault">
+      <div class="feed-head">
+        <h3>✍️ ${esc(signerName)} signed <a href="/deal/${ct.deal_id}">"${esc(ct.deal_title)}"</a></h3>
+        ${statusBadge(ct.status)}
+      </div>
+      <p style="margin-top:8px">${avatarHtml(signerName, signer ? signer.avatar_media_id : null)}<a href="/company/${ct.signer_company_id}"><b>${esc(signerName)}</b></a>
+        · ${starsHtml(signer ? signer.reputation : 0)}${flagHtml}</p>
+      <p class="muted" style="margin-top:6px">Signed at ${esc(ct.signed_at.slice(0, 16).replace('T', ' '))} UTC — your approval sends it to the admin for final approval.</p>
+      <div class="feed-actions">
+        <form method="POST" action="/contracts/${ct.id}/owner-approve"><button class="btn btn-sm btn-green" type="submit">Approve → send to admin</button></form>
+        <form method="POST" action="/contracts/${ct.id}/owner-reject"><button class="btn btn-sm btn-danger" type="submit">Reject</button></form>
+      </div>
+    </div>`;
+  }).join('') : '<div class="card"><p class="muted">No contracts awaiting your approval.</p></div>';
+
+  // Pending counter offers on MY deals — current vs proposed side by side
+  const pendingCounters = db.prepare(`
+    SELECT co.*, d.title AS deal_title, d.value AS cur_value, d.currency AS cur_currency, d.description AS cur_terms
+    FROM counter_offers co JOIN deals d ON d.id = co.deal_id
+    WHERE d.company_id = ? AND co.status = 'pending'
+    ORDER BY co.created_at ASC`).all(myId);
+  const countersHtml = pendingCounters.length ? pendingCounters.map(co => {
+    const from = db.prepare('SELECT * FROM companies WHERE id = ?').get(co.from_company_id);
+    const fromName = from ? from.name : (names.get(co.from_company_id) || 'Unknown');
+    return `<div class="card">
+      <div class="feed-head">
+        <h3>💱 ${esc(fromName)} countered <a href="/deal/${co.deal_id}">"${esc(co.deal_title)}"</a></h3>
+        ${statusBadge(co.status)}
+      </div>
+      <p style="margin-top:8px">${avatarHtml(fromName, from ? from.avatar_media_id : null)}<a href="/company/${co.from_company_id}"><b>${esc(fromName)}</b></a>
+        · ${starsHtml(from ? from.reputation : 0)}
+        ${from && from.flagged ? `<span class="warn-badge" style="margin-left:6px"><i class="warn-ic">⚠️</i> flagged</span>` : ''}</p>
+      <div class="grid2" style="margin-top:10px">
+        <div style="border:1px solid var(--border-soft);border-radius:10px;padding:12px">
+          <div class="kicker" style="color:var(--ink-muted)">Current</div>
+          <div class="deal-value" style="font-size:1.05rem;margin:6px 0">${esc(co.cur_value || '—')} ${esc(co.cur_currency || 'USD')}</div>
+          <p class="muted" style="white-space:pre-wrap">${esc((co.cur_terms || '').slice(0, 400))}</p>
+        </div>
+        <div style="border:1px solid var(--border-gold);border-radius:10px;padding:12px">
+          <div class="kicker">Proposed</div>
+          <div class="deal-value" style="font-size:1.05rem;margin:6px 0">${esc(co.new_value)} ${esc(co.new_currency)}</div>
+          <p class="muted" style="white-space:pre-wrap">${esc(co.new_terms.slice(0, 400))}</p>
+        </div>
+      </div>
+      <div class="feed-actions">
+        <form method="POST" action="/counter/${co.id}/accept"><button class="btn btn-sm btn-green" type="submit">Accept counter offer</button></form>
+        <form method="POST" action="/counter/${co.id}/refuse"><button class="btn btn-sm btn-danger" type="submit">Refuse</button></form>
+      </div>
+    </div>`;
+  }).join('') : '<div class="card"><p class="muted">No pending counter offers on your deals.</p></div>';
+
+  const body = `
+  <h2 class="sec-h" style="margin-top:0;margin-bottom:14px">📥 Deal inbox — your decisions</h2>
+  <h3 class="sec-h">Contracts awaiting your approval</h3>
+  ${contractsHtml}
+  <h3 class="sec-h">Pending counter offers</h3>
+  ${countersHtml}`;
+  res.send(page('Deal inbox', body, req.user, req.query.msg, req.query.err));
+});
+
+// ----- Owner decisions on contracts (party-only: the deal owner) -----
+app.post('/contracts/:id/owner-approve', requireCompany, (req, res) => {
+  const ct = db.prepare('SELECT * FROM contracts WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!ct || ct.owner_company_id !== req.user.id) {
+    return res.redirect('/deals/inbox?err=' + encodeURIComponent('Contract not found.'));
+  }
+  if (ct.status !== 'pending_owner') {
+    return res.redirect('/deals/inbox?err=' + encodeURIComponent('This contract is not awaiting your approval.'));
+  }
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(ct.deal_id);
+  db.prepare(`UPDATE contracts SET status = 'pending_admin' WHERE id = ?`).run(ct.id);
+  audit('CONTRACT AGENT', 'owner approve contract', 'pass', `Owner ${req.user.name} approved contract #${ct.id} (deal #${ct.deal_id}) — forwarded to admin for final approval`);
+  notify(ct.signer_company_id, 'contract_owner_approved',
+    `${req.user.name} approved your signature on "${deal ? deal.title : 'deal #' + ct.deal_id}" — awaiting admin final approval.`, `/deal/${ct.deal_id}`);
+  res.redirect('/deals/inbox?msg=' + encodeURIComponent('Approved — the contract now awaits admin final approval.'));
+});
+
+app.post('/contracts/:id/owner-reject', requireCompany, (req, res) => {
+  const ct = db.prepare('SELECT * FROM contracts WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!ct || ct.owner_company_id !== req.user.id) {
+    return res.redirect('/deals/inbox?err=' + encodeURIComponent('Contract not found.'));
+  }
+  if (ct.status !== 'pending_owner') {
+    return res.redirect('/deals/inbox?err=' + encodeURIComponent('This contract is not awaiting your approval.'));
+  }
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(ct.deal_id);
+  db.prepare(`UPDATE contracts SET status = 'rejected', decided_at = ? WHERE id = ?`).run(now(), ct.id);
+  audit('CONTRACT AGENT', 'owner reject contract', 'fail', `Owner ${req.user.name} rejected contract #${ct.id} (deal #${ct.deal_id})`);
+  notify(ct.signer_company_id, 'contract_rejected',
+    `${req.user.name} rejected your signed contract on "${deal ? deal.title : 'deal #' + ct.deal_id}".`, `/deal/${ct.deal_id}`);
+  res.redirect('/deals/inbox?msg=' + encodeURIComponent('Contract rejected. The signer has been notified.'));
+});
+
+// ----- Owner decisions on counter offers (party-only: the deal owner) -----
+app.post('/counter/:id/accept', requireCompany, (req, res) => {
+  const co = db.prepare('SELECT * FROM counter_offers WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!co) return res.redirect('/deals/inbox?err=' + encodeURIComponent('Counter offer not found.'));
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(co.deal_id);
+  if (!deal || deal.company_id !== req.user.id) {
+    return res.redirect('/deals/inbox?err=' + encodeURIComponent('Counter offer not found.'));
+  }
+  if (co.status !== 'pending') {
+    return res.redirect('/deals/inbox?err=' + encodeURIComponent('This counter offer was already decided.'));
+  }
+  const apply = db.transaction(() => {
+    db.prepare('UPDATE deals SET value = ?, currency = ?, description = ? WHERE id = ?')
+      .run(co.new_value, co.new_currency || deal.currency || 'USD', co.new_terms, deal.id);
+    db.prepare(`UPDATE counter_offers SET status = 'accepted' WHERE id = ?`).run(co.id);
+  });
+  apply();
+  audit('CONTRACT AGENT', 'counter offer accepted', 'pass', `Owner ${req.user.name} accepted counter offer #${co.id} on deal #${deal.id} — deal updated to ${co.new_value} ${co.new_currency}`);
+  notify(co.from_company_id, 'counter_accepted',
+    `${req.user.name} accepted your counter offer on "${deal.title}" — sign now to close the deal.`, `/deal/${deal.id}/contract`);
+  res.redirect('/deals/inbox?msg=' + encodeURIComponent('Counter offer accepted — the deal terms were updated and the counterparty was notified to sign.'));
+});
+
+app.post('/counter/:id/refuse', requireCompany, (req, res) => {
+  const co = db.prepare('SELECT * FROM counter_offers WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!co) return res.redirect('/deals/inbox?err=' + encodeURIComponent('Counter offer not found.'));
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(co.deal_id);
+  if (!deal || deal.company_id !== req.user.id) {
+    return res.redirect('/deals/inbox?err=' + encodeURIComponent('Counter offer not found.'));
+  }
+  if (co.status !== 'pending') {
+    return res.redirect('/deals/inbox?err=' + encodeURIComponent('This counter offer was already decided.'));
+  }
+  db.prepare(`UPDATE counter_offers SET status = 'refused' WHERE id = ?`).run(co.id);
+  audit('CONTRACT AGENT', 'counter offer refused', 'fail', `Owner ${req.user.name} refused counter offer #${co.id} on deal #${deal.id}`);
+  notify(co.from_company_id, 'counter_refused',
+    `${req.user.name} refused your counter offer on "${deal.title}".`, `/deal/${deal.id}`);
+  res.redirect('/deals/inbox?msg=' + encodeURIComponent('Counter offer refused. The counterparty has been notified.'));
 });
 
 // ============================= MEDIA SERVING =============================
@@ -1734,6 +2299,7 @@ app.get('/profile', requireCompany, (req, res) => {
     ${coverHtml}
     <div class="feed-head"><h2>${avatarHtml(c.name, c.avatar_media_id, 'avatar-lg')}${esc(c.name)}</h2>
       <a class="btn btn-sm btn-outline" href="/company/${c.id}">View public profile</a></div>
+    <p style="margin-top:6px">${starsHtml(c.reputation)}</p>
     ${c.bio ? `<p class="profile-bio">${esc(c.bio)}</p>` : ''}
     <p class="muted">${esc(c.email)} · ${fc.followers} followers · ${fc.following} following · member since ${esc(c.created_at.slice(0, 10))}</p>
     ${c.website ? `<p style="margin-top:8px">🌐 <a href="${esc(c.website)}" rel="noopener noreferrer nofollow">${esc(c.website)}</a></p>` : ''}
@@ -1815,10 +2381,13 @@ app.get('/dashboard', requireCompany, (req, res) => {
     commentsReceived: count(`SELECT COUNT(*) AS n FROM comments c WHERE
       (c.target_type = 'deal' AND c.target_id IN (SELECT id FROM deals WHERE company_id = ?)) OR
       (c.target_type = 'post' AND c.target_id IN (SELECT id FROM posts WHERE company_id = ?))`, myId, myId),
-    signedPending: count(`SELECT COUNT(*) AS n FROM contracts WHERE signer_company_id = ? AND status = 'pending'`, myId),
+    signedPending: count(`SELECT COUNT(*) AS n FROM contracts WHERE signer_company_id = ? AND status IN ('pending','pending_owner','pending_admin')`, myId),
     signedApproved: count(`SELECT COUNT(*) AS n FROM contracts WHERE signer_company_id = ? AND status = 'approved'`, myId),
-    minePending: count(`SELECT COUNT(*) AS n FROM contracts WHERE owner_company_id = ? AND status = 'pending'`, myId),
-    mineApproved: count(`SELECT COUNT(*) AS n FROM contracts WHERE owner_company_id = ? AND status = 'approved'`, myId)
+    minePending: count(`SELECT COUNT(*) AS n FROM contracts WHERE owner_company_id = ? AND status IN ('pending','pending_owner','pending_admin')`, myId),
+    mineApproved: count(`SELECT COUNT(*) AS n FROM contracts WHERE owner_company_id = ? AND status = 'approved'`, myId),
+    inboxActions: count(`SELECT
+      (SELECT COUNT(*) FROM contracts WHERE owner_company_id = ? AND status = 'pending_owner') +
+      (SELECT COUNT(*) FROM counter_offers co JOIN deals d ON d.id = co.deal_id WHERE d.company_id = ? AND co.status = 'pending') AS n`, myId, myId)
   };
   const tiles = [
     ['My deals', stats.deals, ' gold'], ['My posts', stats.posts, ''], ['Followers', stats.followers, ' mint'],
@@ -1882,7 +2451,7 @@ app.get('/dashboard', requireCompany, (req, res) => {
     var dn = ${jsonForHtml({ labels: statusRows.map(r => r.status), values: statusRows.map(r => r.n) })};
     var dctx = document.getElementById('chart-contracts');
     if (dctx && dn.labels.length) {
-      var colors = { approved: mint, pending: warn, rejected: dgr };
+      var colors = { approved: mint, pending: warn, pending_owner: warn, pending_admin: gold, rejected: dgr };
       new Chart(dctx, { type: 'doughnut',
         data: { labels: dn.labels, datasets: [{ data: dn.values, backgroundColor: dn.labels.map(function (l) { return colors[l] || faint; }), borderColor: bgv, borderWidth: 2 }]},
         options: base
@@ -1893,6 +2462,11 @@ app.get('/dashboard', requireCompany, (req, res) => {
 
   const body = `
   <h2 class="sec-h" style="margin-top:0;margin-bottom:14px">📊 Company dashboard</h2>
+  <div class="card" style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+    <div><h3 style="margin-bottom:2px">📥 Deal inbox</h3>
+      <p class="muted">Contracts and counter offers on your deals awaiting your decision.</p></div>
+    <a class="btn btn-sm${stats.inboxActions ? '' : ' btn-outline'}" href="/deals/inbox">Open inbox${stats.inboxActions ? ` <span class="unread-chip" style="margin-left:6px">${stats.inboxActions}</span>` : ''}</a>
+  </div>
   ${tilesHtml}
   <div class="card"><h3>My deals</h3>
     <table><tr><th>Title</th><th>Value</th><th>Likes</th><th>Comments</th><th>Contract</th></tr>${dealsRows}</table></div>
@@ -2150,14 +2724,28 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
     approved: count(`SELECT COUNT(*) AS n FROM companies WHERE status = 'approved'`),
     flagged: count('SELECT COUNT(*) AS n FROM companies WHERE flagged = 1'),
     deals: count('SELECT COUNT(*) AS n FROM deals'),
-    contractsPending: count(`SELECT COUNT(*) AS n FROM contracts WHERE status = 'pending'`),
+    contractsPending: count(`SELECT COUNT(*) AS n FROM contracts WHERE status = 'pending_admin'`),
     follows: count('SELECT COUNT(*) AS n FROM follows')
   };
+  // Platform commission: 1% of the summed value of approved (finalized) deals, broken down per currency.
+  const approvedDeals = db.prepare(`SELECT value, currency FROM deals WHERE contract_state = 'approved'`).all();
+  const feeByCurrency = {};
+  for (const d of approvedDeals) {
+    const num = parseDealValue(d.value);
+    if (!isFinite(num) || num <= 0) continue;
+    const cur = d.currency || 'USD';
+    feeByCurrency[cur] = (feeByCurrency[cur] || 0) + num * PLATFORM_FEE_PCT / 100;
+  }
+  const feeCurrencies = Object.keys(feeByCurrency).sort();
+  const commissionText = feeCurrencies.length
+    ? feeCurrencies.map(cur => `${esc(cur)} ${fmtAmount(feeByCurrency[cur])}`).join(' · ')
+    : '—';
   const statsHtml = `<div class="stats">${[
     ['Total companies', stats.companies, ''], ['Pending', stats.pending, ''], ['Approved', stats.approved, ' mint'],
     ['Flagged ⚠️', stats.flagged, ''], ['Deals', stats.deals, ' gold'], ['Contracts pending', stats.contractsPending, ' gold'],
     ['Follows', stats.follows, '']
-  ].map(([l, n, cls]) => `<div class="stat"><div class="num${cls}">${n}</div><div class="lbl">${l}</div></div>`).join('')}</div>`;
+  ].map(([l, n, cls]) => `<div class="stat"><div class="num${cls}">${n}</div><div class="lbl">${l}</div></div>`).join('')}
+    <div class="stat"><div class="num gold" style="font-size:1.15rem;line-height:1.4">${commissionText}</div><div class="lbl">Platform commission (approved deals) · ${PLATFORM_FEE_PCT}%</div></div></div>`;
 
   // Pending companies queue (with ONBOARDING AGENT flags)
   const pending = db.prepare(`SELECT * FROM companies WHERE status = 'pending' ORDER BY created_at ASC`).all();
@@ -2173,9 +2761,9 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
       </td>
     </tr>`).join('') : '<tr><td colspan="3" class="muted">No pending reviews. The agents are holding the fort. 🛡️</td></tr>';
 
-  // Pending contracts queue
+  // Final approval queue — ONLY contracts the deal owner has already approved (state: pending_admin).
   const names = companyNameMap();
-  const pendingContracts = db.prepare(`SELECT * FROM contracts WHERE status = 'pending' ORDER BY signed_at ASC`).all();
+  const pendingContracts = db.prepare(`SELECT * FROM contracts WHERE status = 'pending_admin' ORDER BY signed_at ASC`).all();
   const contractsHtml = pendingContracts.length ? pendingContracts.map(ct => {
     const deal = db.prepare('SELECT title FROM deals WHERE id = ?').get(ct.deal_id);
     return `<tr>
@@ -2187,19 +2775,31 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
         <form method="POST" action="/admin/contracts/${ct.id}/reject" style="display:inline"><button class="btn btn-sm btn-danger">Reject</button></form>
       </td>
     </tr>`;
-  }).join('') : '<tr><td colspan="4" class="muted">No contracts awaiting approval.</td></tr>';
+  }).join('') : '<tr><td colspan="4" class="muted">No contracts awaiting final approval. Contracts land here after the deal owner approves them.</td></tr>';
 
-  // All companies (suspend / reactivate / delete)
+  // All companies (suspend / reactivate / delete / reputation / research)
   const allCompanies = db.prepare('SELECT * FROM companies ORDER BY created_at DESC LIMIT 100').all();
   const companiesHtml = allCompanies.map(c => {
     const actions = [];
     if (c.status === 'approved') actions.push(`<form method="POST" action="/admin/companies/${c.id}/suspend" style="display:inline"><button class="btn btn-sm btn-outline">Suspend</button></form>`);
     if (c.status === 'suspended' || c.status === 'rejected') actions.push(`<form method="POST" action="/admin/companies/${c.id}/reactivate" style="display:inline"><button class="btn btn-sm btn-green">Reactivate</button></form>`);
     actions.push(`<form method="POST" action="/admin/companies/${c.id}/delete" style="display:inline" onsubmit="return confirm('Delete ${esc(c.name)} and ALL their data?')"><button class="btn btn-sm btn-danger">Delete</button></form>`);
+    const repOptions = [0, 1, 2, 3, 4, 5].map(r =>
+      `<option value="${r}"${r === (c.reputation || 0) ? ' selected' : ''}>${r === 0 ? 'Unrated' : '★'.repeat(r)}</option>`).join('');
     return `<tr>
       <td><b>${esc(c.name)}</b> ${c.flagged ? '<span class="warn-badge"><i class="warn-ic">⚠️</i></span>' : ''}<br><span class="muted">${esc(c.email)}</span></td>
       <td>${statusBadge(c.status)}</td>
-      <td style="white-space:nowrap">${actions.join(' ')}</td>
+      <td style="white-space:nowrap">
+        ${starsHtml(c.reputation, true)}<br>
+        <form class="rep-form" method="POST" action="/admin/companies/${c.id}/reputation" style="margin-top:4px">
+          <select name="reputation" aria-label="Reputation for ${esc(c.name)}">${repOptions}</select>
+          <button class="btn btn-sm btn-outline" type="submit">Set</button>
+        </form>
+      </td>
+      <td style="white-space:nowrap">
+        <form method="POST" action="/admin/companies/${c.id}/research" style="display:inline"><button class="btn btn-sm btn-outline" type="submit">🔬 Run research</button></form><br>
+        <div style="margin-top:4px">${actions.join(' ')}</div>
+      </td>
     </tr>`;
   }).join('');
 
@@ -2222,10 +2822,10 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
   ${statsHtml}
   <div class="card"><h3>Pending companies</h3>
     <table><tr><th>Company</th><th>Registered</th><th>Actions</th></tr>${pendingHtml}</table></div>
-  <div class="card"><h3>Pending contracts</h3>
+  <div class="card"><h3>Pending contracts — final approval</h3>
     <table><tr><th>Deal</th><th>Parties</th><th>Signed at</th><th>Actions</th></tr>${contractsHtml}</table></div>
   <div class="card"><h3>All companies</h3>
-    <table><tr><th>Company</th><th>Status</th><th>Actions</th></tr>${companiesHtml}</table></div>
+    <table><tr><th>Company</th><th>Status</th><th>Reputation</th><th>Actions</th></tr>${companiesHtml}</table></div>
   <div class="card"><h3>All deals</h3>
     <table><tr><th>Deal</th><th>Actions</th></tr>${dealsHtml}</table></div>
   <div class="card"><h3>Change admin password</h3>
@@ -2284,6 +2884,7 @@ app.post('/admin/companies/:id/delete', requireAdmin, (req, res) => {
       db.prepare(`DELETE FROM comments WHERE target_type = 'deal' AND target_id = ?`).run(d);
       db.prepare('DELETE FROM reposts WHERE deal_id = ?').run(d);
       db.prepare('DELETE FROM contracts WHERE deal_id = ?').run(d);
+      db.prepare('DELETE FROM counter_offers WHERE deal_id = ?').run(d);
     }
     for (const p of postIds) {
       db.prepare(`DELETE FROM likes WHERE target_type = 'post' AND target_id = ?`).run(p);
@@ -2296,6 +2897,8 @@ app.post('/admin/companies/:id/delete', requireAdmin, (req, res) => {
     db.prepare('DELETE FROM reposts WHERE company_id = ?').run(id);
     db.prepare('DELETE FROM follows WHERE follower_id = ? OR followed_id = ?').run(id, id);
     db.prepare('DELETE FROM contracts WHERE signer_company_id = ? OR owner_company_id = ?').run(id, id);
+    db.prepare('DELETE FROM counter_offers WHERE from_company_id = ?').run(id);
+    db.prepare('DELETE FROM notifications WHERE company_id = ?').run(id);
     db.prepare('DELETE FROM sessions WHERE company_id = ?').run(id);
     db.prepare('DELETE FROM verification_codes WHERE company_id = ?').run(id);
     db.prepare('DELETE FROM media WHERE company_id = ?').run(id);
@@ -2308,6 +2911,93 @@ app.post('/admin/companies/:id/delete', requireAdmin, (req, res) => {
   res.redirect('/admin/dashboard?msg=' + encodeURIComponent(`Deleted ${c.name} and all their data.`));
 });
 
+// ----- Admin reputation scale (0 = unrated, 1–5 stars) -----
+app.post('/admin/companies/:id/reputation', requireAdmin, (req, res) => {
+  const c = db.prepare('SELECT * FROM companies WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!c) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Company not found.'));
+  const rep = parseInt(req.body.reputation, 10);
+  if (!Number.isInteger(rep) || rep < 0 || rep > 5) {
+    return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Reputation must be a whole number from 0 to 5.'));
+  }
+  db.prepare('UPDATE companies SET reputation = ? WHERE id = ?').run(rep, c.id);
+  audit('ADMIN', 'reputation set', 'pass', `Admin set reputation of "${c.name}" to ${rep === 0 ? 'Unrated (0)' : rep + '/5'}`);
+  res.redirect('/admin/dashboard?msg=' + encodeURIComponent(`Reputation for ${c.name} set to ${rep === 0 ? 'Unrated' : rep + '★'}.`));
+});
+
+// ----- RESEARCH AGENT: Wikipedia lookup + admin-confirmed intelligence fields -----
+app.get('/admin/companies/:id/research', requireAdmin, (req, res) => {
+  const c = db.prepare('SELECT * FROM companies WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!c) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Company not found.'));
+  const body = `
+  <div class="card" style="max-width:560px;margin:0 auto">
+    <div class="kicker">🔬 Research Agent</div>
+    <h2 style="margin:6px 0 10px">Company intelligence — ${esc(c.name)}</h2>
+    <p class="muted" style="margin-bottom:12px">Review and edit the researched fields, then save. They appear on the public company profile.</p>
+    ${c.research_source ? `<p class="muted" style="margin-bottom:12px">Source: <a href="${esc(c.research_source)}" rel="noopener noreferrer nofollow">${esc(c.research_source)}</a></p>` : ''}
+    <form method="POST" action="/admin/companies/${c.id}/research">
+      <label>Market value</label><input type="text" name="market_value" maxlength="120" value="${esc(c.market_value || '')}" placeholder="e.g. $2.8T (2024)">
+      <label>Field / industry</label><input type="text" name="field" maxlength="200" value="${esc(c.field || '')}" placeholder="e.g. Consumer electronics and software">
+      <label>Employees</label><input type="text" name="employees" maxlength="80" value="${esc(c.employees || '')}" placeholder="e.g. ~160,000">
+      <button class="btn" type="submit">Save intelligence</button>
+      <a class="btn btn-outline" href="/admin/dashboard" style="margin-left:8px">Back</a>
+    </form>
+  </div>`;
+  res.send(page('Research — ' + c.name, body, req.user, req.query.msg, req.query.err));
+});
+
+app.post('/admin/companies/:id/research', requireAdmin, async (req, res) => {
+  const c = db.prepare('SELECT * FROM companies WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!c) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Company not found.'));
+
+  // Save branch: the edit form posts the three intel fields.
+  if ('market_value' in req.body || 'field' in req.body || 'employees' in req.body) {
+    db.prepare('UPDATE companies SET market_value = ?, field = ?, employees = ? WHERE id = ?')
+      .run(String(req.body.market_value || '').trim().slice(0, 120),
+           String(req.body.field || '').trim().slice(0, 200),
+           String(req.body.employees || '').trim().slice(0, 80), c.id);
+    audit('RESEARCH AGENT', 'intelligence saved', 'pass', `Admin confirmed research fields for "${c.name}"`);
+    return res.redirect('/admin/dashboard?msg=' + encodeURIComponent(`Intelligence saved for ${c.name}.`));
+  }
+
+  // Research branch: "Run research" button — query the public Wikipedia summary API (no key, 5s timeout).
+  let suggestion = null, sourceUrl = '', failReason = '';
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5000);
+    const r = await fetch('https://en.wikipedia.org/api/rest_v1/page/summary/' + encodeURIComponent(c.name), {
+      signal: ctrl.signal, headers: { 'User-Agent': 'Dealzoin Research Agent' }
+    });
+    clearTimeout(timer);
+    if (r.ok) {
+      const data = await r.json();
+      if (data && data.extract) {
+        const firstSentence = String(data.extract).split(/(?<=[.!?])\s+/)[0].trim().slice(0, 200);
+        suggestion = firstSentence;
+        sourceUrl = (data.content_urls && data.content_urls.desktop && data.content_urls.desktop.page) || '';
+      } else {
+        failReason = 'no summary extract returned';
+      }
+    } else {
+      failReason = `Wikipedia API HTTP ${r.status}`;
+    }
+  } catch (e) {
+    failReason = e.name === 'AbortError' ? 'Wikipedia API timed out (5s)' : `fetch error: ${e.message}`;
+  }
+
+  if (suggestion) {
+    // Never overwrite non-empty fields — only fill in blanks.
+    if (!c.field) db.prepare('UPDATE companies SET field = ? WHERE id = ?').run(suggestion, c.id);
+    if (sourceUrl) db.prepare('UPDATE companies SET research_source = ? WHERE id = ?').run(sourceUrl, c.id);
+    audit('RESEARCH AGENT', 'research run', 'pass', `Research for "${c.name}" — Wikipedia summary found${c.field ? ' (field kept: already set)' : `, suggested field: "${suggestion}"`}${sourceUrl ? ', source: ' + sourceUrl : ''}`);
+  } else {
+    audit('RESEARCH AGENT', 'research run', 'fail', `Research for "${c.name}" — no public summary found (${failReason || 'not found'})`);
+  }
+  // Redirect to the edit form so the admin can confirm/edit before saving.
+  res.redirect(`/admin/companies/${c.id}/research?` + (suggestion
+    ? 'msg=' + encodeURIComponent('Research found a public summary — review and save.')
+    : 'err=' + encodeURIComponent('No public data found for "' + c.name + '" (' + (failReason || 'not found') + '). You can still fill the fields manually.')));
+});
+
 // ----- Deal moderation -----
 app.post('/admin/deals/:id/delete', requireAdmin, (req, res) => {
   const d = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
@@ -2317,6 +3007,7 @@ app.post('/admin/deals/:id/delete', requireAdmin, (req, res) => {
     db.prepare(`DELETE FROM comments WHERE target_type = 'deal' AND target_id = ?`).run(d.id);
     db.prepare('DELETE FROM reposts WHERE deal_id = ?').run(d.id);
     db.prepare('DELETE FROM contracts WHERE deal_id = ?').run(d.id);
+    db.prepare('DELETE FROM counter_offers WHERE deal_id = ?').run(d.id);
     db.prepare('DELETE FROM deals WHERE id = ?').run(d.id);
   });
   wipe();
@@ -2324,25 +3015,38 @@ app.post('/admin/deals/:id/delete', requireAdmin, (req, res) => {
   res.redirect('/admin/dashboard?msg=' + encodeURIComponent('Deal removed.'));
 });
 
-// ----- Contract approval queue -----
+// ----- Contract final approval queue (stage 2: only owner-approved contracts) -----
 app.post('/admin/contracts/:id/approve', requireAdmin, (req, res) => {
   const ct = db.prepare('SELECT * FROM contracts WHERE id = ?').get(parseInt(req.params.id, 10));
   if (!ct) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Contract not found.'));
+  if (ct.status !== 'pending_admin') {
+    return res.redirect('/admin/dashboard?err=' + encodeURIComponent('This contract is not awaiting final approval (owner must approve first).'));
+  }
   // 1) Mark the deal as approved and record the signing party on the deal itself.
   const signer = db.prepare('SELECT name FROM companies WHERE id = ?').get(ct.signer_company_id);
   const party = signer ? signer.name : 'Unknown';
+  const dealRow = db.prepare('SELECT title FROM deals WHERE id = ?').get(ct.deal_id);
+  const dealTitle = dealRow ? dealRow.title : 'deal #' + ct.deal_id;
   db.prepare(`UPDATE deals SET contract_state = 'approved', contract_party = ? WHERE id = ?`).run(party, ct.deal_id);
   // 2) Approved contracts are archived: the row is deleted; the deal carries the state.
   db.prepare('DELETE FROM contracts WHERE id = ?').run(ct.id);
   // TODO PHASE 3 — PAYMENT-ESCROW AGENT: when admin approves a contract, hook Stripe escrow initiation here (create escrow, notify both parties, release funds on delivery confirmation). Not implemented in this version.
   audit('CONTRACT AGENT', 'admin approve contract', 'pass', `Contract #${ct.id} (deal #${ct.deal_id}) approved by admin — deal marked approved (party: ${party}); contract record archived (deleted)`);
+  // Both parties are notified when the deal is finalized.
+  notify(ct.signer_company_id, 'contract_approved', `Final approval granted — your contract on "${dealTitle}" is finalized. Deal closed! 🎉`, `/deal/${ct.deal_id}`);
+  notify(ct.owner_company_id, 'contract_approved', `Final approval granted — the contract with ${party} on "${dealTitle}" is finalized. Deal closed! 🎉`, `/deal/${ct.deal_id}`);
   res.redirect('/admin/dashboard?msg=' + encodeURIComponent('Contract approved and archived. The deal now shows its finalized state.'));
 });
 app.post('/admin/contracts/:id/reject', requireAdmin, (req, res) => {
   const ct = db.prepare('SELECT * FROM contracts WHERE id = ?').get(parseInt(req.params.id, 10));
   if (!ct) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Contract not found.'));
+  if (ct.status !== 'pending_admin') {
+    return res.redirect('/admin/dashboard?err=' + encodeURIComponent('This contract is not awaiting final approval.'));
+  }
+  const dealRow = db.prepare('SELECT title FROM deals WHERE id = ?').get(ct.deal_id);
   db.prepare(`UPDATE contracts SET status = 'rejected', decided_at = ? WHERE id = ?`).run(now(), ct.id);
-  audit('AUTHENTICATION AGENT', 'admin reject contract', 'fail', `Contract #${ct.id} (deal #${ct.deal_id}) rejected by admin`);
+  audit('AUTHENTICATION AGENT', 'admin reject contract', 'fail', `Contract #${ct.id} (deal #${ct.deal_id}) rejected by admin at final approval`);
+  notify(ct.signer_company_id, 'contract_rejected', `An admin rejected your signed contract on "${dealRow ? dealRow.title : 'deal #' + ct.deal_id}" at final approval.`, `/deal/${ct.deal_id}`);
   res.redirect('/admin/dashboard?msg=' + encodeURIComponent('Contract rejected.'));
 });
 
