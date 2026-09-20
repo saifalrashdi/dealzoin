@@ -159,6 +159,17 @@ CREATE TABLE IF NOT EXISTS media (
 try { db.exec('ALTER TABLE deals ADD COLUMN media_id INTEGER'); } catch (e) { /* column already exists */ }
 try { db.exec('ALTER TABLE posts ADD COLUMN media_id INTEGER'); } catch (e) { /* column already exists */ }
 
+// Graceful upgrades for databases created before these features existed.
+try { db.exec("ALTER TABLE deals ADD COLUMN currency TEXT DEFAULT 'USD'"); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE deals ADD COLUMN time_period TEXT DEFAULT '30 days'"); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE deals ADD COLUMN contract_state TEXT DEFAULT NULL'); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE deals ADD COLUMN contract_party TEXT DEFAULT NULL'); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE conversation_members ADD COLUMN last_read_at TEXT'); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE companies ADD COLUMN avatar_media_id INTEGER'); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE companies ADD COLUMN header_media_id INTEGER'); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE companies ADD COLUMN bio TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE companies ADD COLUMN about TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+
 // ============================= MEDIA UPLOADS (MULTER) =============================
 // Images: jpg/jpeg/png/gif/webp up to 5 MB. Videos: mp4/webm up to 25 MB.
 const MEDIA_IMAGE_EXT = { jpg: 1, jpeg: 1, png: 1, gif: 1, webp: 1 };
@@ -428,13 +439,89 @@ const CSS = `
     --border-soft:   #242435;
     --border-gold:   rgba(245,185,66,0.35);
     --gradient-coin: linear-gradient(120deg, #F5B942 0%, #FFD97A 45%, #C98A1E 100%);
+    --gold-bright:   #FFD97A;
+    --on-gold:       #14100A;
+    --on-mint:       #0A0A12;
+    --on-danger:     #FFFFFF;
+    --bg-glow:       radial-gradient(1200px 600px at 50% -10%, rgba(245,185,66,0.07), transparent 60%);
+    --nav-bg:        rgba(10,10,18,0.85);
+    --media-bg:      #000000;
+    --row-hover:     rgba(23,23,38,0.5);
+    --bubble-mine-bg: rgba(245,185,66,0.14);
+    --card-shadow:        0 8px 32px rgba(0,0,0,0.45);
+    --card-shadow-hover:  0 16px 44px rgba(0,0,0,0.55);
+    --card-inset:         inset 0 1px 0 rgba(255,217,122,0.08);
+    --ok-bg:         rgba(63,224,176,0.15);
+    --ok-border:     rgba(63,224,176,0.4);
+    --ok-badge-bg:   rgba(63,224,176,0.12);
+    --ok-badge-border: rgba(63,224,176,0.3);
+    --err-bg:        rgba(255,92,122,0.12);
+    --err-border:    rgba(255,92,122,0.4);
+    --err-badge-border: rgba(255,92,122,0.3);
+    --warn-bg:       rgba(255,180,84,0.12);
+    --warn-border:   rgba(255,180,84,0.35);
+    --warn-badge-border: rgba(255,180,84,0.3);
+    --gold-shadow-sm: 0 2px 12px rgba(245,185,66,0.35);
+    --gold-shadow-md: 0 4px 18px rgba(245,185,66,0.28);
+    --gold-shadow-lg: 0 8px 26px rgba(245,185,66,0.42);
+    --gold-shadow-plus: 0 4px 18px rgba(245,185,66,0.35);
+    --gold-shadow-plus-hover: 0 8px 26px rgba(245,185,66,0.5);
     --font-display: "Space Grotesk", "Segoe UI", system-ui, sans-serif;
     --font-body:    "Inter", -apple-system, "Segoe UI", Roboto, sans-serif;
   }
+  /* Light theme — warm off-white paper, dark ink, gold/mint accents kept. */
+  [data-theme="light"] {
+    --bg-void:       #F7F5F0;
+    --bg-elevated:   #FFFFFF;
+    --bg-spotlight:  #F0EDE4;
+    --surface-card:  #FFFFFF;
+    --surface-deal:  linear-gradient(160deg, #FFFBF0 0%, #FFFFFF 60%);
+    --gold:          #A9750D;
+    --gold-deep:     #8A5D0A;
+    --gold-glow:     rgba(169,117,13,0.14);
+    --mint:          #0E9F78;
+    --mint-deep:     #0B8A67;
+    --ink-primary:   #17150F;
+    --ink-muted:     #5A5648;
+    --ink-faint:     #8B8574;
+    --success:       #0E9F78;
+    --warning:       #B06F0E;
+    --danger:        #D93A56;
+    --danger-deep:   #B02A44;
+    --border-soft:   #E3DFD3;
+    --border-gold:   rgba(169,117,13,0.4);
+    --gold-bright:   #C98A1E;
+    --on-gold:       #14100A;
+    --on-mint:       #FFFFFF;
+    --on-danger:     #FFFFFF;
+    --bg-glow:       radial-gradient(1200px 600px at 50% -10%, rgba(245,185,66,0.14), transparent 60%);
+    --nav-bg:        rgba(247,245,240,0.88);
+    --media-bg:      #11111C;
+    --row-hover:     rgba(23,23,20,0.04);
+    --bubble-mine-bg: rgba(245,185,66,0.22);
+    --card-shadow:        0 8px 24px rgba(60,50,20,0.10);
+    --card-shadow-hover:  0 16px 36px rgba(60,50,20,0.16);
+    --card-inset:         inset 0 1px 0 rgba(255,255,255,0.6);
+    --ok-bg:         rgba(14,159,120,0.12);
+    --ok-border:     rgba(14,159,120,0.4);
+    --ok-badge-bg:   rgba(14,159,120,0.10);
+    --ok-badge-border: rgba(14,159,120,0.32);
+    --err-bg:        rgba(217,58,86,0.10);
+    --err-border:    rgba(217,58,86,0.4);
+    --err-badge-border: rgba(217,58,86,0.3);
+    --warn-bg:       rgba(176,111,14,0.10);
+    --warn-border:   rgba(176,111,14,0.35);
+    --warn-badge-border: rgba(176,111,14,0.3);
+    --gold-shadow-sm: 0 2px 12px rgba(169,117,13,0.25);
+    --gold-shadow-md: 0 4px 18px rgba(169,117,13,0.18);
+    --gold-shadow-lg: 0 8px 26px rgba(169,117,13,0.30);
+    --gold-shadow-plus: 0 4px 18px rgba(169,117,13,0.25);
+    --gold-shadow-plus-hover: 0 8px 26px rgba(169,117,13,0.38);
+  }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background-color: var(--bg-void); background-image: radial-gradient(1200px 600px at 50% -10%, rgba(245,185,66,0.07), transparent 60%); background-attachment: fixed; background-repeat: no-repeat; color: var(--ink-primary); font-family: var(--font-body); font-size: 16px; line-height: 1.6; min-height: 100vh; }
+  body { background-color: var(--bg-void); background-image: var(--bg-glow); background-attachment: fixed; background-repeat: no-repeat; color: var(--ink-primary); font-family: var(--font-body); font-size: 16px; line-height: 1.6; min-height: 100vh; }
   a { color: var(--gold); text-decoration: none; }
-  a:hover { color: #FFD97A; }
+  a:hover { color: var(--gold-bright); }
   h1, h2, h3 { font-family: var(--font-display); color: var(--ink-primary); }
   h1 { font-size: 2rem; font-weight: 700; letter-spacing: -0.02em; }
   h2 { font-size: 1.375rem; font-weight: 700; letter-spacing: -0.015em; }
@@ -443,10 +530,10 @@ const CSS = `
   .sec-h { margin: 18px 0 10px; }
 
   /* Nav — sticky, blurred, members-only feel */
-  .nav { position: sticky; top: 0; z-index: 10; min-height: 64px; background: rgba(10,10,18,0.85); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border-bottom: 1px solid var(--border-soft); padding: 10px 24px; display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
+  .nav { position: sticky; top: 0; z-index: 10; min-height: 64px; background: var(--nav-bg); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border-bottom: 1px solid var(--border-soft); padding: 10px 24px; display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
   .nav .brand { display: inline-flex; align-items: center; gap: 10px; font-family: var(--font-display); font-size: 20px; font-weight: 700; letter-spacing: -0.02em; color: var(--ink-primary); }
   .nav .brand:hover { color: var(--ink-primary); }
-  .nav .coin { width: 30px; height: 30px; border-radius: 50%; background: var(--gradient-coin); color: #14100A; display: inline-flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; letter-spacing: 0; box-shadow: 0 2px 12px rgba(245,185,66,0.35); }
+  .nav .coin { width: 30px; height: 30px; border-radius: 50%; background: var(--gradient-coin); color: var(--on-gold); display: inline-flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; letter-spacing: 0; box-shadow: var(--gold-shadow-sm); }
   .nav a.navlink { color: var(--ink-muted); font-size: 14px; font-weight: 500; padding-bottom: 2px; border-bottom: 2px solid transparent; }
   .nav a.navlink:hover { color: var(--ink-primary); }
   .nav .spacer { flex: 1; }
@@ -457,55 +544,63 @@ const CSS = `
   .card { background: var(--surface-card); border: 1px solid var(--border-soft); border-radius: 16px; padding: 1.25rem; margin-bottom: 16px; }
   .card h2, .card h3 { margin-bottom: 10px; }
   /* Deal cards — the money moment */
-  .card-deal { position: relative; background: var(--surface-deal); border: 1px solid var(--border-gold); padding: 1.5rem; box-shadow: 0 8px 32px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,217,122,0.08); transition: transform .2s ease, box-shadow .2s ease; }
+  .card-deal { position: relative; background: var(--surface-deal); border: 1px solid var(--border-gold); padding: 1.5rem; box-shadow: var(--card-shadow), var(--card-inset); transition: transform .2s ease, box-shadow .2s ease; }
   .card-deal::before { content: ""; position: absolute; top: 0; left: 0; right: 0; height: 3px; background: var(--gradient-coin); border-radius: 16px 16px 0 0; }
-  .card-deal:hover { transform: translateY(-3px); box-shadow: 0 16px 44px rgba(0,0,0,0.55), 0 0 0 1px var(--border-gold); }
+  .card-deal:hover { transform: translateY(-3px); box-shadow: var(--card-shadow-hover), 0 0 0 1px var(--border-gold); }
   /* Vault-secure panels (signing room, contract status) */
-  .vault { border-color: var(--border-gold); box-shadow: 0 8px 32px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,217,122,0.08); }
+  .vault { border-color: var(--border-gold); box-shadow: var(--card-shadow), var(--card-inset); }
   .muted { color: var(--ink-muted); font-size: 13px; }
   .deal-value { font-family: var(--font-display); font-weight: 700; font-size: 1.35rem; color: var(--gold); letter-spacing: -0.01em; white-space: nowrap; }
   .avatar { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; border-radius: 10px; background: var(--bg-spotlight); border: 1px solid var(--border-soft); color: var(--gold); font-family: var(--font-display); font-weight: 700; font-size: 15px; vertical-align: middle; margin-right: 8px; }
 
   /* Buttons */
-  .btn { display: inline-block; background: var(--gradient-coin); color: #14100A; border: 1px solid transparent; border-radius: 10px; padding: 0.7rem 1.4rem; font: 600 0.9375rem var(--font-body); cursor: pointer; transition: all .18s ease; box-shadow: 0 4px 18px rgba(245,185,66,0.28); }
-  .btn:hover { transform: translateY(-2px); box-shadow: 0 8px 26px rgba(245,185,66,0.42); color: #14100A; }
-  .btn:active { transform: translateY(0); box-shadow: 0 4px 18px rgba(245,185,66,0.28); }
+  .btn { display: inline-block; background: var(--gradient-coin); color: var(--on-gold); border: 1px solid transparent; border-radius: 10px; padding: 0.7rem 1.4rem; font: 600 0.9375rem var(--font-body); cursor: pointer; transition: all .18s ease; box-shadow: var(--gold-shadow-md); }
+  .btn:hover { transform: translateY(-2px); box-shadow: var(--gold-shadow-lg); color: var(--on-gold); }
+  .btn:active { transform: translateY(0); box-shadow: var(--gold-shadow-md); }
   .btn:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
   .btn-sm { padding: 5px 11px; font-size: 13px; }
   .btn-outline { background: transparent; color: var(--ink-primary); border-color: var(--border-soft); box-shadow: none; }
   .btn-outline:hover { border-color: var(--border-gold); background: var(--bg-spotlight); color: var(--ink-primary); transform: none; box-shadow: none; }
-  .btn-danger { background: var(--danger); color: #fff; box-shadow: none; }
-  .btn-danger:hover { background: var(--danger-deep); color: #fff; }
-  .btn-green { background: var(--mint); color: #0A0A12; box-shadow: none; }
-  .btn-green:hover { background: var(--mint-deep); color: #0A0A12; }
+  .btn-danger { background: var(--danger); color: var(--on-danger); box-shadow: none; }
+  .btn-danger:hover { background: var(--danger-deep); color: var(--on-danger); }
+  .btn-green { background: var(--mint); color: var(--on-mint); box-shadow: none; }
+  .btn-green:hover { background: var(--mint-deep); color: var(--on-mint); }
   .btn.liked { animation: likepop .15s ease; }
   @keyframes likepop { 0% { transform: scale(1); } 50% { transform: scale(1.15); } 100% { transform: scale(1); } }
 
   /* Forms / inputs */
-  input[type=text], input[type=email], input[type=password], input[type=url], input[type=number], textarea {
+  input[type=text], input[type=email], input[type=password], input[type=url], input[type=number], textarea, select {
     width: 100%; background: var(--bg-elevated); border: 1px solid var(--border-soft); border-radius: 10px;
     color: var(--ink-primary); padding: 0.7rem 0.9rem; font-size: 14px; font-family: var(--font-body); margin-bottom: 12px;
   }
   input::placeholder, textarea::placeholder { color: var(--ink-faint); }
-  input:focus, textarea:focus { outline: none; border-color: var(--border-gold); box-shadow: 0 0 0 3px var(--gold-glow); background: var(--bg-spotlight); }
+  input:focus, textarea:focus, select:focus { outline: none; border-color: var(--border-gold); box-shadow: 0 0 0 3px var(--gold-glow); background: var(--bg-spotlight); }
+  select { cursor: pointer; }
   label { display: block; font-size: 0.8125rem; font-weight: 600; color: var(--ink-muted); margin-bottom: 6px; }
+
+  /* Styled upload button — the native file input is visually hidden behind a themed label. */
+  .file-input { position: absolute; width: 1px; height: 1px; opacity: 0; overflow: hidden; z-index: -1; }
+  .file-btn { display: inline-block; background: transparent; color: var(--gold); border: 1px dashed var(--border-gold); border-radius: 10px; padding: 0.6rem 1.1rem; font: 600 0.875rem var(--font-body); cursor: pointer; margin-bottom: 12px; transition: all .18s ease; }
+  .file-btn:hover { background: var(--gold-glow); border-style: solid; }
+  .file-btn .file-btn-text { overflow-wrap: anywhere; }
 
   /* Flash messages */
   .flash-ok, .flash-err { border-radius: 10px; padding: 0.8rem 1.1rem; font: 500 0.9375rem var(--font-body); border: 1px solid; margin-bottom: 14px; animation: flashin .3s ease; }
-  .flash-ok { background: rgba(63,224,176,0.15); border-color: rgba(63,224,176,0.4); color: var(--mint); }
-  .flash-err { background: rgba(255,92,122,0.12); border-color: rgba(255,92,122,0.4); color: var(--danger); }
+  .flash-ok { background: var(--ok-bg); border-color: var(--ok-border); color: var(--mint); }
+  .flash-err { background: var(--err-bg); border-color: var(--err-border); color: var(--danger); }
   @keyframes flashin { from { transform: translateY(-8px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
-  .demo-banner { background: rgba(255,180,84,0.12); border: 1px solid rgba(255,180,84,0.35); color: var(--warning); border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; font-size: 14px; }
+  .demo-banner { background: var(--warn-bg); border: 1px solid var(--warn-border); color: var(--warning); border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; font-size: 14px; }
   .demo-banner b { color: var(--warning); }
 
   /* Badges */
   .badge { display: inline-block; border-radius: 999px; padding: 0.2rem 0.7rem; font: 600 0.75rem var(--font-body); text-transform: uppercase; letter-spacing: 0.08em; border: 1px solid transparent; }
-  .badge-pass, .badge-approved { background: rgba(63,224,176,0.12); color: var(--success); border-color: rgba(63,224,176,0.3); }
+  .badge-pass, .badge-approved { background: var(--ok-badge-bg); color: var(--success); border-color: var(--ok-badge-border); }
   .badge-approved::before { content: "\\2713  "; }
-  .badge-flag, .badge-pending { background: rgba(255,180,84,0.12); color: var(--warning); border-color: rgba(255,180,84,0.3); }
-  .badge-fail, .badge-rejected { background: rgba(255,92,122,0.12); color: var(--danger); border-color: rgba(255,92,122,0.3); }
+  .badge-contract { background: var(--ok-badge-bg); color: var(--mint); border-color: var(--ok-border); }
+  .badge-flag, .badge-pending { background: var(--warn-bg); color: var(--warning); border-color: var(--warn-badge-border); }
+  .badge-fail, .badge-rejected { background: var(--err-bg); color: var(--danger); border-color: var(--err-badge-border); }
   .badge-suspended { background: transparent; color: var(--ink-faint); border: 1px dashed var(--border-soft); }
-  .warn-badge { display: inline-block; background: rgba(255,180,84,0.16); color: var(--warning); border: 1px dashed var(--warning); border-radius: 999px; padding: 0.2rem 0.7rem; font: 600 0.75rem var(--font-body); text-transform: uppercase; letter-spacing: 0.08em; }
+  .warn-badge { display: inline-block; background: var(--warn-bg); color: var(--warning); border: 1px dashed var(--warning); border-radius: 999px; padding: 0.2rem 0.7rem; font: 600 0.75rem var(--font-body); text-transform: uppercase; letter-spacing: 0.08em; }
   .warn-badge .warn-ic { font-style: normal; display: inline-block; animation: warnpulse 2s ease-in-out infinite; }
   @keyframes warnpulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
 
@@ -513,7 +608,7 @@ const CSS = `
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border-soft); vertical-align: top; }
   th { color: var(--ink-muted); font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.14em; }
-  tbody tr:hover td, tr:hover td { background: rgba(23,23,38,0.5); }
+  tbody tr:hover td, tr:hover td { background: var(--row-hover); }
 
   /* Stat tiles */
   .stats { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
@@ -551,17 +646,20 @@ const CSS = `
 
   /* Icon navigation (company pages) */
   .nav-icons { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
-  .nav-ic { display: inline-flex; align-items: center; justify-content: center; width: 40px; height: 40px; border-radius: 12px; color: var(--ink-muted); border: 1px solid transparent; transition: all .15s ease; }
+  .nav-ic { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 40px; height: 40px; border-radius: 12px; color: var(--ink-muted); border: 1px solid transparent; transition: all .15s ease; }
   .nav-ic svg { width: 20px; height: 20px; }
   .nav-ic:hover { color: var(--ink-primary); background: var(--bg-spotlight); }
   .nav-ic.active { color: var(--gold); background: var(--gold-glow); border-color: var(--border-gold); }
-  .nav-plus { display: inline-flex; align-items: center; justify-content: center; width: 42px; height: 42px; border-radius: 50%; background: var(--gradient-coin); color: #14100A; margin-left: 6px; box-shadow: 0 4px 18px rgba(245,185,66,0.35); transition: all .18s ease; }
+  .nav-badge { position: absolute; top: -5px; right: -5px; min-width: 18px; height: 18px; border-radius: 999px; background: var(--danger); color: var(--on-danger); font-size: 11px; font-weight: 700; font-family: var(--font-body); display: inline-flex; align-items: center; justify-content: center; padding: 0 5px; line-height: 1; box-shadow: 0 0 0 2px var(--bg-void); pointer-events: none; }
+  .unread-chip { display: inline-flex; align-items: center; justify-content: center; min-width: 20px; height: 20px; border-radius: 999px; background: var(--danger); color: var(--on-danger); font-size: 12px; font-weight: 700; padding: 0 6px; margin-left: 8px; }
+  button.nav-ic { background: transparent; cursor: pointer; font-size: 17px; line-height: 1; padding: 0; font-family: var(--font-body); }
+  .nav-plus { display: inline-flex; align-items: center; justify-content: center; width: 42px; height: 42px; border-radius: 50%; background: var(--gradient-coin); color: var(--on-gold); margin-left: 6px; box-shadow: var(--gold-shadow-plus); transition: all .18s ease; }
   .nav-plus svg { width: 22px; height: 22px; }
-  .nav-plus:hover { transform: translateY(-2px) scale(1.05); box-shadow: 0 8px 26px rgba(245,185,66,0.5); color: #14100A; }
+  .nav-plus:hover { transform: translateY(-2px) scale(1.05); box-shadow: var(--gold-shadow-plus-hover); color: var(--on-gold); }
   @media (max-width: 700px) { .nav { gap: 8px; padding: 8px 12px; } .nav-ic { width: 36px; height: 36px; } }
 
   /* Attached media on cards */
-  .card-media img, .card-media video { display: block; width: 100%; max-height: 420px; object-fit: cover; border-radius: 12px; border: 1px solid var(--border-soft); margin-top: 12px; background: #000; }
+  .card-media img, .card-media video { display: block; width: 100%; max-height: 420px; object-fit: cover; border-radius: 12px; border: 1px solid var(--border-soft); margin-top: 12px; background: var(--media-bg); }
 
   /* Create menu (/new) */
   .create-card { display: block; text-align: center; padding: 2rem 1.5rem; }
@@ -570,12 +668,12 @@ const CSS = `
 
   /* Chat */
   .conv-row { display: flex; align-items: center; gap: 12px; padding: 12px 4px; border-bottom: 1px solid var(--border-soft); color: var(--ink-primary); }
-  .conv-row:hover { background: rgba(23,23,38,0.5); color: var(--ink-primary); }
+  .conv-row:hover { background: var(--row-hover); color: var(--ink-primary); }
   .conv-row .conv-name { font-weight: 600; }
   .conv-row .conv-preview { color: var(--ink-muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 420px; }
   .chat-box { display: flex; flex-direction: column; gap: 10px; margin: 14px 0; }
-  .bubble { max-width: 75%; border-radius: 14px; padding: 10px 14px; font-size: 14px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
-  .bubble.mine { align-self: flex-end; background: rgba(245,185,66,0.14); border: 1px solid var(--border-gold); border-bottom-right-radius: 4px; }
+  .bubble { width: fit-content; max-width: min(70%, 560px); border-radius: 14px; padding: 10px 14px; font-size: 14px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
+  .bubble.mine { align-self: flex-end; background: var(--bubble-mine-bg); border: 1px solid var(--border-gold); border-bottom-right-radius: 4px; }
   .bubble.theirs { align-self: flex-start; background: var(--bg-spotlight); border: 1px solid var(--border-soft); border-bottom-left-radius: 4px; }
   .bubble .bubble-meta { font-size: 11px; color: var(--ink-faint); margin-top: 4px; }
   .bubble .bubble-sender { font-size: 12px; font-weight: 600; color: var(--mint); margin-bottom: 2px; }
@@ -587,6 +685,13 @@ const CSS = `
   /* Dashboard charts */
   .chart-wrap { position: relative; min-height: 260px; }
   .dash-empty { color: var(--ink-muted); font-size: 14px; padding: 18px 0; text-align: center; }
+
+  /* Rich company profiles — cover banner + avatar + bio/about */
+  .profile-cover { display: block; width: 100%; height: 180px; object-fit: cover; border-radius: 12px; border: 1px solid var(--border-soft); margin-bottom: 14px; background: var(--media-bg); }
+  .avatar-img { display: inline-block; width: 34px; height: 34px; border-radius: 10px; object-fit: cover; vertical-align: middle; margin-right: 8px; border: 1px solid var(--border-soft); background: var(--bg-spotlight); }
+  .avatar-lg, .avatar-lg.avatar-img { width: 96px; height: 96px; border-radius: 24px; font-size: 40px; border: 1px solid var(--border-gold); }
+  .profile-bio { margin-top: 8px; font-size: 15px; color: var(--ink-primary); }
+  .profile-about { margin-top: 10px; white-space: pre-wrap; }
 `;
 
 /** Inline SVG icons for the company nav (no emoji in the nav bar). */
@@ -598,29 +703,47 @@ const NAV_ICONS = {
   dashboard: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 21h18"/><path d="M6 21v-7M11 21V9M16 21v-11M21 21V5"/></svg>',
   plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>'
 };
-function navIcon(key, href, label, active) {
-  return `<a class="nav-ic${active === key ? ' active' : ''}" href="${href}" title="${label}" aria-label="${label}">${NAV_ICONS[key]}</a>`;
+function navIcon(key, href, label, active, badge) {
+  const badgeHtml = badge > 0 ? `<span class="nav-badge" aria-label="${badge} unread messages">${badge > 99 ? '99+' : badge}</span>` : '';
+  return `<a class="nav-ic${active === key ? ' active' : ''}" href="${href}" title="${label}" aria-label="${label}">${NAV_ICONS[key]}${badgeHtml}</a>`;
 }
+
+/** Total unread messages across all of a company's conversations (one query). */
+function totalUnread(companyId) {
+  return db.prepare(`
+    SELECT COUNT(*) AS n FROM messages m
+    JOIN conversation_members cm ON cm.conversation_id = m.conversation_id
+    WHERE cm.company_id = ? AND m.sender_company_id != ?
+      AND m.created_at > COALESCE(cm.last_read_at, '')`).get(companyId, companyId).n;
+}
+
+/** Moon/sun theme toggle button (client-side only, persists to localStorage). */
+const THEME_TOGGLE_BTN = '<button class="nav-ic theme-toggle" id="theme-toggle" type="button" title="Toggle light/dark theme" aria-label="Toggle light/dark theme">🌙</button>';
 
 /** Render the full HTML page shell. */
 function page(title, body, user, msg, err, active, headExtra) {
+  const unread = (user && !user.isAdmin) ? totalUnread(user.id) : 0;
   const navLinks = user && user.isAdmin
-    ? `<a class="navlink" href="/admin">Dashboard</a>
+    ? `${THEME_TOGGLE_BTN}
+       <a class="navlink" href="/admin">Dashboard</a>
        <form method="POST" action="/admin/logout" style="display:inline"><button class="btn btn-sm btn-outline">Log out</button></form>`
     : user
     ? `<span class="nav-icons">
          ${navIcon('home', '/home', 'Home', active)}
-         ${navIcon('chats', '/chats', 'Chats', active)}
+         ${navIcon('chats', '/chats', 'Chats', active, unread)}
          ${navIcon('search', '/search', 'Search', active)}
          ${navIcon('profile', '/profile', 'Profile', active)}
          ${navIcon('dashboard', '/dashboard', 'Dashboard', active)}
          <a class="nav-plus" href="/new" title="Create" aria-label="Create">${NAV_ICONS.plus}</a>
        </span>
+       ${THEME_TOGGLE_BTN}
        <form method="POST" action="/logout" style="display:inline"><button class="btn btn-sm btn-outline">Log out</button></form>`
-    : `<a class="navlink" href="/login">Sign in</a>
+    : `${THEME_TOGGLE_BTN}
+       <a class="navlink" href="/login">Sign in</a>
        <a class="navlink" href="/signup">Register company</a>`;
   return `<!DOCTYPE html>
 <html lang="en"><head>
+<script>try{if(localStorage.getItem('dz-theme')==='light'){document.documentElement.dataset.theme='light';}}catch(e){}</script>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)} — Dealzoin</title>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -640,6 +763,23 @@ ${headExtra || ''}
 </main>
 <div class="footer">Dealzoin — the B2B deal network. Companies only. 🪙</div>
 <script>setTimeout(function(){document.querySelectorAll('.flash-ok,.flash-err').forEach(function(e){e.style.transition='opacity .4s';e.style.opacity='0';setTimeout(function(){e.remove();},400);});},5000);</script>
+<script>(function(){
+  var root=document.documentElement,btn=document.getElementById('theme-toggle');
+  function paintIcon(){if(btn)btn.textContent=root.dataset.theme==='light'?'\\u2600\\uFE0F':'\\uD83C\\uDF19';}
+  if(btn){paintIcon();btn.addEventListener('click',function(){
+    if(root.dataset.theme==='light'){root.removeAttribute('data-theme');}else{root.dataset.theme='light';}
+    try{localStorage.setItem('dz-theme',root.dataset.theme==='light'?'light':'dark');}catch(e){}
+    paintIcon();
+  });}
+  document.querySelectorAll('input.file-input').forEach(function(inp){
+    inp.addEventListener('change',function(){
+      var lbl=inp.closest('.file-btn');if(!lbl)return;
+      var t=lbl.querySelector('.file-btn-text');if(!t)return;
+      var def=t.getAttribute('data-default')||'\\uD83D\\uDCCE Attach photo or video';
+      t.textContent=(inp.files&&inp.files.length)?'\\uD83D\\uDCCE '+Array.prototype.map.call(inp.files,function(f){return f.name;}).join(', '):def;
+    });
+  });
+})();</script>
 </body></html>`;
 }
 
@@ -649,10 +789,33 @@ function statusBadge(status) {
 function resultBadge(result) {
   return `<span class="badge badge-${esc(result)}">${esc(result)}</span>`;
 }
-/** Rounded-square company avatar (institutions, not people — never a circle). */
-function avatarHtml(name) {
+/** Rounded-square company avatar (institutions, not people — never a circle).
+ *  Renders the company's uploaded avatar image when set, else a letter tile. */
+function avatarHtml(name, mediaId, extraClass) {
+  const cls = extraClass ? ' ' + extraClass : '';
+  if (mediaId) return `<img class="avatar-img${cls}" src="/media/${mediaId}" alt="${esc(String(name || '?'))} avatar" loading="lazy">`;
   const initial = (String(name || '?').trim()[0] || '?').toUpperCase();
-  return `<span class="avatar" aria-hidden="true">${esc(initial)}</span>`;
+  return `<span class="avatar${cls}" aria-hidden="true">${esc(initial)}</span>`;
+}
+/** avatar_media_id for a company, or null (letter-avatar fallback). */
+const _avatarStmt = db.prepare('SELECT avatar_media_id FROM companies WHERE id = ?');
+function companyAvatarMediaId(companyId) {
+  const row = _avatarStmt.get(companyId);
+  return row && row.avatar_media_id ? row.avatar_media_id : null;
+}
+
+// ----- Deal dropdown options -----
+const DEAL_CURRENCIES = ['USD', 'EUR', 'GBP', 'AED', 'SAR', 'JPY', 'CNY', 'INR'];
+const DEAL_TIME_PERIODS = ['7 days', '14 days', '30 days', '60 days', '90 days', '6 months', '1 year', 'Ongoing'];
+function optionsHtml(list, selected) {
+  return list.map(v => `<option value="${esc(v)}"${v === selected ? ' selected' : ''}>${esc(v)}</option>`).join('');
+}
+
+// ----- Styled upload button (hides the native file input) -----
+const MEDIA_ACCEPT = 'image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm';
+function fileButtonHtml(labelText) {
+  const def = labelText || '📎 Attach photo or video';
+  return `<label class="file-btn"><span class="file-btn-text" data-default="${esc(def)}">${esc(def)}</span><input type="file" class="file-input" name="media" accept="${MEDIA_ACCEPT}"></label>`;
 }
 
 // ============================= SESSIONS & AUTH MIDDLEWARE =============================
@@ -921,6 +1084,13 @@ function commentListHtml(comments, names) {
      <span class="muted"> · ${esc(c.created_at.slice(0, 16).replace('T', ' '))}</span></div>`
   ).join('');
 }
+/** Build a feed-card item from a full deal row. */
+function dealFeedItem(d) {
+  return { kind: 'deal', ref_id: d.id, company_id: d.company_id, title: d.title, body: d.description,
+           value: d.value, currency: d.currency || 'USD', time_period: d.time_period || '',
+           contract_state: d.contract_state || null, contract_party: d.contract_party || '',
+           created_at: d.created_at, media_id: d.media_id };
+}
 /** Render one feed card. kind: 'deal' | 'post' | 'repost'. */
 function feedCard(item, user, names) {
   const ownerName = names.get(item.company_id) || 'Unknown';
@@ -933,10 +1103,10 @@ function feedCard(item, user, names) {
 
   let head, bodyHtml;
   if (item.kind === 'post') {
-    head = `${avatarHtml(ownerName)} <a href="/company/${item.company_id}"><b>${esc(ownerName)}</b></a> <span class="muted">posted</span>`;
+    head = `${avatarHtml(ownerName, companyAvatarMediaId(item.company_id))} <a href="/company/${item.company_id}"><b>${esc(ownerName)}</b></a> <span class="muted">posted</span>`;
     bodyHtml = `<p style="margin-top:8px;white-space:pre-wrap">${esc(item.body)}</p>`;
   } else if (item.kind === 'deal') {
-    head = `${avatarHtml(ownerName)} <a href="/company/${item.company_id}"><b>${esc(ownerName)}</b></a> <span class="muted">posted a deal</span>`;
+    head = `${avatarHtml(ownerName, companyAvatarMediaId(item.company_id))} <a href="/company/${item.company_id}"><b>${esc(ownerName)}</b></a> <span class="muted">posted a deal</span>`;
     bodyHtml = `<h3 style="margin-top:8px"><a href="/deal/${item.ref_id}">${esc(item.title)}</a></h3>
       <p style="margin-top:6px;white-space:pre-wrap">${esc(item.body)}</p>`;
   } else { // repost
@@ -946,11 +1116,19 @@ function feedCard(item, user, names) {
     bodyHtml = `<h3 style="margin-top:8px"><a href="/deal/${item.repost_of}">${esc(item.title)}</a></h3>
       <p style="margin-top:6px;white-space:pre-wrap">${esc(item.body)}</p>`;
   }
-  // Deal value sits top-right in display gold; timestamp stays muted.
+  // Deal value sits top-right in display gold (with currency); time period + timestamp stay muted.
   const timeStamp = esc(item.created_at.slice(0, 16).replace('T', ' '));
-  const headRight = (item.kind !== 'post' && item.value)
-    ? `<div style="text-align:right"><div class="deal-value">${esc(item.value)}</div><span class="muted">${timeStamp}</span></div>`
-    : `<span class="muted">${timeStamp}</span>`;
+  let headRight;
+  if (item.kind !== 'post') {
+    const valLine = item.value ? `<div class="deal-value">💰 ${esc(item.value)} ${esc(item.currency || 'USD')}</div>` : '';
+    const tpLine = item.time_period ? `<span class="muted">⏳ ${esc(item.time_period)}</span>` : '';
+    headRight = `<div style="text-align:right">${valLine}${tpLine}${tpLine ? '<br>' : ''}<span class="muted">${timeStamp}</span></div>`;
+  } else {
+    headRight = `<span class="muted">${timeStamp}</span>`;
+  }
+  // Mint badge once the deal's contract has been approved by an admin.
+  const contractBadge = (item.kind !== 'post' && item.contract_state === 'approved')
+    ? `<div style="margin-top:10px"><span class="badge badge-contract">Contract approved ✓${item.contract_party ? ' (with ' + esc(item.contract_party) + ')' : ''}</span></div>` : '';
 
   const signBtn = (item.kind !== 'post' && user && !user.isAdmin && !isOwn && item.company_id !== user.id)
     ? `<a class="btn btn-sm btn-green" href="/deal/${targetId}/contract">Sign contract</a>` : '';
@@ -977,6 +1155,7 @@ function feedCard(item, user, names) {
     ${headRight}</div>
     ${bodyHtml}
     ${mediaHtml(item.media_id)}
+    ${contractBadge}
     ${interact}
   </div>`;
 }
@@ -987,13 +1166,16 @@ function feedQuery(filterSql, ...args) {
   return db.prepare(`
     SELECT * FROM (
       SELECT 'deal' AS kind, d.id AS ref_id, d.company_id, d.title, d.description AS body,
-             d.value, d.created_at, NULL AS repost_of, NULL AS orig_company, d.media_id
+             d.value, d.created_at, NULL AS repost_of, NULL AS orig_company, d.media_id,
+             d.currency, d.time_period, d.contract_state, d.contract_party
       FROM deals d ${filterSql}
       UNION ALL
-      SELECT 'post', p.id, p.company_id, NULL, p.body, NULL, p.created_at, NULL, NULL, p.media_id
+      SELECT 'post', p.id, p.company_id, NULL, p.body, NULL, p.created_at, NULL, NULL, p.media_id,
+             NULL, NULL, NULL, NULL
       FROM posts p ${filterSql}
       UNION ALL
-      SELECT 'repost', r.id, r.company_id, d.title, d.description, d.value, r.created_at, d.id, d.company_id, d.media_id
+      SELECT 'repost', r.id, r.company_id, d.title, d.description, d.value, r.created_at, d.id, d.company_id, d.media_id,
+             d.currency, d.time_period, d.contract_state, d.contract_party
       FROM reposts r JOIN deals d ON d.id = r.deal_id ${filterSql ? filterSql.replace(/company_id/g, 'r.company_id') : ''}
     ) ORDER BY created_at DESC LIMIT 100`).all(...args, ...args, ...args);
 }
@@ -1007,7 +1189,7 @@ app.get('/timeline', requireCompany, (req, res) => {
     <h2>Explore — all deals</h2>
     <form method="POST" action="/posts" enctype="multipart/form-data">
       <textarea name="body" rows="3" maxlength="2000" placeholder="Share an update with the network…" required style="margin-bottom:8px"></textarea>
-      <input type="file" name="media" accept="image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm" style="margin-bottom:8px">
+      ${fileButtonHtml()}
       <button class="btn btn-sm" type="submit">Post update</button>
       <a class="btn btn-sm btn-outline" href="/deals/new" style="margin-left:8px">Post a deal</a>
     </form>
@@ -1031,10 +1213,14 @@ app.get('/deals/new', requireCompany, (req, res) => {
     <p class="muted" style="margin-bottom:12px">Deals go live on every company's timeline immediately.</p>
     <form method="POST" action="/deals" enctype="multipart/form-data">
       <label>Deal title</label><input type="text" name="title" required maxlength="160">
-      <label>Deal value (e.g. $50,000 / year)</label><input type="text" name="value" maxlength="80">
+      <label>Deal value (e.g. 50,000 / year)</label><input type="text" name="value" maxlength="80">
+      <div class="grid2">
+        <div><label>Currency</label><select name="currency">${optionsHtml(DEAL_CURRENCIES, 'USD')}</select></div>
+        <div><label>Time period</label><select name="time_period">${optionsHtml(DEAL_TIME_PERIODS, '30 days')}</select></div>
+      </div>
       <label>Description</label><textarea name="description" rows="6" required maxlength="4000"></textarea>
       <label>Photo or video (optional — image ≤ 5 MB, video ≤ 25 MB)</label>
-      <input type="file" name="media" accept="image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm">
+      ${fileButtonHtml()}
       <button class="btn" type="submit">Publish deal</button>
     </form>
   </div>`;
@@ -1045,10 +1231,12 @@ app.post('/deals', requireCompany, mediaUpload, (req, res) => {
   const title = String(req.body.title || '').trim();
   const desc = String(req.body.description || '').trim();
   const value = String(req.body.value || '').trim().slice(0, 80);
+  const currency = DEAL_CURRENCIES.includes(req.body.currency) ? req.body.currency : 'USD';
+  const timePeriod = DEAL_TIME_PERIODS.includes(req.body.time_period) ? req.body.time_period : '30 days';
   if (!title || !desc) return res.redirect('/deals/new?err=' + encodeURIComponent('Title and description are required.'));
   const mediaId = req.file ? saveMedia(req.user.id, req.file) : null;
-  db.prepare('INSERT INTO deals (company_id, title, description, value, created_at, media_id) VALUES (?,?,?,?,?,?)')
-    .run(req.user.id, title.slice(0, 160), desc.slice(0, 4000), value, now(), mediaId);
+  db.prepare('INSERT INTO deals (company_id, title, description, value, created_at, media_id, currency, time_period) VALUES (?,?,?,?,?,?,?,?)')
+    .run(req.user.id, title.slice(0, 160), desc.slice(0, 4000), value, now(), mediaId, currency, timePeriod);
   res.redirect('/timeline?msg=' + encodeURIComponent('Deal published to all timelines!'));
 });
 
@@ -1131,13 +1319,13 @@ app.get('/search', requireCompany, (req, res) => {
     const companies = db.prepare(`SELECT * FROM companies WHERE status = 'approved' AND (name LIKE ? OR description LIKE ?) ORDER BY name LIMIT 30`).all(like, like);
     const names = companyNameMap();
     dealsHtml = deals.length
-      ? deals.map(d => feedCard({ kind: 'deal', ref_id: d.id, company_id: d.company_id, title: d.title, body: d.description, value: d.value, created_at: d.created_at, media_id: d.media_id }, req.user, names)).join('')
+      ? deals.map(d => feedCard(dealFeedItem(d), req.user, names)).join('')
       : '<p class="muted">No deals match your search.</p>';
     companiesHtml = companies.length
       ? companies.map(c => {
           const fc = followCounts(c.id);
           return `<div class="card">
-            <div class="feed-head"><h3>${avatarHtml(c.name)}<a href="/company/${c.id}">${esc(c.name)}</a></h3>${followButton(req.user, c.id)}</div>
+            <div class="feed-head"><h3>${avatarHtml(c.name, c.avatar_media_id)}<a href="/company/${c.id}">${esc(c.name)}</a></h3>${followButton(req.user, c.id)}</div>
             <p class="muted">${fc.followers} followers · ${fc.following} following</p>
             <p style="margin-top:6px">${esc(c.description || '')}</p>
           </div>`;
@@ -1167,16 +1355,19 @@ app.get('/company/:id', requireCompany, (req, res) => {
   const deals = db.prepare('SELECT * FROM deals WHERE company_id = ? ORDER BY created_at DESC LIMIT 50').all(id);
   const names = companyNameMap();
   const dealsHtml = deals.length
-    ? deals.map(d => feedCard({ kind: 'deal', ref_id: d.id, company_id: d.company_id, title: d.title, body: d.description, value: d.value, created_at: d.created_at, media_id: d.media_id }, req.user, names)).join('')
+    ? deals.map(d => feedCard(dealFeedItem(d), req.user, names)).join('')
     : '<div class="card"><p class="muted">No deals yet.</p></div>';
 
   const body = `
   <div class="card">
-    <div class="feed-head"><h2>${avatarHtml(c.name)}${esc(c.name)}</h2>${followButton(req.user, c.id)}</div>
+    ${c.header_media_id ? `<img class="profile-cover" src="/media/${c.header_media_id}" alt="${esc(c.name)} header image" loading="lazy">` : ''}
+    <div class="feed-head"><h2>${avatarHtml(c.name, c.avatar_media_id, 'avatar-lg')}${esc(c.name)}</h2>${followButton(req.user, c.id)}</div>
+    ${c.bio ? `<p class="profile-bio">${esc(c.bio)}</p>` : ''}
     <p class="muted">${fc.followers} followers · ${fc.following} following · member since ${esc(c.created_at.slice(0, 10))}</p>
     ${c.website ? `<p style="margin-top:8px">🌐 <a href="${esc(c.website)}" rel="noopener noreferrer nofollow">${esc(c.website)}</a></p>` : ''}
     <p style="margin-top:10px;white-space:pre-wrap">${esc(c.description || '')}</p>
   </div>
+  ${c.about ? `<div class="card"><h3>About</h3><p class="profile-about">${esc(c.about)}</p></div>` : ''}
   <h2 class="sec-h">Deals by ${esc(c.name)}</h2>
   ${dealsHtml}`;
   res.send(page(c.name, body, req.user, req.query.msg, req.query.err));
@@ -1213,7 +1404,7 @@ function latestContract(dealId) {
 app.get('/deal/:id', requireCompany, (req, res) => {
   const deal = getDealOr404(req, res);
   if (!deal) return;
-  const owner = db.prepare('SELECT id, name FROM companies WHERE id = ?').get(deal.company_id);
+  const owner = db.prepare('SELECT id, name, avatar_media_id FROM companies WHERE id = ?').get(deal.company_id);
   const contract = latestContract(deal.id);
   const names = companyNameMap();
 
@@ -1226,15 +1417,26 @@ app.get('/deal/:id', requireCompany, (req, res) => {
       ${contract.decided_at ? ' · decided ' + esc(contract.decided_at.slice(0, 16).replace('T', ' ')) + ' UTC' : ''}</p>
     </div>`;
   }
+  if (deal.contract_state === 'approved') {
+    contractHtml += `<div class="card vault">
+      <h3>Contract <span class="badge badge-contract">Contract approved ✓${deal.contract_party ? ' (with ' + esc(deal.contract_party) + ')' : ''}</span></h3>
+      <p class="muted">This deal's contract was approved by an admin and archived.</p>
+    </div>`;
+  }
 
-  const signBtn = req.user.id !== deal.company_id
+  const dealValueHtml = deal.value
+    ? `<div style="text-align:right"><div class="deal-value">💰 ${esc(deal.value)} ${esc(deal.currency || 'USD')}</div>${deal.time_period ? `<span class="muted">⏳ ${esc(deal.time_period)}</span><br>` : ''}<span class="muted">${esc(deal.created_at.slice(0, 16).replace('T', ' '))}</span></div>`
+    : `<div style="text-align:right">${deal.time_period ? `<span class="muted">⏳ ${esc(deal.time_period)}</span><br>` : ''}<span class="muted">${esc(deal.created_at.slice(0, 16).replace('T', ' '))}</span></div>`;
+
+  const signBtn = req.user.id !== deal.company_id && deal.contract_state !== 'approved'
     ? `<a class="btn btn-green" href="/deal/${deal.id}/contract">View contract &amp; sign</a>` : '';
   const body = `
   <div class="card card-deal">
     <div class="feed-head"><h2>${esc(deal.title)}</h2>
-      ${deal.value ? `<div style="text-align:right"><div class="deal-value">${esc(deal.value)}</div><span class="muted">${esc(deal.created_at.slice(0, 16).replace('T', ' '))}</span></div>` : `<span class="muted">${esc(deal.created_at.slice(0, 16).replace('T', ' '))}</span>`}</div>
-    <p class="muted">by ${avatarHtml(owner ? owner.name : '?')}<a href="/company/${deal.company_id}"><b>${esc(owner ? owner.name : 'Unknown')}</b></a></p>
+      ${dealValueHtml}</div>
+    <p class="muted">by ${avatarHtml(owner ? owner.name : '?', owner ? owner.avatar_media_id : null)}<a href="/company/${deal.company_id}"><b>${esc(owner ? owner.name : 'Unknown')}</b></a></p>
     <p style="margin-top:12px;white-space:pre-wrap">${esc(deal.description)}</p>
+    ${deal.contract_state === 'approved' ? `<div style="margin-top:12px"><span class="badge badge-contract">Contract approved ✓${deal.contract_party ? ' (with ' + esc(deal.contract_party) + ')' : ''}</span></div>` : ''}
     ${mediaHtml(deal.media_id)}
     <div class="feed-actions">${signBtn}</div>
   </div>
@@ -1254,6 +1456,8 @@ app.get('/deal/:id/contract', requireCompany, (req, res) => {
   const clauses = CONTRACT_CLAUSES.map(c => `<p style="margin-bottom:10px">${esc(c)}</p>`).join('');
   const existing = contract && (contract.status === 'pending' || contract.status === 'approved')
     ? `<p class="muted" style="margin-top:10px">A contract for this deal is currently <b>${esc(contract.status)}</b>.</p>` : '';
+  const finalizedNote = deal.contract_state === 'approved'
+    ? `<p style="margin-top:10px"><span class="badge badge-contract">Contract approved ✓${deal.contract_party ? ' (with ' + esc(deal.contract_party) + ')' : ''}</span></p>` : '';
 
   const actions = isOwn
     ? `<p class="muted" style="margin-top:16px">This is your own deal — you cannot sign a contract with yourself.</p>`
@@ -1269,12 +1473,13 @@ app.get('/deal/:id/contract', requireCompany, (req, res) => {
     <hr class="sep">
     <p><b>Provider:</b> ${esc(owner ? owner.name : 'Unknown')}</p>
     <p><b>Counterparty:</b> ${esc(me.name)}</p>
-    ${deal.value ? `<p><b>Deal value:</b> <span class="deal-value" style="font-size:1.05rem">${esc(deal.value)}</span></p>` : ''}
+    ${deal.value ? `<p><b>Deal value:</b> <span class="deal-value" style="font-size:1.05rem">${esc(deal.value)} ${esc(deal.currency || 'USD')}</span>${deal.time_period ? ` <span class="muted">· ⏳ ${esc(deal.time_period)}</span>` : ''}</p>` : ''}
     <h3 style="margin:14px 0 6px">Deal terms</h3>
     <p style="white-space:pre-wrap">${esc(deal.description)}</p>
     <h3 style="margin:14px 0 6px">Standard B2B terms</h3>
     <div class="muted" style="font-size:13px">${clauses}</div>
     ${existing}
+    ${finalizedNote}
     ${actions}
   </div>`;
   res.send(page('Contract — ' + deal.title, body, req.user, req.query.msg, req.query.err));
@@ -1333,7 +1538,11 @@ app.get('/deal/:id/sign', (req, res) => {
   const owner = db.prepare('SELECT id, name FROM companies WHERE id = ?').get(deal.company_id);
   const isOwn = !user.isAdmin && user.id === deal.company_id;
 
-  const signForm = (!user.isAdmin && !isOwn && !(contract && contract.status !== 'rejected')) ? `
+  const finalized = deal.contract_state === 'approved';
+  const signForm = finalized
+    ? `<p style="margin-top:14px"><span class="badge badge-contract">Contract approved ✓${deal.contract_party ? ' (with ' + esc(deal.contract_party) + ')' : ''}</span></p>
+       <p class="muted" style="margin-top:10px">This deal's contract is finalized.</p>`
+    : ((!user.isAdmin && !isOwn && !(contract && contract.status !== 'rejected')) ? `
     <form method="POST" action="/deal/${deal.id}/sign">
       <label>Re-enter your account password (signing authority check)</label>
       <input type="password" name="password" required>
@@ -1346,7 +1555,7 @@ app.get('/deal/:id/sign', (req, res) => {
       <button class="btn btn-green" type="submit" onclick="this.textContent='Verifying signature…'">Verify &amp; sign</button>
     </form>` : (user.isAdmin
       ? '<p class="muted" style="margin-top:14px">Admin view — signing is performed by the counterparty company.</p>'
-      : '<p class="muted" style="margin-top:14px">This is your own deal — the counterparty signs here.</p>');
+      : '<p class="muted" style="margin-top:14px">This is your own deal — the counterparty signs here.</p>'));
 
   const body = `
   <div class="card vault">
@@ -1376,6 +1585,10 @@ app.post('/deal/:id/sign', requireCompany, (req, res) => {
   if (deal.company_id === req.user.id) {
     audit('AUTHENTICATION AGENT', 'signing self-deal guard', 'fail', `${req.user.name} attempted to sign own deal #${deal.id}`);
     return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — You cannot sign your own deal.</h2></div>', req.user));
+  }
+  // Finalized deals cannot be signed again (approved contracts are archived off the queue).
+  if (deal.contract_state === 'approved') {
+    return res.redirect(`/deal/${deal.id}?err=` + encodeURIComponent("This deal's contract is finalized."));
   }
   // One live contract per deal.
   const existing = latestContract(deal.id);
@@ -1463,7 +1676,7 @@ app.get('/home', requireCompany, (req, res) => {
 
 // ============================= CREATE MENU (/new) =============================
 app.get('/new', requireCompany, (req, res) => {
-  const mediaInput = '<input type="file" name="media" accept="image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm">';
+  const mediaInput = fileButtonHtml();
   const body = `
   <div class="card" style="text-align:center">
     <h2>What are we putting on the wire?</h2>
@@ -1476,7 +1689,11 @@ app.get('/new', requireCompany, (req, res) => {
       <p class="muted">Title, value, description — plus an optional photo or video.</p>
       <form method="POST" action="/deals" enctype="multipart/form-data" style="margin-top:14px;text-align:left">
         <label>Deal title</label><input type="text" name="title" required maxlength="160">
-        <label>Deal value (e.g. $50,000 / year)</label><input type="text" name="value" maxlength="80">
+        <label>Deal value (e.g. 50,000 / year)</label><input type="text" name="value" maxlength="80">
+        <div class="grid2" style="gap:10px">
+          <div><label>Currency</label><select name="currency">${optionsHtml(DEAL_CURRENCIES, 'USD')}</select></div>
+          <div><label>Time period</label><select name="time_period">${optionsHtml(DEAL_TIME_PERIODS, '30 days')}</select></div>
+        </div>
         <label>Description</label><textarea name="description" rows="4" required maxlength="4000"></textarea>
         <label>Photo or video (optional — image ≤ 5 MB, video ≤ 25 MB)</label>${mediaInput}
         <button class="btn" type="submit">Publish deal</button>
@@ -1505,19 +1722,49 @@ app.get('/profile', requireCompany, (req, res) => {
   const deals = db.prepare('SELECT * FROM deals WHERE company_id = ? ORDER BY created_at DESC LIMIT 50').all(c.id);
   const posts = db.prepare('SELECT * FROM posts WHERE company_id = ? ORDER BY created_at DESC LIMIT 50').all(c.id);
   const dealsHtml = deals.length
-    ? deals.map(d => feedCard({ kind: 'deal', ref_id: d.id, company_id: d.company_id, title: d.title, body: d.description, value: d.value, created_at: d.created_at, media_id: d.media_id }, req.user, names)).join('')
+    ? deals.map(d => feedCard(dealFeedItem(d), req.user, names)).join('')
     : '<div class="card"><p class="muted">No deals yet — <a href="/deals/new">post your first deal</a>.</p></div>';
   const postsHtml = posts.length
     ? posts.map(p => feedCard({ kind: 'post', ref_id: p.id, company_id: p.company_id, body: p.body, created_at: p.created_at, media_id: p.media_id }, req.user, names)).join('')
     : '<div class="card"><p class="muted">No posts yet — share an update from the <a href="/new">create menu</a>.</p></div>';
 
+  const coverHtml = c.header_media_id ? `<img class="profile-cover" src="/media/${c.header_media_id}" alt="${esc(c.name)} header image" loading="lazy">` : '';
   const body = `
   <div class="card">
-    <div class="feed-head"><h2>${avatarHtml(c.name)}${esc(c.name)}</h2>
+    ${coverHtml}
+    <div class="feed-head"><h2>${avatarHtml(c.name, c.avatar_media_id, 'avatar-lg')}${esc(c.name)}</h2>
       <a class="btn btn-sm btn-outline" href="/company/${c.id}">View public profile</a></div>
+    ${c.bio ? `<p class="profile-bio">${esc(c.bio)}</p>` : ''}
     <p class="muted">${esc(c.email)} · ${fc.followers} followers · ${fc.following} following · member since ${esc(c.created_at.slice(0, 10))}</p>
     ${c.website ? `<p style="margin-top:8px">🌐 <a href="${esc(c.website)}" rel="noopener noreferrer nofollow">${esc(c.website)}</a></p>` : ''}
     <p style="margin-top:10px;white-space:pre-wrap">${esc(c.description || '')}</p>
+  </div>
+  ${c.about ? `<div class="card"><h3>About</h3><p class="profile-about">${esc(c.about)}</p></div>` : ''}
+  <h2 class="sec-h">Edit profile</h2>
+  <div class="card">
+    <h3>Profile images</h3>
+    <div class="grid2">
+      <form method="POST" action="/profile/avatar" enctype="multipart/form-data">
+        <label>Avatar (square image works best)</label>
+        ${fileButtonHtml('📎 Attach avatar image')}
+        <button class="btn btn-sm" type="submit">Upload avatar</button>
+      </form>
+      <form method="POST" action="/profile/header" enctype="multipart/form-data">
+        <label>Header / cover image (wide banner)</label>
+        ${fileButtonHtml('📎 Attach header image')}
+        <button class="btn btn-sm" type="submit">Upload header</button>
+      </form>
+    </div>
+  </div>
+  <div class="card">
+    <h3>Bio &amp; about</h3>
+    <form method="POST" action="/profile/info">
+      <label>Bio — one-liner under your name (max 160 characters)</label>
+      <input type="text" name="bio" maxlength="160" value="${esc(c.bio || '')}" placeholder="e.g. Industrial robotics, delivered.">
+      <label>About — the full story (max 2000 characters)</label>
+      <textarea name="about" rows="6" maxlength="2000" placeholder="What your company does, who you serve, why you win.">${esc(c.about || '')}</textarea>
+      <button class="btn" type="submit">Save bio &amp; about</button>
+    </form>
   </div>
   <div class="stats">
     <div class="stat"><div class="num gold">${deals.length}</div><div class="lbl">My deals</div></div>
@@ -1530,6 +1777,28 @@ app.get('/profile', requireCompany, (req, res) => {
   <h2 class="sec-h">My posts</h2>
   ${postsHtml}`;
   res.send(page('My profile', body, req.user, req.query.msg, req.query.err, 'profile'));
+});
+
+// ----- Profile editing: avatar, header/cover image, bio & about -----
+function profileImageUpload(field) {
+  return [requireCompany, mediaUpload, (req, res) => {
+    if (!req.file) return res.redirect('/profile?err=' + encodeURIComponent('Choose an image to upload first.'));
+    if (!String(req.file.mimetype).startsWith('image/')) {
+      return res.redirect('/profile?err=' + encodeURIComponent('Profile images must be image files (JPG, PNG, GIF or WEBP).'));
+    }
+    const mediaId = saveMedia(req.user.id, req.file);
+    db.prepare(`UPDATE companies SET ${field} = ? WHERE id = ?`).run(mediaId, req.user.id);
+    res.redirect('/profile?msg=' + encodeURIComponent(field === 'avatar_media_id' ? 'Avatar updated.' : 'Header image updated.'));
+  }];
+}
+app.post('/profile/avatar', ...profileImageUpload('avatar_media_id'));
+app.post('/profile/header', ...profileImageUpload('header_media_id'));
+
+app.post('/profile/info', requireCompany, (req, res) => {
+  const bio = String(req.body.bio || '').trim().slice(0, 160);
+  const about = String(req.body.about || '').trim().slice(0, 2000);
+  db.prepare('UPDATE companies SET bio = ?, about = ? WHERE id = ?').run(bio, about, req.user.id);
+  res.redirect('/profile?msg=' + encodeURIComponent('Profile updated.'));
 });
 
 // ============================= DASHBOARD (/dashboard) =============================
@@ -1571,9 +1840,9 @@ app.get('/dashboard', requireCompany, (req, res) => {
     barComments.push(comments);
     return `<tr>
       <td><a href="/deal/${d.id}"><b>${esc(d.title)}</b></a></td>
-      <td>${d.value ? `<span class="deal-value" style="font-size:0.95rem">${esc(d.value)}</span>` : '<span class="muted">—</span>'}</td>
+      <td>${d.value ? `<span class="deal-value" style="font-size:0.95rem">${esc(d.value)} ${esc(d.currency || 'USD')}</span>` : '<span class="muted">—</span>'}</td>
       <td>${likes}</td><td>${comments}</td>
-      <td>${ct ? statusBadge(ct.status) : '<span class="muted">—</span>'}</td>
+      <td>${ct ? statusBadge(ct.status) : (d.contract_state === 'approved' ? `<span class="badge badge-contract" title="With ${esc(d.contract_party || '')}">approved ✓</span>` : '<span class="muted">—</span>')}</td>
     </tr>`;
   }).join('') : '<tr><td colspan="5" class="muted">No deals yet — <a href="/deals/new">post your first deal</a>.</td></tr>';
 
@@ -1591,15 +1860,18 @@ app.get('/dashboard', requireCompany, (req, res) => {
   <script>
   (function () {
     if (!window.Chart) return;
-    var ink = '#9A97A8', soft = '#242435', primary = '#F4F1E8';
+    var cs = getComputedStyle(document.documentElement);
+    var v = function (name, fb) { var x = cs.getPropertyValue(name).trim(); return x || fb; };
+    var ink = v('--ink-muted', '#9A97A8'), soft = v('--border-soft', '#242435'), primary = v('--ink-primary', '#F4F1E8');
+    var gold = v('--gold', '#F5B942'), mint = v('--mint', '#3FE0B0'), warn = v('--warning', '#FFB454'), dgr = v('--danger', '#FF5C7A'), faint = v('--ink-faint', '#5C5A6B'), bgv = v('--bg-void', '#0A0A12');
     var base = { responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { color: primary } } } };
     var bar = ${jsonForHtml({ labels: barLabels, likes: barLikes, comments: barComments })};
     var bctx = document.getElementById('chart-deals');
     if (bctx && bar.labels.length) {
       new Chart(bctx, { type: 'bar',
         data: { labels: bar.labels, datasets: [
-          { label: 'Likes', data: bar.likes, backgroundColor: '#F5B942', borderRadius: 6 },
-          { label: 'Comments', data: bar.comments, backgroundColor: '#3FE0B0', borderRadius: 6 }
+          { label: 'Likes', data: bar.likes, backgroundColor: gold, borderRadius: 6 },
+          { label: 'Comments', data: bar.comments, backgroundColor: mint, borderRadius: 6 }
         ]},
         options: Object.assign({}, base, { scales: {
           y: { beginAtZero: true, ticks: { precision: 0, color: ink }, grid: { color: soft } },
@@ -1610,9 +1882,9 @@ app.get('/dashboard', requireCompany, (req, res) => {
     var dn = ${jsonForHtml({ labels: statusRows.map(r => r.status), values: statusRows.map(r => r.n) })};
     var dctx = document.getElementById('chart-contracts');
     if (dctx && dn.labels.length) {
-      var colors = { approved: '#3FE0B0', pending: '#FFB454', rejected: '#FF5C7A' };
+      var colors = { approved: mint, pending: warn, rejected: dgr };
       new Chart(dctx, { type: 'doughnut',
-        data: { labels: dn.labels, datasets: [{ data: dn.values, backgroundColor: dn.labels.map(function (l) { return colors[l] || '#5C5A6B'; }), borderColor: '#0A0A12', borderWidth: 2 }]},
+        data: { labels: dn.labels, datasets: [{ data: dn.values, backgroundColor: dn.labels.map(function (l) { return colors[l] || faint; }), borderColor: bgv, borderWidth: 2 }]},
         options: base
       });
     }
@@ -1657,12 +1929,21 @@ app.get('/chats', requireCompany, (req, res) => {
       ? esc((names.get(last.sender_company_id) || 'Unknown') + ': ' + last.body.slice(0, 80))
       : '<span class="muted">No messages yet</span>';
     const when = esc((last ? last.created_at : c.created_at).slice(0, 16).replace('T', ' '));
+    const unread = db.prepare(`
+      SELECT COUNT(*) AS n FROM messages m
+      WHERE m.conversation_id = ? AND m.sender_company_id != ?
+        AND m.created_at > COALESCE((SELECT last_read_at FROM conversation_members WHERE conversation_id = ? AND company_id = ?), '')`)
+      .get(c.id, req.user.id, c.id, req.user.id).n;
+    const other = c.type === 'private'
+      ? db.prepare('SELECT company_id FROM conversation_members WHERE conversation_id = ? AND company_id != ? LIMIT 1').get(c.id, req.user.id)
+      : null;
     return `<a class="conv-row" href="/chat/${c.id}">
-      ${avatarHtml(dn)}
+      ${avatarHtml(dn, other ? companyAvatarMediaId(other.company_id) : null)}
       <div style="flex:1;min-width:0">
         <div class="conv-name">${esc(dn)} ${c.type === 'group' ? '<span class="badge badge-pending">group</span>' : ''}</div>
         <div class="conv-preview">${preview}</div>
       </div>
+      ${unread ? `<span class="unread-chip">${unread}</span>` : ''}
       <span class="muted" style="white-space:nowrap">${when}</span>
     </a>`;
   }).join('');
@@ -1675,7 +1956,7 @@ app.get('/chats', requireCompany, (req, res) => {
     const matches = db.prepare(`SELECT * FROM companies WHERE status = 'approved' AND id != ? AND name LIKE ? ORDER BY name LIMIT 20`).all(req.user.id, like);
     resultsHtml = matches.length ? matches.map(c => `
       <div class="feed-head" style="padding:6px 0">
-        <div>${avatarHtml(c.name)}<a href="/company/${c.id}"><b>${esc(c.name)}</b></a></div>
+        <div>${avatarHtml(c.name, c.avatar_media_id)}<a href="/company/${c.id}"><b>${esc(c.name)}</b></a></div>
         <form method="POST" action="/chats/private"><input type="hidden" name="company_id" value="${c.id}"><button class="btn btn-sm" type="submit">Chat</button></form>
       </div>`).join('')
       : '<p class="muted">No approved companies match that name.</p>';
@@ -1763,8 +2044,16 @@ app.get('/chat/:id', (req, res) => {
   if (!user.isAdmin && !member) {
     return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Private conversation</h2><p class="muted">Only members of this conversation can view it.</p></div>', user));
   }
+  // Viewing a conversation marks it read for the viewer (drives the unread badges).
+  if (member) {
+    db.prepare('UPDATE conversation_members SET last_read_at = ? WHERE conversation_id = ? AND company_id = ?').run(now(), convId, user.id);
+  }
   const names = companyNameMap();
   const dn = convDisplayName(conv, user.id, names);
+  const other = conv.type === 'private'
+    ? db.prepare('SELECT company_id FROM conversation_members WHERE conversation_id = ? AND company_id != ? LIMIT 1').get(conv.id, user.id || 0)
+    : null;
+  const convAvatar = avatarHtml(dn, other ? companyAvatarMediaId(other.company_id) : null);
   const msgs = db.prepare('SELECT * FROM messages WHERE conversation_id = ? ORDER BY id ASC LIMIT 500').all(convId);
   const bubbles = msgs.length ? msgs.map(m => {
     const mine = !user.isAdmin && m.sender_company_id === user.id;
@@ -1785,7 +2074,7 @@ app.get('/chat/:id', (req, res) => {
 
   const body = `
   <div class="card">
-    <div class="feed-head"><h2>${avatarHtml(dn)}${esc(dn)}</h2>
+    <div class="feed-head"><h2>${convAvatar}${esc(dn)}</h2>
       <a class="btn btn-sm btn-outline" href="/chats">← All chats</a></div>
     <p class="muted">${conv.type === 'group' ? 'Group conversation' : 'Private conversation'} · auto-refreshes every 8s</p>
     <hr class="sep">
@@ -2039,10 +2328,15 @@ app.post('/admin/deals/:id/delete', requireAdmin, (req, res) => {
 app.post('/admin/contracts/:id/approve', requireAdmin, (req, res) => {
   const ct = db.prepare('SELECT * FROM contracts WHERE id = ?').get(parseInt(req.params.id, 10));
   if (!ct) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Contract not found.'));
-  db.prepare(`UPDATE contracts SET status = 'approved', decided_at = ? WHERE id = ?`).run(now(), ct.id);
+  // 1) Mark the deal as approved and record the signing party on the deal itself.
+  const signer = db.prepare('SELECT name FROM companies WHERE id = ?').get(ct.signer_company_id);
+  const party = signer ? signer.name : 'Unknown';
+  db.prepare(`UPDATE deals SET contract_state = 'approved', contract_party = ? WHERE id = ?`).run(party, ct.deal_id);
+  // 2) Approved contracts are archived: the row is deleted; the deal carries the state.
+  db.prepare('DELETE FROM contracts WHERE id = ?').run(ct.id);
   // TODO PHASE 3 — PAYMENT-ESCROW AGENT: when admin approves a contract, hook Stripe escrow initiation here (create escrow, notify both parties, release funds on delivery confirmation). Not implemented in this version.
-  audit('AUTHENTICATION AGENT', 'admin approve contract', 'pass', `Contract #${ct.id} (deal #${ct.deal_id}) approved by admin`);
-  res.redirect('/admin/dashboard?msg=' + encodeURIComponent('Contract approved. Both parties can now see it on the deal page.'));
+  audit('CONTRACT AGENT', 'admin approve contract', 'pass', `Contract #${ct.id} (deal #${ct.deal_id}) approved by admin — deal marked approved (party: ${party}); contract record archived (deleted)`);
+  res.redirect('/admin/dashboard?msg=' + encodeURIComponent('Contract approved and archived. The deal now shows its finalized state.'));
 });
 app.post('/admin/contracts/:id/reject', requireAdmin, (req, res) => {
   const ct = db.prepare('SELECT * FROM contracts WHERE id = ?').get(parseInt(req.params.id, 10));
