@@ -842,7 +842,7 @@ function page(title, body, user, msg, err, active, headExtra) {
        <form method="POST" action="/admin/logout" style="display:inline"><button class="btn btn-sm btn-outline">Log out</button></form>`
     : user
     ? `<span class="nav-icons">
-         ${navIcon('home', '/home', 'Home', active)}
+         ${navIcon('home', '/timeline', 'Home', active)}
          ${navIcon('chats', '/chats', 'Chats', active, unread)}
          ${navIcon('bell', '/notifications', 'Notifications', active, notifUnread)}
          ${navIcon('search', '/search', 'Search', active)}
@@ -1310,7 +1310,7 @@ app.get('/timeline', requireCompany, (req, res) => {
     </form>
   </div>
   ${feed.length ? feed.map(i => feedCard(i, req.user, names)).join('') : '<div class="card"><p class="muted">The floor is quiet… for now. Post the first deal and watch the network react.</p></div>'}`;
-  res.send(page('Timeline', body, req.user, req.query.msg, req.query.err));
+  res.send(page('Timeline', body, req.user, req.query.msg, req.query.err, 'home'));
 });
 
 app.post('/posts', requireCompany, mediaUpload, (req, res) => {
