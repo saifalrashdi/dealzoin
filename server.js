@@ -10,6 +10,7 @@ const express = require('express');
 const crypto = require('crypto');
 const path = require('path');
 const Database = require('better-sqlite3');
+const multer = require('multer');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'admin@dealzoin.com';
@@ -126,7 +127,116 @@ CREATE TABLE IF NOT EXISTS agent_audit (
   details    TEXT DEFAULT '',
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS conversations (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  type       TEXT NOT NULL DEFAULT 'private',        -- 'private' | 'group'
+  name       TEXT DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS conversation_members (
+  conversation_id INTEGER NOT NULL,
+  company_id      INTEGER NOT NULL,
+  UNIQUE(conversation_id, company_id)
+);
+CREATE TABLE IF NOT EXISTS messages (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  conversation_id   INTEGER NOT NULL,
+  sender_company_id INTEGER NOT NULL,
+  body              TEXT NOT NULL,
+  created_at        TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS media (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  company_id INTEGER NOT NULL,
+  mime       TEXT NOT NULL,
+  filename   TEXT DEFAULT '',
+  data       BLOB NOT NULL,
+  created_at TEXT NOT NULL
+);
 `);
+
+// Graceful upgrades for databases created before media support existed.
+try { db.exec('ALTER TABLE deals ADD COLUMN media_id INTEGER'); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE posts ADD COLUMN media_id INTEGER'); } catch (e) { /* column already exists */ }
+
+// ============================= MEDIA UPLOADS (MULTER) =============================
+// Images: jpg/jpeg/png/gif/webp up to 5 MB. Videos: mp4/webm up to 25 MB.
+const MEDIA_IMAGE_EXT = { jpg: 1, jpeg: 1, png: 1, gif: 1, webp: 1 };
+const MEDIA_VIDEO_EXT = { mp4: 1, webm: 1 };
+const IMAGE_MAX_BYTES = 5 * 1024 * 1024;
+const VIDEO_MAX_BYTES = 25 * 1024 * 1024;
+const MEDIA_RULES_MSG = 'Only JPG, PNG, GIF or WEBP images (max 5 MB) and MP4 or WEBM videos (max 25 MB) are allowed.';
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: VIDEO_MAX_BYTES, files: 1 },
+  fileFilter: (req, file, cb) => {
+    const ext = String(file.originalname || '').split('.').pop().toLowerCase();
+    const mime = String(file.mimetype || '').toLowerCase();
+    const okImage = MEDIA_IMAGE_EXT[ext] && mime.startsWith('image/');
+    const okVideo = MEDIA_VIDEO_EXT[ext] && mime.startsWith('video/');
+    if (okImage || okVideo) return cb(null, true);
+    cb(new Error(MEDIA_RULES_MSG));
+  }
+});
+
+/** Multer middleware for the "media" field with friendly error redirects. Pass-through for urlencoded forms. */
+function mediaUpload(req, res, next) {
+  upload.single('media')(req, res, (err) => {
+    const back = (req.get('referer') || '/new').split('?')[0];
+    if (err) {
+      const msg = err.code === 'LIMIT_FILE_SIZE' ? 'File too large — images max 5 MB, videos max 25 MB.' : (err.message || MEDIA_RULES_MSG);
+      return res.redirect(back + '?err=' + encodeURIComponent(msg));
+    }
+    if (req.file) {
+      const ext = String(req.file.originalname || '').split('.').pop().toLowerCase();
+      if (!MEDIA_VIDEO_EXT[ext] && req.file.size > IMAGE_MAX_BYTES) {
+        return res.redirect(back + '?err=' + encodeURIComponent('Images are limited to 5 MB.'));
+      }
+      // Magic-byte sniffing: the file's real signature must match its claimed type.
+      const b = req.file.buffer;
+      const sig = {
+        png:  b.length > 3 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47,
+        jpg:  b.length > 2 && b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF,
+        gif:  b.length > 5 && b.toString('latin1', 0, 4) === 'GIF8',
+        webp: b.length > 11 && b.toString('latin1', 0, 4) === 'RIFF' && b.toString('latin1', 8, 12) === 'WEBP',
+        mp4:  b.length > 11 && b.toString('latin1', 4, 8) === 'ftyp',
+        webm: b.length > 3 && b[0] === 0x1A && b[1] === 0x45 && b[2] === 0xDF && b[3] === 0xA3,
+      };
+      const realImage = sig.png || sig.jpg || sig.gif || sig.webp;
+      const realVideo = sig.mp4 || sig.webm;
+      if (!realImage && !realVideo) {
+        return res.redirect(back + '?err=' + encodeURIComponent('Upload rejected: file content does not look like a real image or video.'));
+      }
+      if (realImage && !MEDIA_IMAGE_EXT[ext]) return res.redirect(back + '?err=' + encodeURIComponent(MEDIA_RULES_MSG));
+      if (realVideo && !MEDIA_VIDEO_EXT[ext]) return res.redirect(back + '?err=' + encodeURIComponent(MEDIA_RULES_MSG));
+    }
+    next();
+  });
+}
+
+/** Persist an uploaded file to the media table; returns the new media id. */
+function saveMedia(companyId, file) {
+  const info = db.prepare('INSERT INTO media (company_id, mime, filename, data, created_at) VALUES (?,?,?,?,?)')
+    .run(companyId, String(file.mimetype).toLowerCase(), String(file.originalname || '').slice(0, 200), file.buffer, now());
+  return info.lastInsertRowid;
+}
+
+/** Render an attached image/video inside a feed or deal card. */
+function mediaHtml(mediaId) {
+  if (!mediaId) return '';
+  const m = db.prepare('SELECT id, mime FROM media WHERE id = ?').get(mediaId);
+  if (!m) return '';
+  if (String(m.mime).startsWith('video/')) {
+    return `<div class="card-media"><video controls muted playsinline preload="metadata" src="/media/${m.id}"></video></div>`;
+  }
+  return `<div class="card-media"><img src="/media/${m.id}" alt="Attached media" loading="lazy"></div>`;
+}
+
+/** JSON safely embeddable inside an inline <script> tag. */
+function jsonForHtml(obj) {
+  return JSON.stringify(obj).replace(/&/g, '\\u0026').replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
+}
 
 const now = () => new Date().toISOString();
 
@@ -438,18 +548,74 @@ const CSS = `
   .flag-note { color: var(--warning); font-size: 12px; }
   .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
   @media (max-width: 700px) { .grid2, .steps { grid-template-columns: 1fr; } }
+
+  /* Icon navigation (company pages) */
+  .nav-icons { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+  .nav-ic { display: inline-flex; align-items: center; justify-content: center; width: 40px; height: 40px; border-radius: 12px; color: var(--ink-muted); border: 1px solid transparent; transition: all .15s ease; }
+  .nav-ic svg { width: 20px; height: 20px; }
+  .nav-ic:hover { color: var(--ink-primary); background: var(--bg-spotlight); }
+  .nav-ic.active { color: var(--gold); background: var(--gold-glow); border-color: var(--border-gold); }
+  .nav-plus { display: inline-flex; align-items: center; justify-content: center; width: 42px; height: 42px; border-radius: 50%; background: var(--gradient-coin); color: #14100A; margin-left: 6px; box-shadow: 0 4px 18px rgba(245,185,66,0.35); transition: all .18s ease; }
+  .nav-plus svg { width: 22px; height: 22px; }
+  .nav-plus:hover { transform: translateY(-2px) scale(1.05); box-shadow: 0 8px 26px rgba(245,185,66,0.5); color: #14100A; }
+  @media (max-width: 700px) { .nav { gap: 8px; padding: 8px 12px; } .nav-ic { width: 36px; height: 36px; } }
+
+  /* Attached media on cards */
+  .card-media img, .card-media video { display: block; width: 100%; max-height: 420px; object-fit: cover; border-radius: 12px; border: 1px solid var(--border-soft); margin-top: 12px; background: #000; }
+
+  /* Create menu (/new) */
+  .create-card { display: block; text-align: center; padding: 2rem 1.5rem; }
+  .create-card .big-ic { font-size: 2.2rem; }
+  .create-card:hover { border-color: var(--border-gold); }
+
+  /* Chat */
+  .conv-row { display: flex; align-items: center; gap: 12px; padding: 12px 4px; border-bottom: 1px solid var(--border-soft); color: var(--ink-primary); }
+  .conv-row:hover { background: rgba(23,23,38,0.5); color: var(--ink-primary); }
+  .conv-row .conv-name { font-weight: 600; }
+  .conv-row .conv-preview { color: var(--ink-muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 420px; }
+  .chat-box { display: flex; flex-direction: column; gap: 10px; margin: 14px 0; }
+  .bubble { max-width: 75%; border-radius: 14px; padding: 10px 14px; font-size: 14px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+  .bubble.mine { align-self: flex-end; background: rgba(245,185,66,0.14); border: 1px solid var(--border-gold); border-bottom-right-radius: 4px; }
+  .bubble.theirs { align-self: flex-start; background: var(--bg-spotlight); border: 1px solid var(--border-soft); border-bottom-left-radius: 4px; }
+  .bubble .bubble-meta { font-size: 11px; color: var(--ink-faint); margin-top: 4px; }
+  .bubble .bubble-sender { font-size: 12px; font-weight: 600; color: var(--mint); margin-bottom: 2px; }
+  .chat-send { display: flex; gap: 8px; }
+  .chat-send input { margin-bottom: 0; }
+  .member-check { display: flex; gap: 8px; align-items: center; font-size: 14px; color: var(--ink-primary); font-weight: 500; padding: 6px 0; }
+  .member-check input { width: auto; margin: 0; }
+
+  /* Dashboard charts */
+  .chart-wrap { position: relative; min-height: 260px; }
+  .dash-empty { color: var(--ink-muted); font-size: 14px; padding: 18px 0; text-align: center; }
 `;
 
+/** Inline SVG icons for the company nav (no emoji in the nav bar). */
+const NAV_ICONS = {
+  home: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9.5 21v-6h5v6"/></svg>',
+  chats: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a7.5 7.5 0 0 1-7.5 7.5c-1.2 0-2.4-.27-3.4-.78L4 20l1.7-4.4A7.5 7.5 0 1 1 21 11.5z"/><path d="M8.5 10.5h7M8.5 13.5h4"/></svg>',
+  search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m20 20-4.8-4.8"/></svg>',
+  profile: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="7.5" r="3.5"/><path d="M3.5 20v-1.5a5.5 5.5 0 0 1 5.5-5.5h0a5.5 5.5 0 0 1 5.5 5.5V20"/><path d="M16 4h5v7h-5z"/><path d="M17.5 7.5h1"/></svg>',
+  dashboard: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 21h18"/><path d="M6 21v-7M11 21V9M16 21v-11M21 21V5"/></svg>',
+  plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>'
+};
+function navIcon(key, href, label, active) {
+  return `<a class="nav-ic${active === key ? ' active' : ''}" href="${href}" title="${label}" aria-label="${label}">${NAV_ICONS[key]}</a>`;
+}
+
 /** Render the full HTML page shell. */
-function page(title, body, user, msg, err) {
+function page(title, body, user, msg, err, active, headExtra) {
   const navLinks = user && user.isAdmin
     ? `<a class="navlink" href="/admin">Dashboard</a>
        <form method="POST" action="/admin/logout" style="display:inline"><button class="btn btn-sm btn-outline">Log out</button></form>`
     : user
-    ? `<a class="navlink" href="/timeline">Timeline</a>
-       <a class="navlink" href="/deals/new">New Deal</a>
-       <a class="navlink" href="/search">Search</a>
-       <a class="navlink" href="/company/${user.id}">My Profile</a>
+    ? `<span class="nav-icons">
+         ${navIcon('home', '/home', 'Home', active)}
+         ${navIcon('chats', '/chats', 'Chats', active)}
+         ${navIcon('search', '/search', 'Search', active)}
+         ${navIcon('profile', '/profile', 'Profile', active)}
+         ${navIcon('dashboard', '/dashboard', 'Dashboard', active)}
+         <a class="nav-plus" href="/new" title="Create" aria-label="Create">${NAV_ICONS.plus}</a>
+       </span>
        <form method="POST" action="/logout" style="display:inline"><button class="btn btn-sm btn-outline">Log out</button></form>`
     : `<a class="navlink" href="/login">Sign in</a>
        <a class="navlink" href="/signup">Register company</a>`;
@@ -460,6 +626,7 @@ function page(title, body, user, msg, err) {
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 <style>${CSS}</style>
+${headExtra || ''}
 </head><body>
 <nav class="nav">
   <a href="/" class="brand"><span class="coin">Dz</span>Dealzoin</a>
@@ -809,31 +976,38 @@ function feedCard(item, user, names) {
     <div class="feed-head"><div>${head}</div>
     ${headRight}</div>
     ${bodyHtml}
+    ${mediaHtml(item.media_id)}
     ${interact}
   </div>`;
 }
 
 // ============================= COMPANY ROUTES (timeline, posts, deals) =============================
-app.get('/timeline', requireCompany, (req, res) => {
-  const names = companyNameMap();
-  const feed = db.prepare(`
+/** Unified feed query (deals + posts + reposts). Optional filter SQL is injected into each branch. */
+function feedQuery(filterSql, ...args) {
+  return db.prepare(`
     SELECT * FROM (
       SELECT 'deal' AS kind, d.id AS ref_id, d.company_id, d.title, d.description AS body,
-             d.value, d.created_at, NULL AS repost_of, NULL AS orig_company
-      FROM deals d
+             d.value, d.created_at, NULL AS repost_of, NULL AS orig_company, d.media_id
+      FROM deals d ${filterSql}
       UNION ALL
-      SELECT 'post', p.id, p.company_id, NULL, p.body, NULL, p.created_at, NULL, NULL
-      FROM posts p
+      SELECT 'post', p.id, p.company_id, NULL, p.body, NULL, p.created_at, NULL, NULL, p.media_id
+      FROM posts p ${filterSql}
       UNION ALL
-      SELECT 'repost', r.id, r.company_id, d.title, d.description, d.value, r.created_at, d.id, d.company_id
-      FROM reposts r JOIN deals d ON d.id = r.deal_id
-    ) ORDER BY created_at DESC LIMIT 100`).all();
+      SELECT 'repost', r.id, r.company_id, d.title, d.description, d.value, r.created_at, d.id, d.company_id, d.media_id
+      FROM reposts r JOIN deals d ON d.id = r.deal_id ${filterSql ? filterSql.replace(/company_id/g, 'r.company_id') : ''}
+    ) ORDER BY created_at DESC LIMIT 100`).all(...args, ...args, ...args);
+}
+
+app.get('/timeline', requireCompany, (req, res) => {
+  const names = companyNameMap();
+  const feed = feedQuery('');
 
   const body = `
   <div class="card">
-    <h2>Your timeline</h2>
-    <form method="POST" action="/posts">
+    <h2>Explore — all deals</h2>
+    <form method="POST" action="/posts" enctype="multipart/form-data">
       <textarea name="body" rows="3" maxlength="2000" placeholder="Share an update with the network…" required style="margin-bottom:8px"></textarea>
+      <input type="file" name="media" accept="image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm" style="margin-bottom:8px">
       <button class="btn btn-sm" type="submit">Post update</button>
       <a class="btn btn-sm btn-outline" href="/deals/new" style="margin-left:8px">Post a deal</a>
     </form>
@@ -842,11 +1016,12 @@ app.get('/timeline', requireCompany, (req, res) => {
   res.send(page('Timeline', body, req.user, req.query.msg, req.query.err));
 });
 
-app.post('/posts', requireCompany, (req, res) => {
+app.post('/posts', requireCompany, mediaUpload, (req, res) => {
   const txt = String(req.body.body || '').trim();
   if (!txt) return res.redirect('/timeline?err=' + encodeURIComponent('Post cannot be empty.'));
-  db.prepare('INSERT INTO posts (company_id, body, created_at) VALUES (?,?,?)').run(req.user.id, txt.slice(0, 2000), now());
-  res.redirect('/timeline?msg=' + encodeURIComponent('Posted!'));
+  const mediaId = req.file ? saveMedia(req.user.id, req.file) : null;
+  db.prepare('INSERT INTO posts (company_id, body, created_at, media_id) VALUES (?,?,?,?)').run(req.user.id, txt.slice(0, 2000), now(), mediaId);
+  res.redirect((req.get('referer') || '/timeline').split('?')[0] + '?msg=' + encodeURIComponent('Posted!'));
 });
 
 app.get('/deals/new', requireCompany, (req, res) => {
@@ -854,23 +1029,26 @@ app.get('/deals/new', requireCompany, (req, res) => {
   <div class="card" style="max-width:560px;margin:0 auto">
     <h2>📦 Post a new deal</h2>
     <p class="muted" style="margin-bottom:12px">Deals go live on every company's timeline immediately.</p>
-    <form method="POST" action="/deals">
+    <form method="POST" action="/deals" enctype="multipart/form-data">
       <label>Deal title</label><input type="text" name="title" required maxlength="160">
       <label>Deal value (e.g. $50,000 / year)</label><input type="text" name="value" maxlength="80">
       <label>Description</label><textarea name="description" rows="6" required maxlength="4000"></textarea>
+      <label>Photo or video (optional — image ≤ 5 MB, video ≤ 25 MB)</label>
+      <input type="file" name="media" accept="image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm">
       <button class="btn" type="submit">Publish deal</button>
     </form>
   </div>`;
-  res.send(page('New deal', body, req.user, req.query.msg, req.query.err));
+  res.send(page('New deal', body, req.user, req.query.msg, req.query.err, 'new'));
 });
 
-app.post('/deals', requireCompany, (req, res) => {
+app.post('/deals', requireCompany, mediaUpload, (req, res) => {
   const title = String(req.body.title || '').trim();
   const desc = String(req.body.description || '').trim();
   const value = String(req.body.value || '').trim().slice(0, 80);
   if (!title || !desc) return res.redirect('/deals/new?err=' + encodeURIComponent('Title and description are required.'));
-  db.prepare('INSERT INTO deals (company_id, title, description, value, created_at) VALUES (?,?,?,?,?)')
-    .run(req.user.id, title.slice(0, 160), desc.slice(0, 4000), value, now());
+  const mediaId = req.file ? saveMedia(req.user.id, req.file) : null;
+  db.prepare('INSERT INTO deals (company_id, title, description, value, created_at, media_id) VALUES (?,?,?,?,?,?)')
+    .run(req.user.id, title.slice(0, 160), desc.slice(0, 4000), value, now(), mediaId);
   res.redirect('/timeline?msg=' + encodeURIComponent('Deal published to all timelines!'));
 });
 
@@ -953,7 +1131,7 @@ app.get('/search', requireCompany, (req, res) => {
     const companies = db.prepare(`SELECT * FROM companies WHERE status = 'approved' AND (name LIKE ? OR description LIKE ?) ORDER BY name LIMIT 30`).all(like, like);
     const names = companyNameMap();
     dealsHtml = deals.length
-      ? deals.map(d => feedCard({ kind: 'deal', ref_id: d.id, company_id: d.company_id, title: d.title, body: d.description, value: d.value, created_at: d.created_at }, req.user, names)).join('')
+      ? deals.map(d => feedCard({ kind: 'deal', ref_id: d.id, company_id: d.company_id, title: d.title, body: d.description, value: d.value, created_at: d.created_at, media_id: d.media_id }, req.user, names)).join('')
       : '<p class="muted">No deals match your search.</p>';
     companiesHtml = companies.length
       ? companies.map(c => {
@@ -989,7 +1167,7 @@ app.get('/company/:id', requireCompany, (req, res) => {
   const deals = db.prepare('SELECT * FROM deals WHERE company_id = ? ORDER BY created_at DESC LIMIT 50').all(id);
   const names = companyNameMap();
   const dealsHtml = deals.length
-    ? deals.map(d => feedCard({ kind: 'deal', ref_id: d.id, company_id: d.company_id, title: d.title, body: d.description, value: d.value, created_at: d.created_at }, req.user, names)).join('')
+    ? deals.map(d => feedCard({ kind: 'deal', ref_id: d.id, company_id: d.company_id, title: d.title, body: d.description, value: d.value, created_at: d.created_at, media_id: d.media_id }, req.user, names)).join('')
     : '<div class="card"><p class="muted">No deals yet.</p></div>';
 
   const body = `
@@ -1057,6 +1235,7 @@ app.get('/deal/:id', requireCompany, (req, res) => {
       ${deal.value ? `<div style="text-align:right"><div class="deal-value">${esc(deal.value)}</div><span class="muted">${esc(deal.created_at.slice(0, 16).replace('T', ' '))}</span></div>` : `<span class="muted">${esc(deal.created_at.slice(0, 16).replace('T', ' '))}</span>`}</div>
     <p class="muted">by ${avatarHtml(owner ? owner.name : '?')}<a href="/company/${deal.company_id}"><b>${esc(owner ? owner.name : 'Unknown')}</b></a></p>
     <p style="margin-top:12px;white-space:pre-wrap">${esc(deal.description)}</p>
+    ${mediaHtml(deal.media_id)}
     <div class="feed-actions">${signBtn}</div>
   </div>
   ${contractHtml}`;
@@ -1234,6 +1413,400 @@ app.post('/deal/:id/sign', requireCompany, (req, res) => {
   audit('AUTHENTICATION AGENT', 'contract signed', 'pass', `${me.name} signed deal #${deal.id} at ${ts} — pending admin approval`);
 
   res.redirect(`/deal/${deal.id}?msg=` + encodeURIComponent('Contract signed! It is now pending admin approval.'));
+});
+
+// ============================= MEDIA SERVING =============================
+app.get('/media/:id', (req, res) => {
+  const user = currentUser(req);
+  if (!user) return res.redirect('/login?err=' + encodeURIComponent('Please sign in to view media.'));
+  const m = db.prepare('SELECT * FROM media WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!m) return res.status(404).send(page('Not found', '<div class="card"><h2>Media not found</h2></div>', user));
+  res.setHeader('Content-Type', m.mime);
+  res.setHeader('Content-Length', m.data.length);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Cache-Control', 'private, max-age=3600');
+  res.send(m.data);
+});
+
+// ============================= HOME FEED (FOLLOWING) =============================
+app.get('/home', requireCompany, (req, res) => {
+  const names = companyNameMap();
+  const followCount = db.prepare('SELECT COUNT(*) AS n FROM follows WHERE follower_id = ?').get(req.user.id).n;
+  const followFilter = 'WHERE company_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)';
+  const feed = followCount ? feedQuery(followFilter, req.user.id) : [];
+
+  let feedHtml;
+  if (!followCount) {
+    const globalFeed = feedQuery('');
+    feedHtml = `
+    <div class="card" style="text-align:center">
+      <h3>Follow companies to fill your exchange</h3>
+      <p class="muted" style="margin:8px 0 14px">Your home feed shows deals, posts and reposts only from companies you follow. Find the players in your industry and hit Follow.</p>
+      <a class="btn" href="/search">Find companies to follow</a>
+    </div>
+    <h2 class="sec-h">Explore all deals</h2>
+    ${globalFeed.length ? globalFeed.map(i => feedCard(i, req.user, names)).join('') : '<div class="card"><p class="muted">The floor is quiet… for now. Post the first deal and watch the network react.</p></div>'}`;
+  } else {
+    feedHtml = feed.length
+      ? feed.map(i => feedCard(i, req.user, names)).join('')
+      : '<div class="card"><p class="muted">Nothing yet from the companies you follow. <a href="/timeline">Explore all deals →</a></p></div>';
+  }
+
+  const body = `
+  <div class="card">
+    <h2>Home</h2>
+    <p class="muted">Deals, posts and reposts from companies you follow.</p>
+  </div>
+  ${feedHtml}`;
+  res.send(page('Home', body, req.user, req.query.msg, req.query.err, 'home'));
+});
+
+// ============================= CREATE MENU (/new) =============================
+app.get('/new', requireCompany, (req, res) => {
+  const mediaInput = '<input type="file" name="media" accept="image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm">';
+  const body = `
+  <div class="card" style="text-align:center">
+    <h2>What are we putting on the wire?</h2>
+    <p class="muted">Deals carry a value and can be signed into contracts; feed posts keep the network warm.</p>
+  </div>
+  <div class="grid2">
+    <div class="card card-deal create-card">
+      <div class="big-ic">📄</div>
+      <h2>Post a deal</h2>
+      <p class="muted">Title, value, description — plus an optional photo or video.</p>
+      <form method="POST" action="/deals" enctype="multipart/form-data" style="margin-top:14px;text-align:left">
+        <label>Deal title</label><input type="text" name="title" required maxlength="160">
+        <label>Deal value (e.g. $50,000 / year)</label><input type="text" name="value" maxlength="80">
+        <label>Description</label><textarea name="description" rows="4" required maxlength="4000"></textarea>
+        <label>Photo or video (optional — image ≤ 5 MB, video ≤ 25 MB)</label>${mediaInput}
+        <button class="btn" type="submit">Publish deal</button>
+      </form>
+    </div>
+    <div class="card create-card">
+      <div class="big-ic">💬</div>
+      <h2>Post a feed</h2>
+      <p class="muted">Share an update with the network — text plus an optional photo or video.</p>
+      <form method="POST" action="/posts" enctype="multipart/form-data" style="margin-top:14px;text-align:left">
+        <label>Update</label><textarea name="body" rows="5" required maxlength="2000" placeholder="What's happening in your business?"></textarea>
+        <label>Photo or video (optional — image ≤ 5 MB, video ≤ 25 MB)</label>${mediaInput}
+        <button class="btn" type="submit">Post update</button>
+      </form>
+    </div>
+  </div>`;
+  res.send(page('Create', body, req.user, req.query.msg, req.query.err, 'new'));
+});
+
+// ============================= PROFILE (/profile) =============================
+app.get('/profile', requireCompany, (req, res) => {
+  const c = db.prepare('SELECT * FROM companies WHERE id = ?').get(req.user.id);
+  if (!c) return res.redirect('/login?err=' + encodeURIComponent('Please sign in again.'));
+  const fc = followCounts(c.id);
+  const names = companyNameMap();
+  const deals = db.prepare('SELECT * FROM deals WHERE company_id = ? ORDER BY created_at DESC LIMIT 50').all(c.id);
+  const posts = db.prepare('SELECT * FROM posts WHERE company_id = ? ORDER BY created_at DESC LIMIT 50').all(c.id);
+  const dealsHtml = deals.length
+    ? deals.map(d => feedCard({ kind: 'deal', ref_id: d.id, company_id: d.company_id, title: d.title, body: d.description, value: d.value, created_at: d.created_at, media_id: d.media_id }, req.user, names)).join('')
+    : '<div class="card"><p class="muted">No deals yet — <a href="/deals/new">post your first deal</a>.</p></div>';
+  const postsHtml = posts.length
+    ? posts.map(p => feedCard({ kind: 'post', ref_id: p.id, company_id: p.company_id, body: p.body, created_at: p.created_at, media_id: p.media_id }, req.user, names)).join('')
+    : '<div class="card"><p class="muted">No posts yet — share an update from the <a href="/new">create menu</a>.</p></div>';
+
+  const body = `
+  <div class="card">
+    <div class="feed-head"><h2>${avatarHtml(c.name)}${esc(c.name)}</h2>
+      <a class="btn btn-sm btn-outline" href="/company/${c.id}">View public profile</a></div>
+    <p class="muted">${esc(c.email)} · ${fc.followers} followers · ${fc.following} following · member since ${esc(c.created_at.slice(0, 10))}</p>
+    ${c.website ? `<p style="margin-top:8px">🌐 <a href="${esc(c.website)}" rel="noopener noreferrer nofollow">${esc(c.website)}</a></p>` : ''}
+    <p style="margin-top:10px;white-space:pre-wrap">${esc(c.description || '')}</p>
+  </div>
+  <div class="stats">
+    <div class="stat"><div class="num gold">${deals.length}</div><div class="lbl">My deals</div></div>
+    <div class="stat"><div class="num">${posts.length}</div><div class="lbl">My posts</div></div>
+    <div class="stat"><div class="num mint">${fc.followers}</div><div class="lbl">Followers</div></div>
+    <div class="stat"><div class="num">${fc.following}</div><div class="lbl">Following</div></div>
+  </div>
+  <h2 class="sec-h">My deals</h2>
+  ${dealsHtml}
+  <h2 class="sec-h">My posts</h2>
+  ${postsHtml}`;
+  res.send(page('My profile', body, req.user, req.query.msg, req.query.err, 'profile'));
+});
+
+// ============================= DASHBOARD (/dashboard) =============================
+app.get('/dashboard', requireCompany, (req, res) => {
+  const myId = req.user.id;
+  const count = (sql, ...args) => db.prepare(sql).get(...args).n;
+  const stats = {
+    deals: count('SELECT COUNT(*) AS n FROM deals WHERE company_id = ?', myId),
+    posts: count('SELECT COUNT(*) AS n FROM posts WHERE company_id = ?', myId),
+    followers: count('SELECT COUNT(*) AS n FROM follows WHERE followed_id = ?', myId),
+    likesReceived: count(`SELECT COUNT(*) AS n FROM likes l WHERE
+      (l.target_type = 'deal' AND l.target_id IN (SELECT id FROM deals WHERE company_id = ?)) OR
+      (l.target_type = 'post' AND l.target_id IN (SELECT id FROM posts WHERE company_id = ?))`, myId, myId),
+    commentsReceived: count(`SELECT COUNT(*) AS n FROM comments c WHERE
+      (c.target_type = 'deal' AND c.target_id IN (SELECT id FROM deals WHERE company_id = ?)) OR
+      (c.target_type = 'post' AND c.target_id IN (SELECT id FROM posts WHERE company_id = ?))`, myId, myId),
+    signedPending: count(`SELECT COUNT(*) AS n FROM contracts WHERE signer_company_id = ? AND status = 'pending'`, myId),
+    signedApproved: count(`SELECT COUNT(*) AS n FROM contracts WHERE signer_company_id = ? AND status = 'approved'`, myId),
+    minePending: count(`SELECT COUNT(*) AS n FROM contracts WHERE owner_company_id = ? AND status = 'pending'`, myId),
+    mineApproved: count(`SELECT COUNT(*) AS n FROM contracts WHERE owner_company_id = ? AND status = 'approved'`, myId)
+  };
+  const tiles = [
+    ['My deals', stats.deals, ' gold'], ['My posts', stats.posts, ''], ['Followers', stats.followers, ' mint'],
+    ['Likes received', stats.likesReceived, ' gold'], ['Comments received', stats.commentsReceived, ''],
+    ['Contracts I signed', stats.signedPending + ' pending · ' + stats.signedApproved + ' approved', ''],
+    ['Contracts on my deals', stats.minePending + ' pending · ' + stats.mineApproved + ' approved', '']
+  ];
+  const tilesHtml = `<div class="stats">${tiles.map(([l, n, cls]) => `<div class="stat"><div class="num${cls}">${n}</div><div class="lbl">${l}</div></div>`).join('')}</div>`;
+
+  // My deals table + per-deal chart data
+  const myDeals = db.prepare('SELECT * FROM deals WHERE company_id = ? ORDER BY created_at DESC LIMIT 50').all(myId);
+  const barLabels = [], barLikes = [], barComments = [];
+  const dealsRows = myDeals.length ? myDeals.map(d => {
+    const likes = count(`SELECT COUNT(*) AS n FROM likes WHERE target_type = 'deal' AND target_id = ?`, d.id);
+    const comments = count(`SELECT COUNT(*) AS n FROM comments WHERE target_type = 'deal' AND target_id = ?`, d.id);
+    const ct = latestContract(d.id);
+    barLabels.push(d.title.length > 18 ? d.title.slice(0, 18) + '…' : d.title);
+    barLikes.push(likes);
+    barComments.push(comments);
+    return `<tr>
+      <td><a href="/deal/${d.id}"><b>${esc(d.title)}</b></a></td>
+      <td>${d.value ? `<span class="deal-value" style="font-size:0.95rem">${esc(d.value)}</span>` : '<span class="muted">—</span>'}</td>
+      <td>${likes}</td><td>${comments}</td>
+      <td>${ct ? statusBadge(ct.status) : '<span class="muted">—</span>'}</td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="5" class="muted">No deals yet — <a href="/deals/new">post your first deal</a>.</td></tr>';
+
+  // Contract status breakdown (all contracts involving my company)
+  const statusRows = db.prepare(`SELECT status, COUNT(*) AS n FROM contracts WHERE signer_company_id = ? OR owner_company_id = ? GROUP BY status`).all(myId, myId);
+
+  const barCard = myDeals.length
+    ? `<div class="card"><h3>Likes &amp; comments per deal</h3><div class="chart-wrap"><canvas id="chart-deals"></canvas></div></div>`
+    : `<div class="card"><h3>Likes &amp; comments per deal</h3><div class="dash-empty">No deals yet — this chart appears once you publish a deal.</div></div>`;
+  const doughnutCard = statusRows.length
+    ? `<div class="card"><h3>My contract statuses</h3><div class="chart-wrap"><canvas id="chart-contracts"></canvas></div></div>`
+    : `<div class="card"><h3>My contract statuses</h3><div class="dash-empty">No contracts yet — sign a deal or receive a signature to see the breakdown.</div></div>`;
+
+  const chartScript = `
+  <script>
+  (function () {
+    if (!window.Chart) return;
+    var ink = '#9A97A8', soft = '#242435', primary = '#F4F1E8';
+    var base = { responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { color: primary } } } };
+    var bar = ${jsonForHtml({ labels: barLabels, likes: barLikes, comments: barComments })};
+    var bctx = document.getElementById('chart-deals');
+    if (bctx && bar.labels.length) {
+      new Chart(bctx, { type: 'bar',
+        data: { labels: bar.labels, datasets: [
+          { label: 'Likes', data: bar.likes, backgroundColor: '#F5B942', borderRadius: 6 },
+          { label: 'Comments', data: bar.comments, backgroundColor: '#3FE0B0', borderRadius: 6 }
+        ]},
+        options: Object.assign({}, base, { scales: {
+          y: { beginAtZero: true, ticks: { precision: 0, color: ink }, grid: { color: soft } },
+          x: { ticks: { color: ink }, grid: { display: false } }
+        }})
+      });
+    }
+    var dn = ${jsonForHtml({ labels: statusRows.map(r => r.status), values: statusRows.map(r => r.n) })};
+    var dctx = document.getElementById('chart-contracts');
+    if (dctx && dn.labels.length) {
+      var colors = { approved: '#3FE0B0', pending: '#FFB454', rejected: '#FF5C7A' };
+      new Chart(dctx, { type: 'doughnut',
+        data: { labels: dn.labels, datasets: [{ data: dn.values, backgroundColor: dn.labels.map(function (l) { return colors[l] || '#5C5A6B'; }), borderColor: '#0A0A12', borderWidth: 2 }]},
+        options: base
+      });
+    }
+  })();
+  </script>`;
+
+  const body = `
+  <h2 class="sec-h" style="margin-top:0;margin-bottom:14px">📊 Company dashboard</h2>
+  ${tilesHtml}
+  <div class="card"><h3>My deals</h3>
+    <table><tr><th>Title</th><th>Value</th><th>Likes</th><th>Comments</th><th>Contract</th></tr>${dealsRows}</table></div>
+  ${barCard}
+  ${doughnutCard}
+  ${chartScript}`;
+  res.send(page('Dashboard', body, req.user, req.query.msg, req.query.err, 'dashboard',
+    '<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>'));
+});
+
+// ============================= CHATS (PRIVATE + GROUP MESSAGING) =============================
+function isMember(convId, companyId) {
+  return !!db.prepare('SELECT 1 FROM conversation_members WHERE conversation_id = ? AND company_id = ?').get(convId, companyId);
+}
+/** Display name for a conversation: group name, or the other party's company name for private chats. */
+function convDisplayName(conv, viewerId, names) {
+  if (conv.type === 'group') return conv.name || 'Group chat';
+  const other = db.prepare('SELECT company_id FROM conversation_members WHERE conversation_id = ? AND company_id != ? LIMIT 1').get(conv.id, viewerId);
+  if (other) return names.get(other.company_id) || 'Unknown';
+  return names.get(viewerId) || 'Chat';
+}
+
+app.get('/chats', requireCompany, (req, res) => {
+  const names = companyNameMap();
+  const convs = db.prepare(`
+    SELECT c.*, (SELECT MAX(m.created_at) FROM messages m WHERE m.conversation_id = c.id) AS last_at
+    FROM conversations c JOIN conversation_members cm ON cm.conversation_id = c.id
+    WHERE cm.company_id = ?
+    ORDER BY COALESCE(last_at, c.created_at) DESC`).all(req.user.id);
+  const rows = convs.map(c => {
+    const dn = convDisplayName(c, req.user.id, names);
+    const last = db.prepare('SELECT * FROM messages WHERE conversation_id = ? ORDER BY id DESC LIMIT 1').get(c.id);
+    const preview = last
+      ? esc((names.get(last.sender_company_id) || 'Unknown') + ': ' + last.body.slice(0, 80))
+      : '<span class="muted">No messages yet</span>';
+    const when = esc((last ? last.created_at : c.created_at).slice(0, 16).replace('T', ' '));
+    return `<a class="conv-row" href="/chat/${c.id}">
+      ${avatarHtml(dn)}
+      <div style="flex:1;min-width:0">
+        <div class="conv-name">${esc(dn)} ${c.type === 'group' ? '<span class="badge badge-pending">group</span>' : ''}</div>
+        <div class="conv-preview">${preview}</div>
+      </div>
+      <span class="muted" style="white-space:nowrap">${when}</span>
+    </a>`;
+  }).join('');
+
+  // New private chat — search an approved company by name
+  const q = String(req.query.q || '').trim();
+  let resultsHtml = '';
+  if (q) {
+    const like = '%' + q.replace(/[%_]/g, '') + '%';
+    const matches = db.prepare(`SELECT * FROM companies WHERE status = 'approved' AND id != ? AND name LIKE ? ORDER BY name LIMIT 20`).all(req.user.id, like);
+    resultsHtml = matches.length ? matches.map(c => `
+      <div class="feed-head" style="padding:6px 0">
+        <div>${avatarHtml(c.name)}<a href="/company/${c.id}"><b>${esc(c.name)}</b></a></div>
+        <form method="POST" action="/chats/private"><input type="hidden" name="company_id" value="${c.id}"><button class="btn btn-sm" type="submit">Chat</button></form>
+      </div>`).join('')
+      : '<p class="muted">No approved companies match that name.</p>';
+  }
+
+  // New group — checkbox list of approved companies
+  const others = db.prepare(`SELECT id, name FROM companies WHERE status = 'approved' AND id != ? ORDER BY name LIMIT 100`).all(req.user.id);
+  const checks = others.length
+    ? others.map(c => `<label class="member-check"><input type="checkbox" name="members" value="${c.id}">${esc(c.name)}</label>`).join('')
+    : '<p class="muted">No other approved companies on the network yet.</p>';
+
+  const body = `
+  <div class="card">
+    <h2>💬 Chats</h2>
+    ${convs.length ? rows : '<p class="muted">No conversations yet — start a private chat or open a group below.</p>'}
+  </div>
+  <div class="grid2">
+    <div class="card">
+      <h3>New private chat</h3>
+      <form method="GET" action="/chats" style="display:flex;gap:8px;margin:10px 0">
+        <input type="text" name="q" value="${esc(q)}" placeholder="Search a company by name…" style="margin-bottom:0">
+        <button class="btn btn-sm" type="submit">Search</button>
+      </form>
+      ${resultsHtml}
+    </div>
+    <div class="card">
+      <h3>New group</h3>
+      <form method="POST" action="/chats/group" style="margin-top:10px">
+        <label>Group name</label><input type="text" name="name" required maxlength="120" placeholder="e.g. Q3 supplier sync">
+        <div style="max-height:220px;overflow:auto">${checks}</div>
+        <button class="btn" type="submit" style="margin-top:10px">Create group</button>
+      </form>
+    </div>
+  </div>`;
+  res.send(page('Chats', body, req.user, req.query.msg, req.query.err, 'chats'));
+});
+
+app.post('/chats/private', requireCompany, (req, res) => {
+  const otherId = parseInt(req.body.company_id, 10);
+  if (!otherId || otherId === req.user.id) {
+    return res.redirect('/chats?err=' + encodeURIComponent('Pick another company to chat with.'));
+  }
+  const other = db.prepare(`SELECT id FROM companies WHERE id = ? AND status = 'approved'`).get(otherId);
+  if (!other) return res.redirect('/chats?err=' + encodeURIComponent('Company not found.'));
+  const existing = db.prepare(`
+    SELECT c.id FROM conversations c
+    WHERE c.type = 'private'
+      AND EXISTS (SELECT 1 FROM conversation_members m WHERE m.conversation_id = c.id AND m.company_id = ?)
+      AND EXISTS (SELECT 1 FROM conversation_members m WHERE m.conversation_id = c.id AND m.company_id = ?)`)
+    .get(req.user.id, otherId);
+  let convId;
+  if (existing) {
+    convId = existing.id;
+  } else {
+    convId = db.prepare(`INSERT INTO conversations (type, name, created_at) VALUES ('private', '', ?)`).run(now()).lastInsertRowid;
+    const ins = db.prepare('INSERT INTO conversation_members (conversation_id, company_id) VALUES (?,?)');
+    ins.run(convId, req.user.id);
+    ins.run(convId, otherId);
+  }
+  res.redirect('/chat/' + convId);
+});
+
+app.post('/chats/group', requireCompany, (req, res) => {
+  const name = String(req.body.name || '').trim().slice(0, 120);
+  if (!name) return res.redirect('/chats?err=' + encodeURIComponent('Group name is required.'));
+  let members = req.body.members || [];
+  if (!Array.isArray(members)) members = [members];
+  const ids = [...new Set(members.map(m => parseInt(m, 10)).filter(n => Number.isInteger(n) && n > 0 && n !== req.user.id))];
+  const valid = ids.filter(id => db.prepare(`SELECT 1 FROM companies WHERE id = ? AND status = 'approved'`).get(id));
+  if (!valid.length) return res.redirect('/chats?err=' + encodeURIComponent('Select at least one company for the group.'));
+  const convId = db.prepare(`INSERT INTO conversations (type, name, created_at) VALUES ('group', ?, ?)`).run(name, now()).lastInsertRowid;
+  const ins = db.prepare('INSERT OR IGNORE INTO conversation_members (conversation_id, company_id) VALUES (?,?)');
+  ins.run(convId, req.user.id);
+  for (const id of valid) ins.run(convId, id);
+  res.redirect('/chat/' + convId + '?msg=' + encodeURIComponent('Group created.'));
+});
+
+app.get('/chat/:id', (req, res) => {
+  const user = currentUser(req);
+  if (!user) return res.redirect('/login?err=' + encodeURIComponent('Please sign in.'));
+  const convId = parseInt(req.params.id, 10);
+  const conv = db.prepare('SELECT * FROM conversations WHERE id = ?').get(convId);
+  if (!conv) return res.status(404).send(page('Not found', '<div class="card"><h2>Conversation not found</h2></div>', user));
+  const member = !user.isAdmin && isMember(convId, user.id);
+  if (!user.isAdmin && !member) {
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Private conversation</h2><p class="muted">Only members of this conversation can view it.</p></div>', user));
+  }
+  const names = companyNameMap();
+  const dn = convDisplayName(conv, user.id, names);
+  const msgs = db.prepare('SELECT * FROM messages WHERE conversation_id = ? ORDER BY id ASC LIMIT 500').all(convId);
+  const bubbles = msgs.length ? msgs.map(m => {
+    const mine = !user.isAdmin && m.sender_company_id === user.id;
+    const sender = names.get(m.sender_company_id) || 'Unknown';
+    return `<div class="bubble ${mine ? 'mine' : 'theirs'}">
+      ${conv.type === 'group' && !mine ? `<div class="bubble-sender">${esc(sender)}</div>` : ''}
+      ${esc(m.body)}
+      <div class="bubble-meta">${esc(m.created_at.slice(0, 16).replace('T', ' '))}</div>
+    </div>`;
+  }).join('') : '<p class="muted">No messages yet — say hello.</p>';
+
+  const sendForm = user.isAdmin
+    ? '<p class="muted">Admin view — conversations are read-only for admins.</p>'
+    : `<form method="POST" action="/chat/${conv.id}/send" class="chat-send">
+         <input type="text" name="body" required maxlength="2000" placeholder="Write a message…" autocomplete="off">
+         <button class="btn" type="submit">Send</button>
+       </form>`;
+
+  const body = `
+  <div class="card">
+    <div class="feed-head"><h2>${avatarHtml(dn)}${esc(dn)}</h2>
+      <a class="btn btn-sm btn-outline" href="/chats">← All chats</a></div>
+    <p class="muted">${conv.type === 'group' ? 'Group conversation' : 'Private conversation'} · auto-refreshes every 8s</p>
+    <hr class="sep">
+    <div class="chat-box" id="chatbox">${bubbles}</div>
+    ${sendForm}
+  </div>
+  <script>window.scrollTo(0, document.body.scrollHeight);</script>`;
+  res.send(page(dn, body, user, req.query.msg, req.query.err, 'chats', '<meta http-equiv="refresh" content="8">'));
+});
+
+app.post('/chat/:id/send', requireCompany, (req, res) => {
+  const convId = parseInt(req.params.id, 10);
+  const conv = db.prepare('SELECT * FROM conversations WHERE id = ?').get(convId);
+  if (!conv || !isMember(convId, req.user.id)) {
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Private conversation</h2></div>', req.user));
+  }
+  const txt = String(req.body.body || '').trim();
+  if (!txt) return res.redirect('/chat/' + convId + '?err=' + encodeURIComponent('Message cannot be empty.'));
+  db.prepare('INSERT INTO messages (conversation_id, sender_company_id, body, created_at) VALUES (?,?,?,?)')
+    .run(convId, req.user.id, txt.slice(0, 2000), now());
+  res.redirect('/chat/' + convId);
 });
 
 // ============================= ADMIN ROUTES =============================
@@ -1436,6 +2009,9 @@ app.post('/admin/companies/:id/delete', requireAdmin, (req, res) => {
     db.prepare('DELETE FROM contracts WHERE signer_company_id = ? OR owner_company_id = ?').run(id, id);
     db.prepare('DELETE FROM sessions WHERE company_id = ?').run(id);
     db.prepare('DELETE FROM verification_codes WHERE company_id = ?').run(id);
+    db.prepare('DELETE FROM media WHERE company_id = ?').run(id);
+    // Remove the company from all conversations (their messages keep attribution as "Unknown").
+    db.prepare('DELETE FROM conversation_members WHERE company_id = ?').run(id);
     db.prepare('DELETE FROM companies WHERE id = ?').run(id);
   });
   wipe();
