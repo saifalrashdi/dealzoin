@@ -1,55 +1,44 @@
-# Dealzoin — real platform (v1)
+# Dealzoin — real platform (v2)
 
-A working B2B platform: company registration with **owner approval**, company login,
-deal/contract submission with **owner approval**, and an **owner dashboard**.
-Real database, hashed passwords, sessions — no demo tricks.
+Working B2B network. Companies register → owner approves → they post deals live to
+every company's timeline, like/comment/repost, search deals & companies, follow
+companies (instagram-style), sign contracts through a terms page with document
+download, negotiate in a private closed room, and the owner gives final approval.
 
 ## Run locally
 
     npm install
     npm start          → http://localhost:3000
 
-On first run the owner account is created and printed to the console:
+First-run admin (printed to console): `admin@dealzoin.com` / `Dealzoin@2026` —
+override with env vars ADMIN_EMAIL / ADMIN_PASSWORD, and change the password after
+first sign-in.
 
-    email:    admin@dealzoin.com
-    password: Dealzoin@2026
+## Feature map
 
-**Sign in as admin and change the password immediately** (top right → Change password).
-Override defaults before first run instead:
+| # | You asked | Where |
+|---|---|---|
+| 1-3 | Post deals, visible to all instantly | Timeline composer (publish deal) |
+| 4 | See all companies' deals | Timeline + Companies + Search |
+| 5 | Search deals | Search page (title & terms) |
+| 6 | Search companies, follow (instagram) | Companies page — instant Follow, counts |
+| 7 | Like / repost / comment / sign on deals | Every deal card in the timeline |
+| 8 | Terms page + download + Proceed | `/deal/:id` → Download (.doc) → Proceed with signing |
+| 9 | Closed room: both parties + admin view | `/deal/:id/room` (others are bounced to sign-in) |
+| 10 | Contract goes to admin for approval | Owner dashboard → Pending contracts → Approve/Reject (parties get notified in the room) |
 
-    ADMIN_EMAIL=you@dealzoin.com ADMIN_PASSWORD='a-long-secret' npm start
+Admin dashboard also shows: pending registrations, approve/reject companies,
+approved companies, all contracts, approved contract value.
 
-## The flow
+## Deploy
 
-1. `/signup` — company registers → status **pending** (cannot sign in to trade yet)
-2. You sign in at `/signin` → **Owner dashboard** shows:
-   - Pending registrations → Approve / Reject
-   - Pending contracts → Approve / Reject
-   - Approved companies, all contracts, KPIs
-3. Approved company signs in → posts a deal → appears in your **pending contracts** queue
-4. You approve → the deal is live (marketplace feed comes next)
+Push to GitHub → Render web service (build `npm install`, start `node server.js`) →
+custom domain dealzoin.com. Env vars: ADMIN_EMAIL, ADMIN_PASSWORD, SESSION_SECRET, PORT, NODE_VERSION=20.
 
-## Deploy (so dealzoin.com serves THIS, not the demo)
+## Known limits (free Render tier)
 
-Any Node host works. On **Render** (free tier OK):
-1. New → Web Service → connect your repo (push this folder to GitHub first)
-2. Build command: `npm install` · Start command: `node server.js`
-3. Environment variables: `ADMIN_EMAIL`, `ADMIN_PASSWORD` (strong!), `SESSION_SECRET` (long random), `PORT=3000`
-4. Add a persistent disk (mount `/var/data`) and set the DB path via env if you want data to survive redeploys — or move to managed Postgres later
-5. Custom domain: add `dealzoin.com` in Render → point DNS (A/CNAME per Render's instructions) → HTTPS automatic
-
-## Production checklist before real companies join
-
-- [ ] Change admin password / set strong env credentials
-- [ ] Set `SESSION_SECRET` and add `cookie: { secure: true }` behind HTTPS (one-line change in server.js once SSL is on)
-- [ ] Replace in-memory session store with Redis/pg when you scale (sessions drop on restart otherwise)
-- [ ] Email notifications on approval/rejection (Mailgun/Resend — ~20 lines)
-- [ ] Backups of `dealzoin.db` (nightly copy — it IS your business data)
-- [ ] Then: marketplace feed, escrow payments, the three AI agents (specs in /connectb2b)
-
-## Files
-
-    server.js        entire app: db, auth, admin, company routes, UI
-    package.json     dependencies (express, express-session, better-sqlite3)
-    .env.example     which env vars to set
-    dealzoin.db      created automatically on first run (SQLite)
+- SQLite file lives on Render's ephemeral disk → data resets on redeploys. Fine for
+  testing; before real users, move the DB to persistent disk or managed Postgres.
+- Sessions are in-memory → everyone is logged out when the server restarts.
+- No email notifications yet (flash messages inside the app only).
+- Next: platform fee % on approved contracts + the three AI agents.
