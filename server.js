@@ -163,6 +163,19 @@ CREATE TABLE IF NOT EXISTS counter_offers (
   status          TEXT NOT NULL DEFAULT 'pending',     -- pending | accepted | refused
   created_at      TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS private_contracts (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  sender_company_id    INTEGER NOT NULL,
+  recipient_company_id INTEGER NOT NULL,
+  title                TEXT NOT NULL,
+  value                REAL,
+  currency             TEXT DEFAULT 'USD',
+  terms                TEXT DEFAULT '',
+  status               TEXT NOT NULL DEFAULT 'pending_recipient', -- pending_recipient | pending_owner | pending_admin | approved | rejected
+  signed_at            TEXT,
+  decided_at           TEXT,
+  created_at           TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS notifications (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   company_id INTEGER NOT NULL,
@@ -383,6 +396,10 @@ function notify(companyId, type, text, link) {
 function unreadNotifications(companyId) {
   return db.prepare('SELECT COUNT(*) AS n FROM notifications WHERE company_id = ? AND is_read = 0').get(companyId).n;
 }
+/** Received private contracts awaiting the recipient's action (drives the nav badge). */
+function unreadPrivateContracts(companyId) {
+  return db.prepare(`SELECT COUNT(*) AS n FROM private_contracts WHERE recipient_company_id = ? AND status = 'pending_recipient'`).get(companyId).n;
+}
 
 // ============================= REPUTATION STARS =============================
 /** Gold star rating for a reputation score (1–5); 0/NULL renders muted "Unrated". */
@@ -504,107 +521,126 @@ function sendVerificationCode(email, code) {
 }
 
 // ============================= HTML LAYOUT & CSS =============================
-// "The Midnight Exchange" theme — molten gold (money) + electric mint (trust) on ink.
+// "The Gilded Ledger" theme (BRAND2) — Midnight Floor dark / Day Ledger light.
+// Craft layers: reeded coin edges, banknote guilloché, sealed-letter mailbox.
 const CSS = `
   :root {
-    --bg-void:       #0A0A12;
-    --bg-elevated:   #11111C;
-    --bg-spotlight:  #171726;
-    --surface-card:  #14141F;
-    --surface-deal:  linear-gradient(160deg, #1B1A2E 0%, #14141F 60%);
+    --bg-void:       #0A0912;
+    --bg-elevated:   #0F0D19;
+    --bg-spotlight:  #1B1929;
+    --surface-card:  #15131F;
+    --surface-deal:  linear-gradient(165deg, #1E1A30 0%, #14121E 55%, #171322 100%);
     --gold:          #F5B942;
     --gold-deep:     #C98A1E;
     --gold-glow:     rgba(245,185,66,0.16);
     --mint:          #3FE0B0;
     --mint-deep:     #1FAF85;
-    --ink-primary:   #F4F1E8;
-    --ink-muted:     #9A97A8;
+    --ink-primary:   #F5F0E4;
+    --ink-muted:     #A39FB2;
     --ink-faint:     #5C5A6B;
     --success:       #3FE0B0;
     --warning:       #FFB454;
     --danger:        #FF5C7A;
     --danger-deep:   #C93A56;
-    --border-soft:   #242435;
-    --border-gold:   rgba(245,185,66,0.35);
-    --gradient-coin: linear-gradient(120deg, #F5B942 0%, #FFD97A 45%, #C98A1E 100%);
+    --border-soft:   #262438;
+    --border-gold:   rgba(245,185,66,0.38);
+    --gradient-coin: linear-gradient(120deg, #F5B942 0%, #FFE1A0 45%, #C98A1E 100%);
     --gold-bright:   #FFD97A;
-    --on-gold:       #14100A;
-    --on-mint:       #0A0A12;
-    --on-danger:     #FFFFFF;
+    --on-gold:       #241A05;
+    --on-mint:       #FFF7F0;
+    --on-danger:     #FFF7F0;
     --bg-glow:       radial-gradient(1200px 600px at 50% -10%, rgba(245,185,66,0.07), transparent 60%);
-    --nav-bg:        rgba(10,10,18,0.85);
-    --media-bg:      #000000;
-    --row-hover:     rgba(23,23,38,0.5);
-    --bubble-mine-bg: rgba(245,185,66,0.14);
-    --card-shadow:        0 8px 32px rgba(0,0,0,0.45);
+    --nav-bg:        rgba(10,9,18,0.85);
+    --media-bg:      #0A0912;
+    --row-hover:     rgba(27,25,41,0.5);
+    --bubble-mine-bg: linear-gradient(160deg, #33280F 0%, #231B0B 100%);
+    --bubble-theirs-bg: #1E1B2D;
+    --card-shadow:        0 10px 34px rgba(0,0,0,0.50);
     --card-shadow-hover:  0 16px 44px rgba(0,0,0,0.55);
-    --card-inset:         inset 0 1px 0 rgba(255,217,122,0.08);
-    --ok-bg:         rgba(63,224,176,0.15);
+    --card-inset:         inset 0 1px 0 rgba(255,217,122,0.10);
+    --input-bg:      #12101C;
+    --input-border:  #2A2840;
+    --ok-bg:         rgba(63,224,176,0.12);
     --ok-border:     rgba(63,224,176,0.4);
-    --ok-badge-bg:   rgba(63,224,176,0.12);
+    --ok-badge-bg:   rgba(63,224,176,0.13);
     --ok-badge-border: rgba(63,224,176,0.3);
     --err-bg:        rgba(255,92,122,0.12);
     --err-border:    rgba(255,92,122,0.4);
     --err-badge-border: rgba(255,92,122,0.3);
-    --warn-bg:       rgba(255,180,84,0.12);
+    --warn-bg:       rgba(255,180,84,0.13);
     --warn-border:   rgba(255,180,84,0.35);
     --warn-badge-border: rgba(255,180,84,0.3);
+    --badge-flag-bg: rgba(255,92,122,0.12);
+    --badge-flag-fg: #FF7A92;
     --gold-shadow-sm: 0 2px 12px rgba(245,185,66,0.35);
     --gold-shadow-md: 0 4px 18px rgba(245,185,66,0.28);
     --gold-shadow-lg: 0 8px 26px rgba(245,185,66,0.42);
     --gold-shadow-plus: 0 4px 18px rgba(245,185,66,0.35);
     --gold-shadow-plus-hover: 0 8px 26px rgba(245,185,66,0.5);
+    --shadow-gold:   0 6px 24px rgba(245,185,66,0.28);
     --font-display: "Space Grotesk", "Segoe UI", system-ui, sans-serif;
     --font-body:    "Inter", -apple-system, "Segoe UI", Roboto, sans-serif;
+    /* Theme-agnostic craft layers (BRAND2) */
+    --coin-reed:     repeating-linear-gradient(90deg, rgba(0,0,0,0.22) 0 2px, transparent 2px 5px);
+    --guilloche:     repeating-radial-gradient(circle at 50% -60%, transparent 0 7px, rgba(140,110,40,0.06) 7px 8px);
+    --radius-card:   16px;
+    --radius-ctl:    10px;
   }
-  /* Light theme — warm off-white paper, dark ink, gold/mint accents kept. */
+  /* Light theme — "Day Ledger": 100% beige-family parchment, espresso ink, darkened bullion gold. No white anywhere. */
   [data-theme="light"] {
-    --bg-void:       #F7F5F0;
-    --bg-elevated:   #FFFFFF;
-    --bg-spotlight:  #F0EDE4;
-    --surface-card:  #FFFFFF;
-    --surface-deal:  linear-gradient(160deg, #FFFBF0 0%, #FFFFFF 60%);
-    --gold:          #A9750D;
-    --gold-deep:     #8A5D0A;
-    --gold-glow:     rgba(169,117,13,0.14);
-    --mint:          #0E9F78;
-    --mint-deep:     #0B8A67;
-    --ink-primary:   #17150F;
-    --ink-muted:     #5A5648;
+    --bg-void:       #ECE2CB;
+    --bg-elevated:   #E2D6B8;
+    --bg-spotlight:  #EFE6CD;
+    --surface-card:  #F5EEDA;
+    --surface-deal:  linear-gradient(165deg, #F9F2DE 0%, #F1E7CC 55%, #F5EBD2 100%);
+    --gold:          #8A5C08;
+    --gold-deep:     #6E4A05;
+    --gold-glow:     rgba(138,92,8,0.14);
+    --mint:          #0B7A58;
+    --mint-deep:     #0B6B4E;
+    --ink-primary:   #2B2114;
+    --ink-muted:     #6E6046;
     --ink-faint:     #8B8574;
-    --success:       #0E9F78;
-    --warning:       #B06F0E;
-    --danger:        #D93A56;
-    --danger-deep:   #B02A44;
-    --border-soft:   #E3DFD3;
-    --border-gold:   rgba(169,117,13,0.4);
-    --gold-bright:   #C98A1E;
-    --on-gold:       #14100A;
-    --on-mint:       #FFFFFF;
-    --on-danger:     #FFFFFF;
-    --bg-glow:       radial-gradient(1200px 600px at 50% -10%, rgba(245,185,66,0.14), transparent 60%);
-    --nav-bg:        rgba(247,245,240,0.88);
+    --success:       #0B7A58;
+    --warning:       #8F5200;
+    --danger:        #C22A47;
+    --danger-deep:   #A31F3C;
+    --border-soft:   #D8CBA6;
+    --border-gold:   rgba(138,92,8,0.45);
+    --gradient-coin: linear-gradient(120deg, #D9A02B 0%, #F0C668 45%, #A9760F 100%);
+    --gold-bright:   #6E4A05;
+    --on-gold:       #241A05;
+    --on-mint:       #FFF7F0;
+    --on-danger:     #FFF7F0;
+    --bg-glow:       radial-gradient(1200px 600px at 50% -10%, rgba(138,92,8,0.06), transparent 60%);
+    --nav-bg:        rgba(236,226,203,0.88);
     --media-bg:      #11111C;
-    --row-hover:     rgba(23,23,20,0.04);
-    --bubble-mine-bg: rgba(245,185,66,0.22);
-    --card-shadow:        0 8px 24px rgba(60,50,20,0.10);
-    --card-shadow-hover:  0 16px 36px rgba(60,50,20,0.16);
+    --row-hover:     rgba(74,56,20,0.06);
+    --bubble-mine-bg: linear-gradient(160deg, #F3DFA6 0%, #EBD18C 100%);
+    --bubble-theirs-bg: #F5EEDA;
+    --card-shadow:        0 10px 28px rgba(74,56,20,0.14);
+    --card-shadow-hover:  0 16px 36px rgba(74,56,20,0.16);
     --card-inset:         inset 0 1px 0 rgba(255,255,255,0.6);
-    --ok-bg:         rgba(14,159,120,0.12);
-    --ok-border:     rgba(14,159,120,0.4);
-    --ok-badge-bg:   rgba(14,159,120,0.10);
-    --ok-badge-border: rgba(14,159,120,0.32);
-    --err-bg:        rgba(217,58,86,0.10);
-    --err-border:    rgba(217,58,86,0.4);
-    --err-badge-border: rgba(217,58,86,0.3);
-    --warn-bg:       rgba(176,111,14,0.10);
-    --warn-border:   rgba(176,111,14,0.35);
-    --warn-badge-border: rgba(176,111,14,0.3);
-    --gold-shadow-sm: 0 2px 12px rgba(169,117,13,0.25);
-    --gold-shadow-md: 0 4px 18px rgba(169,117,13,0.18);
-    --gold-shadow-lg: 0 8px 26px rgba(169,117,13,0.30);
-    --gold-shadow-plus: 0 4px 18px rgba(169,117,13,0.25);
-    --gold-shadow-plus-hover: 0 8px 26px rgba(169,117,13,0.38);
+    --input-bg:      #F9F3E2;
+    --input-border:  #CDBF97;
+    --ok-bg:         rgba(11,122,88,0.10);
+    --ok-border:     rgba(11,122,88,0.4);
+    --ok-badge-bg:   #DFF0E4;
+    --ok-badge-border: rgba(11,107,78,0.45);
+    --err-bg:        rgba(194,42,71,0.10);
+    --err-border:    rgba(194,42,71,0.4);
+    --err-badge-border: rgba(163,31,60,0.45);
+    --warn-bg:       #F3E2B8;
+    --warn-border:   rgba(122,78,0,0.45);
+    --warn-badge-border: rgba(122,78,0,0.4);
+    --badge-flag-bg: #F6DDE2;
+    --badge-flag-fg: #A31F3C;
+    --gold-shadow-sm: 0 2px 12px rgba(138,92,8,0.25);
+    --gold-shadow-md: 0 4px 18px rgba(138,92,8,0.18);
+    --gold-shadow-lg: 0 8px 26px rgba(138,92,8,0.30);
+    --gold-shadow-plus: 0 4px 18px rgba(138,92,8,0.25);
+    --gold-shadow-plus-hover: 0 8px 26px rgba(138,92,8,0.38);
+    --shadow-gold:   0 6px 22px rgba(138,92,8,0.28);
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background-color: var(--bg-void); background-image: var(--bg-glow); background-attachment: fixed; background-repeat: no-repeat; color: var(--ink-primary); font-family: var(--font-body); font-size: 16px; line-height: 1.6; min-height: 100vh; }
@@ -619,6 +655,7 @@ const CSS = `
 
   /* Nav — sticky, blurred, members-only feel */
   .nav { position: sticky; top: 0; z-index: 10; min-height: 64px; background: var(--nav-bg); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border-bottom: 1px solid var(--border-soft); padding: 10px 24px; display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
+  .nav::after { content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px; background: linear-gradient(90deg, transparent, var(--border-gold) 30%, var(--border-gold) 70%, transparent); pointer-events: none; }
   .nav .brand { display: inline-flex; align-items: center; gap: 10px; font-family: var(--font-display); font-size: 20px; font-weight: 700; letter-spacing: -0.02em; color: var(--ink-primary); }
   .nav .brand:hover { color: var(--ink-primary); }
   .nav .coin { width: 30px; height: 30px; border-radius: 50%; background: var(--gradient-coin); color: var(--on-gold); display: inline-flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; letter-spacing: 0; box-shadow: var(--gold-shadow-sm); }
@@ -631,18 +668,22 @@ const CSS = `
   /* Cards */
   .card { background: var(--surface-card); border: 1px solid var(--border-soft); border-radius: 16px; padding: 1.25rem; margin-bottom: 16px; }
   .card h2, .card h3 { margin-bottom: 10px; }
-  /* Deal cards — the money moment */
-  .card-deal { position: relative; background: var(--surface-deal); border: 1px solid var(--border-gold); padding: 1.5rem; box-shadow: var(--card-shadow), var(--card-inset); transition: transform .2s ease, box-shadow .2s ease; }
-  .card-deal::before { content: ""; position: absolute; top: 0; left: 0; right: 0; height: 3px; background: var(--gradient-coin); border-radius: 16px 16px 0 0; }
-  .card-deal:hover { transform: translateY(-3px); box-shadow: var(--card-shadow-hover), 0 0 0 1px var(--border-gold); }
-  /* Vault-secure panels (signing room, contract status) */
-  .vault { border-color: var(--border-gold); box-shadow: var(--card-shadow), var(--card-inset); }
+  /* Deal cards — struck coin: guilloché engraving + reeded gold edge */
+  .card-deal { position: relative; overflow: hidden; background: var(--guilloche), var(--surface-deal), var(--surface-card); border: 1px solid var(--border-gold); padding: 1.5rem; box-shadow: var(--card-shadow), var(--card-inset); transition: transform .2s ease, box-shadow .2s ease; }
+  .card-deal::before { content: ""; position: absolute; top: 0; left: 0; right: 0; height: 4px; background: var(--gradient-coin); border-radius: 16px 16px 0 0; }
+  .card-deal::after { content: ""; position: absolute; top: 0; left: 0; right: 0; height: 4px; background: var(--coin-reed); opacity: .5; pointer-events: none; }
+  .card-deal:hover { transform: translateY(-3px); box-shadow: var(--card-shadow-hover), var(--shadow-gold), 0 0 0 1px var(--border-gold); }
+  /* Vault-secure panels (signing room, contract status) — guilloché + inner door seam */
+  .vault { position: relative; overflow: hidden; border-color: var(--border-gold); background: var(--guilloche), var(--surface-card); box-shadow: var(--card-shadow), var(--card-inset); }
+  .vault::before { content: ""; position: absolute; inset: 10px; border-radius: 10px; border: 1px dashed var(--border-gold); pointer-events: none; }
   .muted { color: var(--ink-muted); font-size: 13px; }
-  .deal-value { font-family: var(--font-display); font-weight: 700; font-size: 1.35rem; color: var(--gold); letter-spacing: -0.01em; white-space: nowrap; }
+  .deal-value { font-family: var(--font-display); font-weight: 700; font-size: 1.35rem; color: var(--gold); letter-spacing: -0.01em; white-space: nowrap; font-variant-numeric: tabular-nums; }
   .avatar { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; border-radius: 10px; background: var(--bg-spotlight); border: 1px solid var(--border-soft); color: var(--gold); font-family: var(--font-display); font-weight: 700; font-size: 15px; vertical-align: middle; margin-right: 8px; }
 
-  /* Buttons */
-  .btn { display: inline-block; background: var(--gradient-coin); color: var(--on-gold); border: 1px solid transparent; border-radius: 10px; padding: 0.7rem 1.4rem; font: 600 0.9375rem var(--font-body); cursor: pointer; transition: all .18s ease; box-shadow: var(--gold-shadow-md); }
+  /* Buttons — primary .btn is the struck gold coin (reeded bottom edge) */
+  .btn { display: inline-block; background: var(--gradient-coin); color: var(--on-gold); border: 1px solid transparent; border-radius: 10px; padding: 0.7rem 1.4rem; font: 600 0.9375rem var(--font-body); cursor: pointer; transition: all .18s ease; box-shadow: var(--gold-shadow-md), inset 0 1px 0 rgba(255,255,255,0.35); }
+  .btn:not(.btn-outline):not(.btn-danger):not(.btn-green) { position: relative; overflow: hidden; }
+  .btn:not(.btn-outline):not(.btn-danger):not(.btn-green)::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: var(--coin-reed); opacity: .35; pointer-events: none; }
   .btn:hover { transform: translateY(-2px); box-shadow: var(--gold-shadow-lg); color: var(--on-gold); }
   .btn:active { transform: translateY(0); box-shadow: var(--gold-shadow-md); }
   .btn:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
@@ -658,8 +699,9 @@ const CSS = `
 
   /* Forms / inputs */
   input[type=text], input[type=email], input[type=password], input[type=url], input[type=number], textarea, select {
-    width: 100%; background: var(--bg-elevated); border: 1px solid var(--border-soft); border-radius: 10px;
+    width: 100%; background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 10px;
     color: var(--ink-primary); padding: 0.7rem 0.9rem; font-size: 14px; font-family: var(--font-body); margin-bottom: 12px;
+    box-shadow: inset 0 2px 4px rgba(0,0,0,0.12);
   }
   input::placeholder, textarea::placeholder { color: var(--ink-faint); }
   input:focus, textarea:focus, select:focus { outline: none; border-color: var(--border-gold); box-shadow: 0 0 0 3px var(--gold-glow); background: var(--bg-spotlight); }
@@ -685,10 +727,12 @@ const CSS = `
   .badge-pass, .badge-approved { background: var(--ok-badge-bg); color: var(--success); border-color: var(--ok-badge-border); }
   .badge-approved::before { content: "\\2713  "; }
   .badge-contract { background: var(--ok-badge-bg); color: var(--mint); border-color: var(--ok-border); }
-  .badge-flag, .badge-pending { background: var(--warn-bg); color: var(--warning); border-color: var(--warn-badge-border); }
+  .badge-pending { background: var(--warn-bg); color: var(--warning); border-color: var(--warn-badge-border); }
+  .badge-flag { background: var(--badge-flag-bg); color: var(--badge-flag-fg); border: 1px dashed currentColor; }
   .badge-fail, .badge-rejected { background: var(--err-bg); color: var(--danger); border-color: var(--err-badge-border); }
+  .badge-sealed { background: transparent; color: var(--gold); border: 1px solid var(--border-gold); }
   .badge-suspended { background: transparent; color: var(--ink-faint); border: 1px dashed var(--border-soft); }
-  .warn-badge { display: inline-block; background: var(--warn-bg); color: var(--warning); border: 1px dashed var(--warning); border-radius: 999px; padding: 0.2rem 0.7rem; font: 600 0.75rem var(--font-body); text-transform: uppercase; letter-spacing: 0.08em; }
+  .warn-badge { display: inline-block; background: var(--badge-flag-bg); color: var(--badge-flag-fg); border: 1px dashed currentColor; border-radius: 999px; padding: 0.2rem 0.7rem; font: 600 0.75rem var(--font-body); text-transform: uppercase; letter-spacing: 0.08em; }
   .warn-badge .warn-ic { font-style: normal; display: inline-block; animation: warnpulse 2s ease-in-out infinite; }
   @keyframes warnpulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
 
@@ -700,9 +744,10 @@ const CSS = `
 
   /* Stat tiles */
   .stats { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
-  .stat { background: var(--surface-card); border: 1px solid var(--border-soft); border-radius: 14px; padding: 1.1rem 1.25rem; flex: 1; min-width: 110px; transition: border-color .18s ease; }
+  .stat { position: relative; overflow: hidden; background: var(--surface-card); border: 1px solid var(--border-soft); border-radius: 14px; padding: 1.1rem 1.25rem; flex: 1; min-width: 110px; transition: border-color .18s ease; }
+  .stat::after { content: ""; position: absolute; inset: 0; background: var(--guilloche); opacity: .7; pointer-events: none; }
   .stat:hover { border-color: var(--border-gold); }
-  .stat .num { font-family: var(--font-display); font-size: 1.75rem; font-weight: 700; color: var(--ink-primary); }
+  .stat .num { position: relative; font-family: var(--font-display); font-size: 1.75rem; font-weight: 700; color: var(--ink-primary); font-variant-numeric: tabular-nums; }
   .stat .num.gold { color: var(--gold); }
   .stat .num.mint { color: var(--mint); }
   .stat .lbl { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.14em; color: var(--ink-muted); margin-top: 2px; }
@@ -738,7 +783,8 @@ const CSS = `
   .nav-ic svg { width: 20px; height: 20px; }
   .nav-ic:hover { color: var(--ink-primary); background: var(--bg-spotlight); }
   .nav-ic.active { color: var(--gold); background: var(--gold-glow); border-color: var(--border-gold); }
-  .nav-badge { position: absolute; top: -5px; right: -5px; min-width: 18px; height: 18px; border-radius: 999px; background: var(--danger); color: var(--on-danger); font-size: 11px; font-weight: 700; font-family: var(--font-body); display: inline-flex; align-items: center; justify-content: center; padding: 0 5px; line-height: 1; box-shadow: 0 0 0 2px var(--bg-void); pointer-events: none; }
+  .nav-badge { position: absolute; top: -5px; right: -5px; min-width: 18px; height: 18px; border-radius: 999px; background: var(--danger); color: var(--on-danger); font-size: 11px; font-weight: 700; font-family: var(--font-body); display: inline-flex; align-items: center; justify-content: center; padding: 0 5px; line-height: 1; box-shadow: 0 0 0 2px var(--bg-void); pointer-events: none; animation: badge-pulse 2.4s ease-in-out infinite; }
+  @keyframes badge-pulse { 50% { transform: scale(1.12); } }
   .unread-chip { display: inline-flex; align-items: center; justify-content: center; min-width: 20px; height: 20px; border-radius: 999px; background: var(--danger); color: var(--on-danger); font-size: 12px; font-weight: 700; padding: 0 6px; margin-left: 8px; }
   button.nav-ic { background: transparent; cursor: pointer; font-size: 17px; line-height: 1; padding: 0; font-family: var(--font-body); }
   .nav-plus { display: inline-flex; align-items: center; justify-content: center; width: 42px; height: 42px; border-radius: 50%; background: var(--gradient-coin); color: var(--on-gold); margin-left: 6px; box-shadow: var(--gold-shadow-plus); transition: all .18s ease; }
@@ -762,7 +808,7 @@ const CSS = `
   .chat-box { display: flex; flex-direction: column; gap: 10px; margin: 14px 0; }
   .bubble { width: fit-content; max-width: min(70%, 560px); border-radius: 14px; padding: 10px 14px; font-size: 14px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
   .bubble.mine { align-self: flex-end; background: var(--bubble-mine-bg); border: 1px solid var(--border-gold); border-bottom-right-radius: 4px; }
-  .bubble.theirs { align-self: flex-start; background: var(--bg-spotlight); border: 1px solid var(--border-soft); border-bottom-left-radius: 4px; }
+  .bubble.theirs { align-self: flex-start; background: var(--bubble-theirs-bg); border: 1px solid var(--border-soft); border-bottom-left-radius: 4px; }
   .bubble .bubble-meta { font-size: 11px; color: var(--ink-faint); margin-top: 4px; }
   .bubble .bubble-sender { font-size: 12px; font-weight: 600; color: var(--mint); margin-bottom: 2px; }
   .chat-send { display: flex; gap: 8px; }
@@ -782,7 +828,7 @@ const CSS = `
   .profile-about { margin-top: 10px; white-space: pre-wrap; }
 
   /* Two-stage contract states */
-  .badge-pending_owner, .badge-pending_admin { background: var(--warn-bg); color: var(--warning); border-color: var(--warn-badge-border); }
+  .badge-pending_owner, .badge-pending_admin, .badge-pending_recipient { background: var(--warn-bg); color: var(--warning); border-color: var(--warn-badge-border); }
   .badge-accepted { background: var(--ok-badge-bg); color: var(--success); border-color: var(--ok-badge-border); }
   .badge-refused { background: var(--err-bg); color: var(--danger); border-color: var(--err-badge-border); }
 
@@ -803,6 +849,68 @@ const CSS = `
   /* Reputation star selector (admin) */
   .rep-form { display: inline-flex; gap: 6px; align-items: center; }
   .rep-form select { width: auto; margin-bottom: 0; padding: 4px 8px; font-size: 13px; }
+
+  /* ============ Private Contracts Mailbox — "sealed letters" (BRAND2) ============ */
+  .mail-row {
+    position: relative; display: flex; align-items: center; gap: 1rem;
+    padding: 1rem 1.25rem; border: 1px solid var(--border-soft);
+    border-radius: 14px; background: var(--surface-card); cursor: pointer; color: var(--ink-primary);
+    margin-bottom: 10px;
+    transition: transform .18s ease, box-shadow .18s ease;
+  }
+  .mail-row--sealed {
+    background: var(--guilloche), var(--surface-deal), var(--surface-card);
+    border-color: var(--border-gold);
+    box-shadow: var(--card-shadow);
+  }
+  .mail-row--sealed::before {      /* envelope flap — folded gold top edge */
+    content: ""; position: absolute; inset: 0 0 auto 0; height: 3px;
+    background: linear-gradient(90deg, transparent, var(--border-gold), transparent);
+  }
+  .mail-row--sealed .mail-subject { font-weight: 700; color: var(--ink-primary); }
+  .mail-row--sealed .mail-sender  { font-weight: 600; }
+  .mail-row--sealed::after {       /* unread dot, mint = seal intact */
+    content: ""; position: absolute; top: 12px; right: 14px; width: 8px; height: 8px;
+    border-radius: 50%; background: var(--mint);
+  }
+  .mail-row--opened .mail-subject { font-weight: 500; color: var(--ink-muted); }
+  .mail-row--opened { opacity: .88; }
+  .mail-row:hover { transform: translateY(-2px); box-shadow: var(--card-shadow), 0 0 0 1px var(--border-gold); color: var(--ink-primary); }
+  .mail-main { flex: 1; min-width: 0; }
+  .mail-subject { font-family: var(--font-body); font-size: 0.9375rem; overflow-wrap: anywhere; }
+  .mail-sender { font-size: 0.8125rem; color: var(--ink-muted); }
+  .mail-amount { font-family: var(--font-display); font-weight: 700; color: var(--gold); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .mail-date { font-size: 0.75rem; color: var(--ink-faint); white-space: nowrap; }
+  /* The wax seal — pure CSS, 40px */
+  .wax-seal {
+    position: relative; flex: 0 0 auto; width: 40px; height: 40px; border-radius: 50%;
+    display: grid; place-items: center;
+    background: radial-gradient(circle at 32% 28%, #FFD97A 0%, #F5B942 42%, #C98A1E 78%, #9A6A0A 100%);
+    box-shadow: inset 0 2px 3px rgba(255,255,255,0.45), inset 0 -3px 5px rgba(80,50,0,0.45),
+                0 2px 6px rgba(0,0,0,0.35);
+    transform: rotate(-8deg);
+    font: 700 0.875rem var(--font-display); color: #4A3200; letter-spacing: -0.02em;
+  }
+  .wax-seal::before {              /* embossed inner ring */
+    content: ""; position: absolute; inset: 4px; border-radius: 50%;
+    border: 1px solid rgba(80,50,0,0.35); box-shadow: inset 0 1px 1px rgba(255,255,255,0.3);
+  }
+  .wax-seal > span { position: relative; }
+  /* Opened letters: the seal is cracked — desaturated, dashed ring, upright */
+  .mail-row--opened .wax-seal {
+    background: var(--bg-spotlight); color: var(--ink-muted); transform: none;
+    box-shadow: inset 0 0 0 1px var(--border-soft);
+  }
+  .mail-row--opened .wax-seal::before { border-style: dashed; border-color: var(--border-soft); box-shadow: none; }
+  /* Mailbox filter pills (All / Sealed / Opened / Signed) */
+  .mail-filters { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0 16px; }
+  .mail-filters a { border-radius: 999px; padding: 0.3rem 0.9rem; font: 600 0.8125rem var(--font-body); border: 1px solid var(--border-soft); color: var(--ink-muted); }
+  .mail-filters a:hover { color: var(--ink-primary); border-color: var(--border-gold); }
+  .mail-filters a.pill-active { background: var(--bg-spotlight); border-color: var(--border-gold); color: var(--gold); }
+  /* Discover companies (empty timeline) */
+  .discover-row { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--border-soft); }
+  .discover-row:last-of-type { border-bottom: none; }
+  .discover-row .grow { flex: 1; min-width: 0; }
 `;
 
 /** Inline SVG icons for the company nav (no emoji in the nav bar). */
@@ -813,7 +921,8 @@ const NAV_ICONS = {
   profile: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="7.5" r="3.5"/><path d="M3.5 20v-1.5a5.5 5.5 0 0 1 5.5-5.5h0a5.5 5.5 0 0 1 5.5 5.5V20"/><path d="M16 4h5v7h-5z"/><path d="M17.5 7.5h1"/></svg>',
   dashboard: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 21h18"/><path d="M6 21v-7M11 21V9M16 21v-11M21 21V5"/></svg>',
   plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
-  bell: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8.5a6 6 0 0 0-12 0c0 6.5-2.5 7.5-2.5 7.5h17S18 15 18 8.5z"/><path d="M10 20a2.2 2.2 0 0 0 4 0"/></svg>'
+  bell: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8.5a6 6 0 0 0-12 0c0 6.5-2.5 7.5-2.5 7.5h17S18 15 18 8.5z"/><path d="M10 20a2.2 2.2 0 0 0 4 0"/></svg>',
+  contracts: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7.5 9 6 9-6"/></svg>'
 };
 function navIcon(key, href, label, active, badge) {
   const badgeHtml = badge > 0 ? `<span class="nav-badge" aria-label="${badge} unread">${badge > 99 ? '99+' : badge}</span>` : '';
@@ -836,6 +945,7 @@ const THEME_TOGGLE_BTN = '<button class="nav-ic theme-toggle" id="theme-toggle" 
 function page(title, body, user, msg, err, active, headExtra) {
   const unread = (user && !user.isAdmin) ? totalUnread(user.id) : 0;
   const notifUnread = (user && !user.isAdmin) ? unreadNotifications(user.id) : 0;
+  const contractsUnread = (user && !user.isAdmin) ? unreadPrivateContracts(user.id) : 0;
   const navLinks = user && user.isAdmin
     ? `${THEME_TOGGLE_BTN}
        <a class="navlink" href="/admin">Dashboard</a>
@@ -844,6 +954,7 @@ function page(title, body, user, msg, err, active, headExtra) {
     ? `<span class="nav-icons">
          ${navIcon('home', '/timeline', 'Home', active)}
          ${navIcon('chats', '/chats', 'Chats', active, unread)}
+         ${navIcon('contracts', '/contracts', 'Contracts', active, contractsUnread)}
          ${navIcon('bell', '/notifications', 'Notifications', active, notifUnread)}
          ${navIcon('search', '/search', 'Search', active)}
          ${navIcon('profile', '/profile', 'Profile', active)}
@@ -861,7 +972,7 @@ function page(title, body, user, msg, err, active, headExtra) {
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)} — Dealzoin</title>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>${CSS}</style>
 ${headExtra || ''}
 </head><body>
@@ -1297,11 +1408,45 @@ function feedQuery(filterSql, ...args) {
 
 app.get('/timeline', requireCompany, (req, res) => {
   const names = companyNameMap();
-  const feed = feedQuery('');
+  // Following-only feed: posts/deals/reposts from companies the user follows, plus their own.
+  const followFilter = 'WHERE (company_id IN (SELECT followed_id FROM follows WHERE follower_id = ?) OR company_id = ?)';
+  const followCount = db.prepare('SELECT COUNT(*) AS n FROM follows WHERE follower_id = ?').get(req.user.id).n;
+  const feed = feedQuery(followFilter, req.user.id, req.user.id);
+
+  let feedHtml;
+  if (!followCount) {
+    // Empty state: friendly note + "Discover companies" (approved companies, limit 8).
+    const discover = db.prepare(`
+      SELECT id, name, avatar_media_id, reputation FROM companies
+      WHERE status = 'approved' AND id != ? ORDER BY reputation DESC, name ASC LIMIT 8`).all(req.user.id);
+    const discoverHtml = discover.length ? `
+      <div class="card">
+        <div class="kicker">Discover companies</div>
+        <h3 style="margin:6px 0 4px">Start your ledger</h3>
+        ${discover.map(c => `
+          <div class="discover-row">
+            <div class="grow">${avatarHtml(c.name, c.avatar_media_id)}<a href="/company/${c.id}"><b>${esc(c.name)}</b></a>
+              <div style="margin-left:42px">${starsHtml(c.reputation, true)}</div></div>
+            ${followButton(req.user, c.id)}
+          </div>`).join('')}
+      </div>` : '';
+    feedHtml = `
+    <div class="card" style="text-align:center">
+      <h3>Your exchange is quiet — follow companies to fill it</h3>
+      <p class="muted" style="margin:8px 0 14px">Your timeline shows deals, posts and reposts only from companies you follow (plus your own). Find the players in your industry and hit Follow.</p>
+      <a class="btn" href="/search">Find companies to follow</a>
+    </div>
+    ${discoverHtml}
+    ${feed.length ? feed.map(i => feedCard(i, req.user, names)).join('') : ''}`;
+  } else {
+    feedHtml = feed.length
+      ? feed.map(i => feedCard(i, req.user, names)).join('')
+      : '<div class="card"><p class="muted">Nothing yet from the companies you follow. <a href="/search">Discover more companies →</a></p></div>';
+  }
 
   const body = `
   <div class="card">
-    <h2>Explore — all deals</h2>
+    <h2>Your exchange — following</h2>
     <form method="POST" action="/posts" enctype="multipart/form-data">
       <textarea name="body" rows="3" maxlength="2000" placeholder="Share an update with the network…" required style="margin-bottom:8px"></textarea>
       ${fileButtonHtml()}
@@ -1309,7 +1454,7 @@ app.get('/timeline', requireCompany, (req, res) => {
       <a class="btn btn-sm btn-outline" href="/deals/new" style="margin-left:8px">Post a deal</a>
     </form>
   </div>
-  ${feed.length ? feed.map(i => feedCard(i, req.user, names)).join('') : '<div class="card"><p class="muted">The floor is quiet… for now. Post the first deal and watch the network react.</p></div>'}`;
+  ${feedHtml}`;
   res.send(page('Timeline', body, req.user, req.query.msg, req.query.err, 'home'));
 });
 
@@ -2193,6 +2338,411 @@ app.post('/counter/:id/refuse', requireCompany, (req, res) => {
   res.redirect('/deals/inbox?msg=' + encodeURIComponent('Counter offer refused. The counterparty has been notified.'));
 });
 
+// ============================= PRIVATE CONTRACTS MAILBOX =============================
+// Company → company contracts that never touch a public deal. Flow:
+// pending_recipient → (recipient signs w/ OTP) pending_owner → (sender approves) pending_admin → (admin) approved.
+function getPrivateContract(id) {
+  return db.prepare('SELECT * FROM private_contracts WHERE id = ?').get(parseInt(id, 10));
+}
+/** Privacy guard: only the sender, the recipient and the admin may view a private contract. */
+function canViewPrivateContract(user, pc) {
+  return !!user && !!pc && (user.isAdmin || user.id === pc.sender_company_id || user.id === pc.recipient_company_id);
+}
+/** 1% platform-fee clause for private contracts (HTML / plain-text variants). */
+function pcFeeAmount(pc) {
+  const num = Number(pc && pc.value);
+  return isFinite(num) && num > 0 ? `${fmtAmount(num * PLATFORM_FEE_PCT / 100)} ${pc.currency || 'USD'}` : `1% of contract value`;
+}
+function pcFeeLineHtml(pc, style) {
+  return `<div class="muted" style="font-size:12px;${style || ''}">🏦 Platform fee: ${PLATFORM_FEE_PCT}% (${esc(pcFeeAmount(pc))}) — transparent Dealzoin commission</div>`;
+}
+function pcFeeLineText(pc) {
+  return `Platform fee: ${PLATFORM_FEE_PCT}% (${pcFeeAmount(pc)}) — transparent Dealzoin commission`;
+}
+/** A letter is "sealed" while the mailbox owner owes the next action on it. */
+function pcIsSealed(pc, viewerId) {
+  if (pc.status === 'pending_recipient') return pc.recipient_company_id === viewerId;
+  if (pc.status === 'pending_owner') return pc.sender_company_id === viewerId;
+  return false;
+}
+
+// ----- Compose: GET /contracts/new -----
+app.get('/contracts/new', requireCompany, (req, res) => {
+  const q = String(req.query.q || '').trim();
+  let recipients;
+  if (q) {
+    const like = '%' + q.replace(/[%_]/g, '') + '%';
+    recipients = db.prepare(`SELECT id, name FROM companies WHERE status = 'approved' AND id != ? AND name LIKE ? ORDER BY name LIMIT 20`).all(req.user.id, like);
+  } else {
+    recipients = db.prepare(`SELECT id, name FROM companies WHERE status = 'approved' AND id != ? ORDER BY name LIMIT 50`).all(req.user.id);
+  }
+  const options = recipients.length
+    ? recipients.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('')
+    : '';
+  const body = `
+  <div class="card vault" style="max-width:560px;margin:0 auto">
+    <div class="kicker">Private contracts</div>
+    <h2 style="margin:6px 0 10px">✉️ New private contract</h2>
+    <p class="muted" style="margin-bottom:12px">Sealed company-to-company — never posted to any feed. Only the two parties and the admin can read it.</p>
+    <form method="GET" action="/contracts/new" style="display:flex;gap:8px;margin-bottom:14px">
+      <input type="text" name="q" value="${esc(q)}" placeholder="Search a company by name…" style="margin-bottom:0">
+      <button class="btn btn-sm btn-outline" type="submit">Search</button>
+    </form>
+    ${recipients.length ? `
+    <form method="POST" action="/contracts">
+      <label>Recipient company</label>
+      <select name="recipient" required>${options}</select>
+      <label>Letter subject</label>
+      <input type="text" name="title" required maxlength="160" placeholder="e.g. Exclusivity &amp; supply agreement">
+      <div class="grid2" style="gap:10px">
+        <div><label>Value</label><input type="number" name="value" min="0" step="any" placeholder="50000"></div>
+        <div><label>Currency</label><select name="currency">${optionsHtml(DEAL_CURRENCIES, 'USD')}</select></div>
+      </div>
+      <label>Terms of the offer</label>
+      <textarea name="terms" rows="6" required maxlength="4000" placeholder="Scope, deliverables, payment schedule…"></textarea>
+      ${'<div class="muted" style="font-size:12px;margin-bottom:12px">🏦 A transparent ' + PLATFORM_FEE_PCT + '% Dealzoin platform fee applies and is disclosed to both parties.</div>'}
+      <button class="btn" type="submit">Seal &amp; send</button>
+      <a class="btn btn-outline" href="/contracts" style="margin-left:8px">Discard draft</a>
+    </form>` : `<p class="muted">No approved companies match. <a href="/contracts/new">Clear the search</a> to list all.</p>`}
+  </div>`;
+  res.send(page('New private contract', body, req.user, req.query.msg, req.query.err, 'contracts'));
+});
+
+// ----- Mailbox: GET /contracts (tabs Received / Sent; filters All / Sealed / Opened / Signed) -----
+app.get('/contracts', requireCompany, (req, res) => {
+  const tab = req.query.tab === 'sent' ? 'sent' : 'received';
+  const filter = ['sealed', 'opened', 'signed'].includes(req.query.filter) ? req.query.filter : 'all';
+  const rows = tab === 'sent'
+    ? db.prepare('SELECT * FROM private_contracts WHERE sender_company_id = ? ORDER BY id DESC LIMIT 100').all(req.user.id)
+    : db.prepare('SELECT * FROM private_contracts WHERE recipient_company_id = ? ORDER BY id DESC LIMIT 100').all(req.user.id);
+  const names = companyNameMap();
+  const isSigned = s => ['pending_owner', 'pending_admin', 'approved'].includes(s);
+  const shown = rows.filter(pc => {
+    if (filter === 'sealed') return pcIsSealed(pc, req.user.id);
+    if (filter === 'opened') return !pcIsSealed(pc, req.user.id);
+    if (filter === 'signed') return isSigned(pc.status);
+    return true;
+  });
+
+  const rowHtml = shown.length ? shown.map(pc => {
+    const sealed = pcIsSealed(pc, req.user.id);
+    const otherId = tab === 'sent' ? pc.recipient_company_id : pc.sender_company_id;
+    const otherName = names.get(otherId) || 'Unknown';
+    const amount = Number(pc.value) > 0 ? `<span class="mail-amount">${esc(fmtAmount(Number(pc.value)))} ${esc(pc.currency || 'USD')}</span>` : '';
+    return `<a class="mail-row ${sealed ? 'mail-row--sealed' : 'mail-row--opened'}" href="/contracts/${pc.id}"
+        title="${sealed ? 'Sealed — open to read the terms' : 'Opened · seal spent'}">
+      <span class="wax-seal"><span>Dz</span></span>
+      <div class="mail-main">
+        <div class="mail-subject">${esc(pc.title)}</div>
+        <div class="mail-sender">${tab === 'sent' ? 'To' : 'From'}: ${esc(otherName)} · ${esc((pc.terms || '').slice(0, 80))}${(pc.terms || '').length > 80 ? '…' : ''}</div>
+      </div>
+      <div style="text-align:right">
+        ${amount}<br>
+        <span class="mail-date">${esc(pc.created_at.slice(0, 10))}</span><br>
+        ${statusBadge(pc.status)}
+      </div>
+    </a>`;
+  }).join('') : `<div class="card"><p class="muted">${tab === 'sent'
+      ? 'Nothing sent. Seal your first offer and put it in the post.'
+      : 'No letters yet. When a company offers you a contract, it arrives here — sealed in gold.'}</p></div>`;
+
+  const filterHref = f => `/contracts?tab=${tab}${f === 'all' ? '' : '&filter=' + f}`;
+  const body = `
+  <div class="feed-head" style="margin-bottom:4px">
+    <div>
+      <div class="kicker">Private contracts</div>
+      <h1 style="font-size:1.75rem;margin-top:4px">The Sealed Ledger</h1>
+    </div>
+    <a class="btn" href="/contracts/new">✉️ New private contract</a>
+  </div>
+  <div class="tab-row" style="max-width:420px">
+    <a href="/contracts?tab=received" class="${tab === 'received' ? 'tab-active' : ''}">Received</a>
+    <a href="/contracts?tab=sent" class="${tab === 'sent' ? 'tab-active' : ''}">Sent</a>
+  </div>
+  <div class="mail-filters">
+    ${['all', 'sealed', 'opened', 'signed'].map(f => `<a href="${filterHref(f)}" class="${filter === f ? 'pill-active' : ''}">${f[0].toUpperCase() + f.slice(1)}</a>`).join('')}
+  </div>
+  ${rowHtml}`;
+  res.send(page('Contracts', body, req.user, req.query.msg, req.query.err, 'contracts'));
+});
+
+// ----- Create: POST /contracts -----
+app.post('/contracts', requireCompany, (req, res) => {
+  const recipientId = parseInt(req.body.recipient, 10);
+  const title = String(req.body.title || '').trim().slice(0, 160);
+  const terms = String(req.body.terms || '').trim().slice(0, 4000);
+  const currency = DEAL_CURRENCIES.includes(req.body.currency) ? req.body.currency : 'USD';
+  const rawValue = String(req.body.value || '').trim();
+  const value = rawValue === '' ? null : parseFloat(rawValue);
+  if (!title || !terms) return res.redirect('/contracts/new?err=' + encodeURIComponent('Subject and terms are required.'));
+  if (value !== null && (!isFinite(value) || value < 0)) return res.redirect('/contracts/new?err=' + encodeURIComponent('Value must be a valid non-negative number.'));
+  const recipient = db.prepare(`SELECT id, name FROM companies WHERE id = ? AND status = 'approved'`).get(recipientId);
+  if (!recipient || recipient.id === req.user.id) {
+    return res.redirect('/contracts/new?err=' + encodeURIComponent('Choose another approved company as recipient.'));
+  }
+  const info = db.prepare(`INSERT INTO private_contracts (sender_company_id, recipient_company_id, title, value, currency, terms, status, created_at)
+    VALUES (?,?,?,?,?,?, 'pending_recipient', ?)`).run(req.user.id, recipient.id, title, value, currency, terms, now());
+  const pcId = info.lastInsertRowid;
+  audit('CONTRACT AGENT', 'private contract created', 'pass', `${req.user.name} sealed private contract #${pcId} "${title}" to ${recipient.name}${value ? ` (${fmtAmount(value)} ${currency})` : ''}`);
+  notify(recipient.id, 'private_contract', `${req.user.name} sent you a sealed private contract: "${title}". Open it in your contracts mailbox.`, `/contracts/${pcId}`);
+  res.redirect('/contracts?tab=sent&msg=' + encodeURIComponent('Contract sealed & sent. The recipient has been notified.'));
+});
+
+// ----- View one letter: GET /contracts/:id (parties + admin only) -----
+app.get('/contracts/:id', (req, res) => {
+  const pc = getPrivateContract(req.params.id);
+  const user = currentUser(req);
+  if (!pc) return res.status(404).send(page('Not found', '<div class="card"><h2>Contract not found</h2></div>', user));
+  if (!canViewPrivateContract(user, pc)) {
+    audit('CONTRACT AGENT', 'private contract access', 'fail', `Unauthorized view attempt on private contract #${pc.id} by ${user ? user.name : 'anonymous'}`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Private contract</h2><p class="muted">Only the sender, the recipient and the admin can view this contract.</p></div>', user));
+  }
+  const names = companyNameMap();
+  const senderName = names.get(pc.sender_company_id) || 'Unknown';
+  const recipientName = names.get(pc.recipient_company_id) || 'Unknown';
+  const isRecipient = !user.isAdmin && user.id === pc.recipient_company_id;
+  const isSender = !user.isAdmin && user.id === pc.sender_company_id;
+
+  let actions = '';
+  if (isRecipient && pc.status === 'pending_recipient') {
+    actions = `
+    <hr class="sep">
+    <h3 style="margin-bottom:8px">✍️ Sign this contract</h3>
+    <form method="POST" action="/contracts/${pc.id}/sign">
+      <label>Re-enter your account password (signing authority check)</label>
+      <input type="password" name="password" required>
+      <label style="display:flex;gap:8px;align-items:center;margin:10px 0">
+        <input type="checkbox" name="authorized" value="yes" style="width:auto;margin:0" required>
+        I am an authorized signatory of my company</label>
+      <label style="display:flex;gap:8px;align-items:center;margin:10px 0">
+        <input type="checkbox" name="agree" value="yes" style="width:auto;margin:0" required>
+        I agree to the terms of this contract</label>
+      <button class="btn btn-green" type="submit" onclick="this.textContent='Verifying…'">Verify &amp; continue →</button>
+      <p class="muted" style="margin-top:8px">Step 1 of 2 — next, the Authentication Agent sends a one-time signing code to your business email.</p>
+    </form>
+    <form method="POST" action="/contracts/${pc.id}/decline" style="margin-top:8px">
+      <button class="btn btn-danger" type="submit">Decline contract</button>
+    </form>`;
+  } else if (isSender && pc.status === 'pending_owner') {
+    actions = `
+    <hr class="sep">
+    <p class="muted" style="margin-bottom:10px">${esc(recipientName)} has signed. Your approval forwards the contract to the admin for final approval.</p>
+    <form method="POST" action="/contracts/${pc.id}/sender-approve">
+      <button class="btn btn-green" type="submit">Approve → send to admin</button>
+    </form>`;
+  } else if (pc.status === 'pending_admin') {
+    actions = `<hr class="sep"><p class="muted">Both parties have signed — awaiting admin final approval.</p>`;
+  }
+
+  const finalized = pc.status === 'approved'
+    ? `<p style="margin-top:10px"><span class="badge badge-contract">Finalized ✓</span> <span class="muted">Approved by the admin. This contract is kept on file in both mailboxes.</span></p>` : '';
+  const valueLine = Number(pc.value) > 0
+    ? `<p><b>Value:</b> <span class="deal-value" style="font-size:1.05rem">${esc(fmtAmount(Number(pc.value)))} ${esc(pc.currency || 'USD')}</span></p>${pcFeeLineHtml(pc)}` : '';
+
+  const body = `
+  <div class="card vault">
+    <div class="kicker" style="margin-bottom:6px">Private contract · sealed ledger</div>
+    <h2>✉️ ${esc(pc.title)}</h2>
+    <p class="muted">Contract #${pc.id} · sealed ${esc(pc.created_at.slice(0, 16).replace('T', ' '))} UTC
+      ${pc.signed_at ? ' · signed ' + esc(pc.signed_at.slice(0, 16).replace('T', ' ')) + ' UTC' : ''}
+      ${pc.decided_at ? ' · decided ' + esc(pc.decided_at.slice(0, 16).replace('T', ' ')) + ' UTC' : ''}</p>
+    <p style="margin-top:8px">${statusBadge(pc.status)}</p>
+    <hr class="sep">
+    <p><b>From (sender):</b> ${esc(senderName)} ${starsHtml(companyReputation(pc.sender_company_id), true)}</p>
+    <p><b>To (recipient):</b> ${esc(recipientName)} ${starsHtml(companyReputation(pc.recipient_company_id), true)}</p>
+    ${valueLine}
+    <h3 style="margin:14px 0 6px">Terms of the offer</h3>
+    <p style="white-space:pre-wrap">${esc(pc.terms)}</p>
+    <h3 style="margin:14px 0 6px">Platform fee clause</h3>
+    <p class="muted" style="font-size:13px">${esc('10. PLATFORM FEE. A transparent platform commission of 1% of the stated contract value is payable to Dealzoin. This fee is disclosed to both parties before signing and is separate from the value exchanged between the parties.')}</p>
+    ${pcFeeLineHtml(pc, 'margin-top:6px')}
+    ${finalized}
+    <div class="feed-actions" style="margin-top:16px">
+      <a class="btn btn-sm btn-outline" href="/contracts/${pc.id}/download">Download contract document</a>
+      <a class="btn btn-sm btn-outline" href="/contracts">← Mailbox</a>
+    </div>
+    ${actions}
+  </div>`;
+  res.send(page('Private contract — ' + pc.title, body, user, req.query.msg, req.query.err, user.isAdmin ? undefined : 'contracts'));
+});
+
+// ----- Download the letter as a Word-compatible document -----
+app.get('/contracts/:id/download', (req, res) => {
+  const pc = getPrivateContract(req.params.id);
+  const user = currentUser(req);
+  if (!pc) return res.status(404).send(page('Not found', '<div class="card"><h2>Contract not found</h2></div>', user));
+  if (!canViewPrivateContract(user, pc)) {
+    audit('CONTRACT AGENT', 'private contract download', 'fail', `Unauthorized download attempt on private contract #${pc.id} by ${user ? user.name : 'anonymous'}`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Private contract</h2><p class="muted">Only the sender, the recipient and the admin can download this contract.</p></div>', user));
+  }
+  const names = companyNameMap();
+  const doc = `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word">
+<head><meta charset="utf-8"><title>Private Contract #${pc.id}</title></head>
+<body style="font-family:Calibri,Arial,sans-serif">
+  <h1>Private Contract #${pc.id}</h1>
+  <h2>${esc(pc.title)}</h2>
+  <p><b>From (sender):</b> ${esc(names.get(pc.sender_company_id) || 'Unknown')}<br>
+     <b>To (recipient):</b> ${esc(names.get(pc.recipient_company_id) || 'Unknown')}<br>
+     ${Number(pc.value) > 0 ? `<b>Value:</b> ${esc(fmtAmount(Number(pc.value)))} ${esc(pc.currency || 'USD')}<br>` : ''}
+     <b>${esc(pcFeeLineText(pc))}</b><br>
+     <b>Status:</b> ${esc(pc.status.replace(/_/g, ' '))}<br>
+     <b>Sealed:</b> ${esc(pc.created_at)}${pc.signed_at ? `<br><b>Signed:</b> ${esc(pc.signed_at)}` : ''}${pc.decided_at ? `<br><b>Decided:</b> ${esc(pc.decided_at)}` : ''}</p>
+  <h3>Terms of the offer</h3><p>${esc(pc.terms)}</p>
+  <h3>Platform fee clause</h3>
+  <p>${esc('10. PLATFORM FEE. A transparent platform commission of 1% of the stated contract value is payable to Dealzoin. This fee is disclosed to both parties before signing and is separate from the value exchanged between the parties.')}</p>
+  <p>__________________________&nbsp;&nbsp;&nbsp;__________________________<br>
+  Sender signature&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Recipient signature</p>
+</body></html>`;
+  res.setHeader('Content-Type', 'application/msword');
+  res.setHeader('Content-Disposition', `attachment; filename="private-contract-${pc.id}.doc"`);
+  res.send(doc);
+});
+
+/** Loader for the private-contract signing OTP (payload.pc must match the contract id). */
+function loadPcOtpContext(req, pcId) {
+  const token = readSignedCookie(req, 'dz_sign');
+  if (!token) return null;
+  const row = db.prepare(`SELECT * FROM verification_codes WHERE token = ? AND purpose = 'sign'`).get(token);
+  if (!row || row.company_id !== req.user.id) return null;
+  let payload = {};
+  try { payload = JSON.parse(row.payload || '{}'); } catch (e) { payload = {}; }
+  if (payload.pc !== pcId) return null;
+  return { row, payload };
+}
+
+// ----- Recipient signing step 1: password + declarations, then a signing OTP -----
+app.post('/contracts/:id/sign', requireCompany, (req, res) => {
+  const pc = getPrivateContract(req.params.id);
+  if (!pc) return res.redirect('/contracts?err=' + encodeURIComponent('Contract not found.'));
+  if (pc.recipient_company_id !== req.user.id) {
+    audit('CONTRACT AGENT', 'private contract sign guard', 'fail', `${req.user.name} attempted to sign private contract #${pc.id} without being the recipient`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Only the recipient can sign this contract.</h2></div>', req.user));
+  }
+  if (pc.status !== 'pending_recipient') {
+    return res.redirect(`/contracts/${pc.id}?err=` + encodeURIComponent('This contract is not awaiting your signature.'));
+  }
+
+  // (a) password re-verification
+  const me = db.prepare('SELECT * FROM companies WHERE id = ?').get(req.user.id);
+  if (!verifyPassword(String(req.body.password || ''), me.salt, me.password_hash)) {
+    audit('AUTHENTICATION AGENT', 'signing password re-verification', 'fail', `Wrong password at private-contract signing for ${me.email} (contract #${pc.id})`);
+    return res.redirect(`/contracts/${pc.id}?err=` + encodeURIComponent('Password verification failed.'));
+  }
+  audit('AUTHENTICATION AGENT', 'signing password re-verification', 'pass', `Password re-verified for ${me.email} (private contract #${pc.id})`);
+  // (b) authorized-signatory checkbox
+  if (req.body.authorized !== 'yes') {
+    audit('AUTHENTICATION AGENT', 'signatory authority checkbox', 'fail', `Not confirmed by ${me.email} (private contract #${pc.id})`);
+    return res.redirect(`/contracts/${pc.id}?err=` + encodeURIComponent('You must confirm you are an authorized signatory.'));
+  }
+  // (c) agree-to-terms checkbox
+  if (req.body.agree !== 'yes') {
+    audit('AUTHENTICATION AGENT', 'terms agreement checkbox', 'fail', `Terms not accepted by ${me.email} (private contract #${pc.id})`);
+    return res.redirect(`/contracts/${pc.id}?err=` + encodeURIComponent('You must agree to the terms.'));
+  }
+  audit('AUTHENTICATION AGENT', 'signing declarations', 'pass', `Authorized signatory + terms confirmed by ${me.email} (private contract #${pc.id})`);
+
+  // (d) step 2 — one-time signing code (Brevo email, or demo banner without an API key)
+  const code = String(crypto.randomInt(100000, 1000000));
+  const token = randomToken();
+  db.prepare(`DELETE FROM verification_codes WHERE company_id = ? AND purpose = 'sign'`).run(me.id);
+  db.prepare('INSERT INTO verification_codes (token, company_id, code, purpose, payload, expires_at, created_at) VALUES (?,?,?,?,?,?,?)')
+    .run(token, me.id, code, 'sign', JSON.stringify({ pc: pc.id }), new Date(Date.now() + CODE_TTL_MS).toISOString(), now());
+  sendVerificationCode(me.email, code);
+  audit('AUTHENTICATION AGENT', 'signing OTP issued', 'pass', `Signing code issued for ${me.email} (private contract #${pc.id}, 10-min expiry)`);
+
+  res.setHeader('Set-Cookie', `dz_sign=${signedCookieValue(token)}; HttpOnly; Path=/; Max-Age=600; SameSite=Lax${isSecureReq(req) ? '; Secure' : ''}`);
+  res.redirect(`/contracts/${pc.id}/sign/verify`);
+});
+
+// ----- Recipient signing step 2: enter the one-time code to execute the signature -----
+app.get('/contracts/:id/sign/verify', requireCompany, (req, res) => {
+  const pc = getPrivateContract(req.params.id);
+  if (!pc) return res.redirect('/contracts?err=' + encodeURIComponent('Contract not found.'));
+  if (pc.recipient_company_id !== req.user.id) return res.redirect('/contracts?err=' + encodeURIComponent('Contract not found.'));
+  const ctx = loadPcOtpContext(req, pc.id);
+  if (!ctx) return res.redirect(`/contracts/${pc.id}?err=` + encodeURIComponent('No signing verification in progress. Please start again.'));
+
+  const demo = BREVO_API_KEY ? '' : `
+    <div class="demo-banner">⚠️ <b>DEMO MODE</b> — no BREVO_API_KEY configured, so the email was not sent.
+    Your signing code is: <b style="font-size:18px;letter-spacing:3px">${esc(ctx.row.code)}</b></div>`;
+  const body = `
+  <div class="card vault" style="max-width:480px;margin:0 auto">
+    <div class="kicker" style="margin-bottom:6px">Step 2 of 2 · signing code</div>
+    <h2>✍️ Confirm your signature</h2>
+    <p class="muted" style="margin-bottom:12px">The Authentication Agent sent a 6-digit signing code to your business email. Enter it to sign <b>${esc(pc.title)}</b>.</p>
+    ${demo}
+    <form method="POST" action="/contracts/${pc.id}/sign/verify">
+      <label>6-digit signing code</label><input type="text" name="code" required pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code">
+      <button class="btn btn-green" type="submit">Sign contract</button>
+    </form>
+    <p class="shield-note">🛡️ Protected by Dealzoin security agents</p>
+  </div>`;
+  res.send(page('Confirm signature', body, req.user, req.query.msg, req.query.err, 'contracts'));
+});
+
+app.post('/contracts/:id/sign/verify', requireCompany, (req, res) => {
+  const pc = getPrivateContract(req.params.id);
+  if (!pc) return res.redirect('/contracts?err=' + encodeURIComponent('Contract not found.'));
+  if (pc.recipient_company_id !== req.user.id) {
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Only the recipient can sign this contract.</h2></div>', req.user));
+  }
+  const code = String(req.body.code || '').trim();
+  const ctx = loadPcOtpContext(req, pc.id);
+  if (!ctx || ctx.row.expires_at < now()) {
+    audit('AUTHENTICATION AGENT', 'signing OTP verify', 'fail', `Private-contract signing code expired or missing for ${req.user.name} (contract #${pc.id})`);
+    return res.redirect(`/contracts/${pc.id}?err=` + encodeURIComponent('Signing code expired. Please start signing again.'));
+  }
+  const a = Buffer.from(code.padEnd(6, ' '));
+  const b = Buffer.from(ctx.row.code.padEnd(6, ' '));
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    audit('AUTHENTICATION AGENT', 'signing OTP verify', 'fail', `Wrong private-contract signing code for ${req.user.name} (contract #${pc.id})`);
+    return res.redirect(`/contracts/${pc.id}/sign/verify?err=` + encodeURIComponent('Incorrect code. Try again.'));
+  }
+  if (pc.status !== 'pending_recipient') {
+    db.prepare('DELETE FROM verification_codes WHERE id = ?').run(ctx.row.id);
+    return res.redirect(`/contracts/${pc.id}?err=` + encodeURIComponent('This contract is not awaiting your signature.'));
+  }
+
+  db.prepare('DELETE FROM verification_codes WHERE id = ?').run(ctx.row.id);
+  const ts = now();
+  db.prepare(`UPDATE private_contracts SET status = 'pending_owner', signed_at = ? WHERE id = ?`).run(ts, pc.id);
+  res.setHeader('Set-Cookie', 'dz_sign=; HttpOnly; Path=/; Max-Age=0');
+  audit('AUTHENTICATION AGENT', 'signing OTP verify', 'pass', `Signing code verified for ${req.user.name} (private contract #${pc.id})`);
+  audit('CONTRACT AGENT', 'private contract signed', 'pass', `${req.user.name} signed private contract #${pc.id} "${pc.title}" at ${ts} — pending sender approval`);
+  notify(pc.sender_company_id, 'private_contract_signed', `${req.user.name} signed your private contract "${pc.title}". Review and approve it from your contracts mailbox.`, `/contracts/${pc.id}`);
+  res.redirect(`/contracts/${pc.id}?msg=` + encodeURIComponent('Contract signed and filed. The ledger remembers. 🪙'));
+});
+
+// ----- Recipient declines -----
+app.post('/contracts/:id/decline', requireCompany, (req, res) => {
+  const pc = getPrivateContract(req.params.id);
+  if (!pc || pc.recipient_company_id !== req.user.id) {
+    return res.redirect('/contracts?err=' + encodeURIComponent('Contract not found.'));
+  }
+  if (pc.status !== 'pending_recipient') {
+    return res.redirect(`/contracts/${pc.id}?err=` + encodeURIComponent('This contract was already decided.'));
+  }
+  db.prepare(`UPDATE private_contracts SET status = 'rejected', decided_at = ? WHERE id = ?`).run(now(), pc.id);
+  audit('CONTRACT AGENT', 'private contract declined', 'fail', `${req.user.name} declined private contract #${pc.id} "${pc.title}"`);
+  notify(pc.sender_company_id, 'private_contract_rejected', `${req.user.name} declined your private contract "${pc.title}".`, `/contracts/${pc.id}`);
+  res.redirect('/contracts?msg=' + encodeURIComponent('Contract declined. The sender has been notified.'));
+});
+
+// ----- Sender (owner) approves the recipient's signature → admin queue -----
+app.post('/contracts/:id/sender-approve', requireCompany, (req, res) => {
+  const pc = getPrivateContract(req.params.id);
+  if (!pc || pc.sender_company_id !== req.user.id) {
+    return res.redirect('/contracts?err=' + encodeURIComponent('Contract not found.'));
+  }
+  if (pc.status !== 'pending_owner') {
+    return res.redirect(`/contracts/${pc.id}?err=` + encodeURIComponent('This contract is not awaiting your approval.'));
+  }
+  db.prepare(`UPDATE private_contracts SET status = 'pending_admin' WHERE id = ?`).run(pc.id);
+  audit('CONTRACT AGENT', 'sender approve private contract', 'pass', `Sender ${req.user.name} approved private contract #${pc.id} "${pc.title}" — forwarded to admin for final approval`);
+  notify(pc.recipient_company_id, 'private_contract_owner_approved', `${req.user.name} approved the signed private contract "${pc.title}" — awaiting admin final approval.`, `/contracts/${pc.id}`);
+  res.redirect(`/contracts/${pc.id}?msg=` + encodeURIComponent('Approved — the contract now awaits admin final approval.'));
+});
+
 // ============================= MEDIA SERVING =============================
 app.get('/media/:id', (req, res) => {
   const user = currentUser(req);
@@ -2206,37 +2756,10 @@ app.get('/media/:id', (req, res) => {
   res.send(m.data);
 });
 
-// ============================= HOME FEED (FOLLOWING) =============================
+// ============================= HOME FEED → TIMELINE =============================
+// The home feed was merged into the (following-only) timeline; keep the route as a redirect.
 app.get('/home', requireCompany, (req, res) => {
-  const names = companyNameMap();
-  const followCount = db.prepare('SELECT COUNT(*) AS n FROM follows WHERE follower_id = ?').get(req.user.id).n;
-  const followFilter = 'WHERE company_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)';
-  const feed = followCount ? feedQuery(followFilter, req.user.id) : [];
-
-  let feedHtml;
-  if (!followCount) {
-    const globalFeed = feedQuery('');
-    feedHtml = `
-    <div class="card" style="text-align:center">
-      <h3>Follow companies to fill your exchange</h3>
-      <p class="muted" style="margin:8px 0 14px">Your home feed shows deals, posts and reposts only from companies you follow. Find the players in your industry and hit Follow.</p>
-      <a class="btn" href="/search">Find companies to follow</a>
-    </div>
-    <h2 class="sec-h">Explore all deals</h2>
-    ${globalFeed.length ? globalFeed.map(i => feedCard(i, req.user, names)).join('') : '<div class="card"><p class="muted">The floor is quiet… for now. Post the first deal and watch the network react.</p></div>'}`;
-  } else {
-    feedHtml = feed.length
-      ? feed.map(i => feedCard(i, req.user, names)).join('')
-      : '<div class="card"><p class="muted">Nothing yet from the companies you follow. <a href="/timeline">Explore all deals →</a></p></div>';
-  }
-
-  const body = `
-  <div class="card">
-    <h2>Home</h2>
-    <p class="muted">Deals, posts and reposts from companies you follow.</p>
-  </div>
-  ${feedHtml}`;
-  res.send(page('Home', body, req.user, req.query.msg, req.query.err, 'home'));
+  res.redirect(302, '/timeline');
 });
 
 // ============================= CREATE MENU (/new) =============================
@@ -2724,7 +3247,8 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
     approved: count(`SELECT COUNT(*) AS n FROM companies WHERE status = 'approved'`),
     flagged: count('SELECT COUNT(*) AS n FROM companies WHERE flagged = 1'),
     deals: count('SELECT COUNT(*) AS n FROM deals'),
-    contractsPending: count(`SELECT COUNT(*) AS n FROM contracts WHERE status = 'pending_admin'`),
+    contractsPending: count(`SELECT COUNT(*) AS n FROM contracts WHERE status = 'pending_admin'`) +
+                      count(`SELECT COUNT(*) AS n FROM private_contracts WHERE status = 'pending_admin'`),
     follows: count('SELECT COUNT(*) AS n FROM follows')
   };
   // Platform commission: 1% of the summed value of approved (finalized) deals, broken down per currency.
@@ -2764,7 +3288,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
   // Final approval queue — ONLY contracts the deal owner has already approved (state: pending_admin).
   const names = companyNameMap();
   const pendingContracts = db.prepare(`SELECT * FROM contracts WHERE status = 'pending_admin' ORDER BY signed_at ASC`).all();
-  const contractsHtml = pendingContracts.length ? pendingContracts.map(ct => {
+  const dealContractRows = pendingContracts.map(ct => {
     const deal = db.prepare('SELECT title FROM deals WHERE id = ?').get(ct.deal_id);
     return `<tr>
       <td><b>${esc(deal ? deal.title : '(deal removed)')}</b> <span class="muted">#${ct.deal_id}</span></td>
@@ -2775,7 +3299,21 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
         <form method="POST" action="/admin/contracts/${ct.id}/reject" style="display:inline"><button class="btn btn-sm btn-danger">Reject</button></form>
       </td>
     </tr>`;
-  }).join('') : '<tr><td colspan="4" class="muted">No contracts awaiting final approval. Contracts land here after the deal owner approves them.</td></tr>';
+  });
+  // Private contracts (company → company, off-feed) awaiting final approval — kept on file after approval.
+  const pendingPrivate = db.prepare(`SELECT * FROM private_contracts WHERE status = 'pending_admin' ORDER BY signed_at ASC`).all();
+  const privateContractRows = pendingPrivate.map(pc => `<tr>
+      <td><b>${esc(pc.title)}</b> <span class="muted">#${pc.id}</span> <span class="badge badge-sealed">Private contract</span></td>
+      <td>${esc(names.get(pc.sender_company_id) || '?')} ⇄ ${esc(names.get(pc.recipient_company_id) || '?')}</td>
+      <td class="muted">${esc((pc.signed_at || pc.created_at).slice(0, 16).replace('T', ' '))}</td>
+      <td style="white-space:nowrap">
+        <a class="btn btn-sm btn-outline" href="/contracts/${pc.id}">View</a>
+        <form method="POST" action="/admin/private-contracts/${pc.id}/approve" style="display:inline"><button class="btn btn-sm btn-green">Approve</button></form>
+        <form method="POST" action="/admin/private-contracts/${pc.id}/reject" style="display:inline"><button class="btn btn-sm btn-danger">Reject</button></form>
+      </td>
+    </tr>`);
+  const allContractRows = [...dealContractRows, ...privateContractRows];
+  const contractsHtml = allContractRows.length ? allContractRows.join('') : '<tr><td colspan="4" class="muted">No contracts awaiting final approval. Contracts land here after the deal owner approves them.</td></tr>';
 
   // All companies (suspend / reactivate / delete / reputation / research)
   const allCompanies = db.prepare('SELECT * FROM companies ORDER BY created_at DESC LIMIT 100').all();
@@ -2897,6 +3435,7 @@ app.post('/admin/companies/:id/delete', requireAdmin, (req, res) => {
     db.prepare('DELETE FROM reposts WHERE company_id = ?').run(id);
     db.prepare('DELETE FROM follows WHERE follower_id = ? OR followed_id = ?').run(id, id);
     db.prepare('DELETE FROM contracts WHERE signer_company_id = ? OR owner_company_id = ?').run(id, id);
+    db.prepare('DELETE FROM private_contracts WHERE sender_company_id = ? OR recipient_company_id = ?').run(id, id);
     db.prepare('DELETE FROM counter_offers WHERE from_company_id = ?').run(id);
     db.prepare('DELETE FROM notifications WHERE company_id = ?').run(id);
     db.prepare('DELETE FROM sessions WHERE company_id = ?').run(id);
@@ -3048,6 +3587,33 @@ app.post('/admin/contracts/:id/reject', requireAdmin, (req, res) => {
   audit('AUTHENTICATION AGENT', 'admin reject contract', 'fail', `Contract #${ct.id} (deal #${ct.deal_id}) rejected by admin at final approval`);
   notify(ct.signer_company_id, 'contract_rejected', `An admin rejected your signed contract on "${dealRow ? dealRow.title : 'deal #' + ct.deal_id}" at final approval.`, `/deal/${ct.deal_id}`);
   res.redirect('/admin/dashboard?msg=' + encodeURIComponent('Contract rejected.'));
+});
+
+// ----- Private contracts final approval (rows are KEPT after approval — shown as "Finalized ✓") -----
+app.post('/admin/private-contracts/:id/approve', requireAdmin, (req, res) => {
+  const pc = getPrivateContract(req.params.id);
+  if (!pc) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Contract not found.'));
+  if (pc.status !== 'pending_admin') {
+    return res.redirect('/admin/dashboard?err=' + encodeURIComponent('This private contract is not awaiting final approval.'));
+  }
+  const names = companyNameMap();
+  db.prepare(`UPDATE private_contracts SET status = 'approved', decided_at = ? WHERE id = ?`).run(now(), pc.id);
+  audit('CONTRACT AGENT', 'admin approve private contract', 'pass', `Private contract #${pc.id} "${pc.title}" (${names.get(pc.sender_company_id) || '?'} ⇄ ${names.get(pc.recipient_company_id) || '?'}) approved by admin — kept on file in both mailboxes`);
+  notify(pc.sender_company_id, 'private_contract_approved', `Final approval granted — your private contract "${pc.title}" is finalized. 🎉`, `/contracts/${pc.id}`);
+  notify(pc.recipient_company_id, 'private_contract_approved', `Final approval granted — the private contract "${pc.title}" is finalized. 🎉`, `/contracts/${pc.id}`);
+  res.redirect('/admin/dashboard?msg=' + encodeURIComponent('Private contract approved and kept on file.'));
+});
+app.post('/admin/private-contracts/:id/reject', requireAdmin, (req, res) => {
+  const pc = getPrivateContract(req.params.id);
+  if (!pc) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Contract not found.'));
+  if (pc.status !== 'pending_admin') {
+    return res.redirect('/admin/dashboard?err=' + encodeURIComponent('This private contract is not awaiting final approval.'));
+  }
+  db.prepare(`UPDATE private_contracts SET status = 'rejected', decided_at = ? WHERE id = ?`).run(now(), pc.id);
+  audit('CONTRACT AGENT', 'admin reject private contract', 'fail', `Private contract #${pc.id} "${pc.title}" rejected by admin at final approval`);
+  notify(pc.sender_company_id, 'private_contract_rejected', `An admin rejected your private contract "${pc.title}" at final approval.`, `/contracts/${pc.id}`);
+  notify(pc.recipient_company_id, 'private_contract_rejected', `An admin rejected the private contract "${pc.title}" at final approval.`, `/contracts/${pc.id}`);
+  res.redirect('/admin/dashboard?msg=' + encodeURIComponent('Private contract rejected.'));
 });
 
 // ----- Change admin password (settings override; env var is fallback) -----
