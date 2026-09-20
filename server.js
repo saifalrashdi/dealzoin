@@ -1,709 +1,1400 @@
-/* ============================================================
-   Dealzoin — v2 (real platform)
-   Companies: sign up → owner approves → post deals instantly to
-   every company's timeline, like/comment/repost, search deals &
-   companies, follow companies (instagram-style), sign contract →
-   terms page + document download → private closed room → owner
-   approves the contract.
-   Run: npm install && npm start  →  http://localhost:3000
-   ============================================================ */
-const path = require('path');
-const crypto = require('crypto');
+'use strict';
+/* ============================================================================
+ * DEALZOIN v2 — B2B social network for COMPANIES only.
+ * Single-file app: Express 4 + better-sqlite3 (sync) + built-in crypto.
+ * Dark purple theme, server-rendered HTML via template literals.
+ * ==========================================================================*/
+
+// ============================= CONFIG & DEPENDENCIES =============================
 const express = require('express');
-const session = require('express-session');
+const crypto = require('crypto');
+const path = require('path');
 const Database = require('better-sqlite3');
 
-const app = express();
-const PORT = process.env.PORT || 3000;
-const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || 'admin@dealzoin.com').toLowerCase();
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'Dealzoin@2026';
+const PORT = parseInt(process.env.PORT || '3000', 10);
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'admin@dealzoin.com';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin';
+const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-insecure-secret-change-me';
+const BREVO_API_KEY = process.env.BREVO_API_KEY || '';
+const BREVO_SENDER_EMAIL = process.env.BREVO_SENDER_EMAIL || ADMIN_EMAIL;
 
-/* ---------- database ---------- */
-const db = new Database(path.join(__dirname, 'dealzoin.db'));
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const CODE_TTL_MS = 10 * 60 * 1000;             // 10 minutes (login 2FA codes)
+
+const app = express();
+app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
+app.disable('x-powered-by');
+
+// ============================= DATABASE SETUP =============================
+const db = new Database(path.join(process.cwd(), 'dealzoin.db'));
 db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
+
 db.exec(`
-CREATE TABLE IF NOT EXISTS admins (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  email TEXT UNIQUE NOT NULL,
-  pass_hash TEXT NOT NULL,
-  salt TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
 CREATE TABLE IF NOT EXISTS companies (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  email TEXT UNIQUE NOT NULL,
-  pass_hash TEXT NOT NULL,
-  salt TEXT NOT NULL,
-  country TEXT NOT NULL,
-  industry TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  name          TEXT NOT NULL,
+  email         TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  salt          TEXT NOT NULL,
+  website       TEXT DEFAULT '',
+  description   TEXT DEFAULT '',
+  status        TEXT NOT NULL DEFAULT 'pending',     -- pending | approved | rejected | suspended
+  flagged       INTEGER NOT NULL DEFAULT 0,
+  flag_reasons  TEXT DEFAULT '',
+  created_at    TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS follows (
-  follower_id INTEGER NOT NULL REFERENCES companies(id),
-  following_id INTEGER NOT NULL REFERENCES companies(id),
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  PRIMARY KEY (follower_id, following_id)
+CREATE TABLE IF NOT EXISTS sessions (
+  token      TEXT PRIMARY KEY,
+  company_id INTEGER,                                -- NULL for admin sessions
+  is_admin   INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS posts (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  company_id INTEGER NOT NULL REFERENCES companies(id),
-  body TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  company_id INTEGER NOT NULL,
+  body       TEXT NOT NULL,
+  created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS deals (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  company_id INTEGER NOT NULL REFERENCES companies(id),
-  title TEXT NOT NULL,
-  value_usd REAL NOT NULL,
-  terms TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  company_id  INTEGER NOT NULL,
+  title       TEXT NOT NULL,
+  description TEXT NOT NULL,
+  value       TEXT DEFAULT '',
+  created_at  TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS likes (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  company_id INTEGER NOT NULL REFERENCES companies(id),
-  post_id INTEGER REFERENCES posts(id),
-  deal_id INTEGER REFERENCES deals(id),
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  company_id  INTEGER NOT NULL,
+  target_type TEXT NOT NULL,                         -- 'deal' | 'post'
+  target_id   INTEGER NOT NULL,
+  created_at  TEXT NOT NULL,
+  UNIQUE(company_id, target_type, target_id)
 );
 CREATE TABLE IF NOT EXISTS comments (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  company_id INTEGER NOT NULL REFERENCES companies(id),
-  post_id INTEGER REFERENCES posts(id),
-  deal_id INTEGER REFERENCES deals(id),
-  body TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  company_id  INTEGER NOT NULL,
+  target_type TEXT NOT NULL,                         -- 'deal' | 'post'
+  target_id   INTEGER NOT NULL,
+  body        TEXT NOT NULL,
+  created_at  TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS reposts (
-  deal_id INTEGER NOT NULL REFERENCES deals(id),
-  company_id INTEGER NOT NULL REFERENCES companies(id),
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  PRIMARY KEY (deal_id, company_id)
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  company_id INTEGER NOT NULL,
+  deal_id    INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS follows (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  follower_id INTEGER NOT NULL,
+  followed_id INTEGER NOT NULL,
+  created_at  TEXT NOT NULL,
+  UNIQUE(follower_id, followed_id)
 );
 CREATE TABLE IF NOT EXISTS contracts (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  deal_id INTEGER NOT NULL REFERENCES deals(id),
-  requester_id INTEGER NOT NULL REFERENCES companies(id),
-  status TEXT NOT NULL DEFAULT 'pending',   -- pending | approved | rejected
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+  deal_id            INTEGER NOT NULL,
+  signer_company_id  INTEGER NOT NULL,
+  owner_company_id   INTEGER NOT NULL,
+  status             TEXT NOT NULL DEFAULT 'pending', -- pending | approved | rejected
+  signed_at          TEXT NOT NULL,
+  decided_at         TEXT,
+  created_at         TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  deal_id INTEGER NOT NULL REFERENCES deals(id),
-  sender_company_id INTEGER REFERENCES companies(id),
-  sender_admin INTEGER NOT NULL DEFAULT 0,
-  body TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);`);
+CREATE TABLE IF NOT EXISTS verification_codes (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  token      TEXT NOT NULL,                          -- random pending-login token (cookie)
+  company_id INTEGER NOT NULL,
+  code       TEXT NOT NULL,
+  purpose    TEXT NOT NULL DEFAULT 'login',
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS agent_audit (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent      TEXT NOT NULL,
+  action     TEXT NOT NULL,
+  result     TEXT NOT NULL,                          -- pass | flag | fail
+  details    TEXT DEFAULT '',
+  created_at TEXT NOT NULL
+);
+`);
 
-/* ---------- security helpers ---------- */
-function hashPassword(password) {
-  const salt = crypto.randomBytes(16).toString('hex');
-  return { salt, hash: crypto.scryptSync(password, salt, 64).toString('hex') };
-}
-function verifyPassword(password, salt, hash) {
-  const c = crypto.scryptSync(password, salt, 64);
-  const s = Buffer.from(hash, 'hex');
-  return c.length === s.length && crypto.timingSafeEqual(c, s);
-}
-const isEmail = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
-const fails = {};
-const tooMany = (k) => fails[k] && Date.now() - fails[k].t < 600000 && fails[k].n >= 10;
-function recordFail(k) { const f = fails[k] || { n: 0, t: Date.now() }; f.n++; fails[k] = f; }
+const now = () => new Date().toISOString();
 
-/* ---------- seed admin ---------- */
-if (!db.prepare('SELECT id FROM admins').get()) {
-  const { salt, hash } = hashPassword(ADMIN_PASSWORD);
-  db.prepare('INSERT INTO admins (email, pass_hash, salt) VALUES (?,?,?)').run(ADMIN_EMAIL, hash, salt);
-  console.log('==========================================================');
-  console.log('Admin account created —  email: ' + ADMIN_EMAIL + '  password: ' + ADMIN_PASSWORD);
-  console.log('>>> Sign in and change this password immediately. <<<');
-  console.log('==========================================================');
+// ============================= SECURITY HELPERS =============================
+/** Escape ALL user content before injecting into HTML. */
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
-/* ---------- middleware ---------- */
-app.use(express.urlencoded({ extended: false }));
-app.use(session({
-  secret: process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'),
-  resave: false, saveUninitialized: false,
-  cookie: { httpOnly: true, sameSite: 'lax', maxAge: 1000 * 60 * 60 * 8 }
-}));
+function hashPassword(password, salt) {
+  return crypto.scryptSync(String(password), salt, 64).toString('hex');
+}
+function newSalt() { return crypto.randomBytes(16).toString('hex'); }
+function verifyPassword(password, salt, expectedHash) {
+  const actual = Buffer.from(hashPassword(password, salt), 'hex');
+  const expected = Buffer.from(expectedHash || '', 'hex');
+  if (actual.length !== expected.length) return false;
+  return crypto.timingSafeEqual(actual, expected);
+}
+/** Constant-time comparison for plain (env) secrets via SHA-256 digests. */
+function safeEqualPlain(a, b) {
+  const ha = crypto.createHash('sha256').update(String(a)).digest();
+  const hb = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+function hmac(value) {
+  return crypto.createHmac('sha256', SESSION_SECRET).update(value).digest('hex');
+}
+function randomToken() { return crypto.randomBytes(32).toString('hex'); }
+
+/** Minimal cookie parser (no cookie-parser dependency). */
+function parseCookies(req) {
+  const out = {};
+  const raw = req.headers.cookie;
+  if (!raw) return out;
+  for (const part of raw.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx === -1) continue;
+    const k = part.slice(0, idx).trim();
+    const v = part.slice(idx + 1).trim();
+    if (k) out[k] = decodeURIComponent(v);
+  }
+  return out;
+}
+/** Read + verify an HMAC-signed cookie value of the form "value.sig". Returns value or null. */
+function readSignedCookie(req, name) {
+  const raw = parseCookies(req)[name];
+  if (!raw) return null;
+  const dot = raw.lastIndexOf('.');
+  if (dot === -1) return null;
+  const value = raw.slice(0, dot);
+  const sig = raw.slice(dot + 1);
+  const expected = hmac(value);
+  if (sig.length !== expected.length) return null;
+  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
+  return value;
+}
+function signedCookieValue(value) { return value + '.' + hmac(value); }
+
+// ============================= AGENT AUDIT LOG =============================
+function audit(agent, action, result, details) {
+  db.prepare('INSERT INTO agent_audit (agent, action, result, details, created_at) VALUES (?,?,?,?,?)')
+    .run(agent, action, result, String(details || '').slice(0, 500), now());
+}
+
+// ============================= SECURITY AGENTS =============================
+// --- ONBOARDING AGENT data ---
+const DISPOSABLE_DOMAINS = [
+  'mailinator.com', 'tempmail.com', '10minutemail.com', 'guerrillamail.com',
+  'yopmail.com', 'temp-mail.org', 'throwawaymail.com', 'fakeinbox.com',
+  'sharklasers.com', 'getnada.com', 'maildrop.cc', 'trashmail.com',
+  'tempmailo.com', 'dispostable.com', 'mailnesia.com', 'mintemail.com'
+];
+const FREE_PROVIDERS = [
+  'gmail.com', 'yahoo.com', 'outlook.com', 'hotmail.com',
+  'aol.com', 'icloud.com', 'proton.me', 'protonmail.com'
+];
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
+/**
+ * ONBOARDING AGENT — runs on every company signup.
+ * Returns { hardReject: bool, error: string, flags: [string] }.
+ */
+function runOnboardingAgent(name, email) {
+  const flags = [];
+  const domain = String(email).split('@')[1]?.toLowerCase() || '';
+
+  // (a) email format validation
+  if (!EMAIL_RE.test(email)) {
+    audit('ONBOARDING AGENT', 'signup email validation', 'fail', `Invalid email format: ${email}`);
+    return { hardReject: true, error: 'Invalid business email format.', flags };
+  }
+  audit('ONBOARDING AGENT', 'signup email validation', 'pass', `Email format OK: ${email}`);
+
+  // (b) disposable / temp email domains -> hard reject
+  if (DISPOSABLE_DOMAINS.includes(domain)) {
+    audit('ONBOARDING AGENT', 'disposable domain check', 'fail', `Blocked disposable domain: ${domain}`);
+    return { hardReject: true, error: 'Disposable/temporary email addresses are not allowed. Please use your business email.', flags };
+  }
+  audit('ONBOARDING AGENT', 'disposable domain check', 'pass', `Domain not disposable: ${domain}`);
+
+  // (c) free providers -> warning flag (registration still allowed, stays pending)
+  if (FREE_PROVIDERS.includes(domain)) {
+    flags.push('Non-business email domain (' + domain + ')');
+    audit('ONBOARDING AGENT', 'free provider check', 'flag', `Free email provider used: ${domain}`);
+  } else {
+    audit('ONBOARDING AGENT', 'free provider check', 'pass', `Business domain: ${domain}`);
+  }
+
+  // (d) name screening: too short, contains "test", or keyboard mash
+  const n = String(name).trim();
+  const mash = /(qwerty|asdf|zxcv|qazwsx|12345|(.)\2{3,})/i;
+  if (n.length < 3) {
+    flags.push('Company name too short (<3 chars)');
+    audit('ONBOARDING AGENT', 'name screening', 'flag', `Name too short: "${n}"`);
+  } else if (/test/i.test(n)) {
+    flags.push('Company name contains "test"');
+    audit('ONBOARDING AGENT', 'name screening', 'flag', `Name contains "test": "${n}"`);
+  } else if (mash.test(n)) {
+    flags.push('Company name looks like keyboard mash');
+    audit('ONBOARDING AGENT', 'name screening', 'flag', `Keyboard-mash name: "${n}"`);
+  } else {
+    audit('ONBOARDING AGENT', 'name screening', 'pass', `Name OK: "${n}"`);
+  }
+
+  return { hardReject: false, error: '', flags };
+}
+
+// ============================= EMAIL DELIVERY (BREVO / DEMO MODE) =============================
+/**
+ * Dual-mode code delivery.
+ *  - BREVO_API_KEY set   -> send via Brevo HTTPS API (global fetch, no SMTP/nodemailer).
+ *  - BREVO_API_KEY unset -> DEMO MODE: code shown on the verify page + console.log.
+ */
+function sendVerificationCode(email, code) {
+  if (!BREVO_API_KEY) {
+    console.log(`[DEMO MODE] Verification code for ${email}: ${code}`);
+    audit('AUTHENTICATION AGENT', '2FA code delivery', 'flag', `DEMO MODE — code for ${email} shown on screen (no BREVO_API_KEY set)`);
+    return;
+  }
+  fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: { 'api-key': BREVO_API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      sender: { email: BREVO_SENDER_EMAIL, name: 'Dealzoin Security' },
+      to: [{ email }],
+      subject: 'Your Dealzoin verification code',
+      htmlContent: `<html><body style="font-family:sans-serif"><h2>Dealzoin Security</h2>
+        <p>Your login verification code is:</p>
+        <p style="font-size:28px;font-weight:bold;letter-spacing:4px">${code}</p>
+        <p>This code expires in 10 minutes. If you did not request it, ignore this email.</p>
+        </body></html>`
+    })
+  }).then(async (res) => {
+    if (res.ok) {
+      audit('AUTHENTICATION AGENT', '2FA code delivery', 'pass', `Brevo email sent to ${email}`);
+    } else {
+      const txt = await res.text().catch(() => '');
+      audit('AUTHENTICATION AGENT', '2FA code delivery', 'fail', `Brevo API ${res.status} for ${email}: ${txt.slice(0, 200)}`);
+    }
+  }).catch((err) => {
+    audit('AUTHENTICATION AGENT', '2FA code delivery', 'fail', `Brevo send error for ${email}: ${err.message}`);
+  });
+}
+
+// ============================= HTML LAYOUT & CSS =============================
+const CSS = `
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #150826; color: #e9e4f5; font-family: -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; min-height: 100vh; }
+  a { color: #a855f7; text-decoration: none; }
+  a:hover { color: #c084fc; }
+  .nav { background: #1a0b2e; border-bottom: 1px solid #3b1d63; padding: 14px 24px; display: flex; align-items: center; gap: 18px; flex-wrap: wrap; position: sticky; top: 0; z-index: 10; }
+  .nav .brand { font-size: 22px; font-weight: 800; color: #a855f7; letter-spacing: .5px; }
+  .nav .brand span { color: #e9e4f5; }
+  .nav a.navlink { color: #cbb8ec; font-size: 14px; }
+  .nav a.navlink:hover { color: #fff; }
+  .nav .spacer { flex: 1; }
+  .container { max-width: 860px; margin: 28px auto; padding: 0 16px; }
+  .card { background: #1a0b2e; border: 1px solid #3b1d63; border-radius: 12px; padding: 20px; margin-bottom: 16px; box-shadow: 0 4px 18px rgba(0,0,0,.35); }
+  .card h2, .card h3 { color: #c4b5fd; margin-bottom: 10px; }
+  .muted { color: #9d8fc0; font-size: 13px; }
+  .btn { display: inline-block; background: #7c3aed; color: #fff; border: none; border-radius: 8px; padding: 9px 16px; font-size: 14px; font-weight: 600; cursor: pointer; }
+  .btn:hover { background: #8b5cf6; }
+  .btn-sm { padding: 5px 11px; font-size: 13px; }
+  .btn-outline { background: transparent; border: 1px solid #7c3aed; color: #a855f7; }
+  .btn-outline:hover { background: #2a1245; }
+  .btn-danger { background: #b91c1c; }
+  .btn-danger:hover { background: #dc2626; }
+  .btn-green { background: #15803d; }
+  .btn-green:hover { background: #16a34a; }
+  input[type=text], input[type=email], input[type=password], input[type=url], input[type=number], textarea {
+    width: 100%; background: #24103f; border: 1px solid #4c2a85; border-radius: 8px;
+    color: #efe9fb; padding: 10px 12px; font-size: 14px; margin-bottom: 12px;
+  }
+  input:focus, textarea:focus { outline: none; border-color: #a855f7; }
+  label { display: block; font-size: 13px; color: #b9a8e0; margin-bottom: 5px; }
+  .flash-ok { background: #14532d; border: 1px solid #22c55e; color: #bbf7d0; border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; font-size: 14px; }
+  .flash-err { background: #450a0a; border: 1px solid #ef4444; color: #fecaca; border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; font-size: 14px; }
+  .demo-banner { background: #78350f; border: 1px solid #f59e0b; color: #fde68a; border-radius: 8px; padding: 12px 14px; margin-bottom: 14px; font-size: 14px; }
+  .badge { display: inline-block; border-radius: 999px; padding: 2px 10px; font-size: 12px; font-weight: 700; }
+  .badge-pass { background: #14532d; color: #4ade80; }
+  .badge-flag { background: #78350f; color: #fbbf24; }
+  .badge-fail { background: #450a0a; color: #f87171; }
+  .badge-pending { background: #78350f; color: #fbbf24; }
+  .badge-approved { background: #14532d; color: #4ade80; }
+  .badge-rejected { background: #450a0a; color: #f87171; }
+  .badge-suspended { background: #374151; color: #9ca3af; }
+  .warn-badge { background: #78350f; color: #fbbf24; border-radius: 6px; padding: 2px 8px; font-size: 12px; font-weight: 700; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #3b1d63; vertical-align: top; }
+  th { color: #a78bfa; font-size: 12px; text-transform: uppercase; letter-spacing: .5px; }
+  .stats { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
+  .stat { background: #1a0b2e; border: 1px solid #3b1d63; border-radius: 10px; padding: 12px 18px; flex: 1; min-width: 110px; text-align: center; }
+  .stat .num { font-size: 24px; font-weight: 800; color: #a855f7; }
+  .stat .lbl { font-size: 12px; color: #9d8fc0; }
+  .feed-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .feed-actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; align-items: center; }
+  .feed-actions form { display: inline; }
+  .comment { border-top: 1px solid #2c1552; padding: 8px 0; font-size: 13px; }
+  .hero { text-align: center; padding: 60px 20px; }
+  .hero h1 { font-size: 44px; color: #c4b5fd; margin-bottom: 14px; }
+  .hero p { color: #b9a8e0; font-size: 17px; max-width: 620px; margin: 0 auto 26px; }
+  .footer { text-align: center; color: #6d5f92; font-size: 12px; padding: 30px 0; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 700px) { .grid2 { grid-template-columns: 1fr; } }
+`;
+
+/** Render the full HTML page shell. */
+function page(title, body, user, msg, err) {
+  const navLinks = user && user.isAdmin
+    ? `<a class="navlink" href="/admin">Dashboard</a>
+       <form method="POST" action="/admin/logout" style="display:inline"><button class="btn btn-sm btn-outline">Log out</button></form>`
+    : user
+    ? `<a class="navlink" href="/timeline">Timeline</a>
+       <a class="navlink" href="/deals/new">New Deal</a>
+       <a class="navlink" href="/search">Search</a>
+       <a class="navlink" href="/company/${user.id}">My Profile</a>
+       <form method="POST" action="/logout" style="display:inline"><button class="btn btn-sm btn-outline">Log out</button></form>`
+    : `<a class="navlink" href="/login">Sign in</a>
+       <a class="navlink" href="/signup">Register company</a>`;
+  return `<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(title)} — Dealzoin</title>
+<style>${CSS}</style>
+</head><body>
+<nav class="nav">
+  <a href="/" class="brand">Dealz<span>oin</span></a>
+  <span class="spacer"></span>
+  ${navLinks}
+</nav>
+<main class="container">
+  ${msg ? `<div class="flash-ok">${esc(msg)}</div>` : ''}
+  ${err ? `<div class="flash-err">${esc(err)}</div>` : ''}
+  ${body}
+</main>
+<div class="footer">Dealzoin — the B2B deal network. Companies only.</div>
+</body></html>`;
+}
+
+function statusBadge(status) {
+  return `<span class="badge badge-${esc(status)}">${esc(status)}</span>`;
+}
+function resultBadge(result) {
+  return `<span class="badge badge-${esc(result)}">${esc(result)}</span>`;
+}
+
+// ============================= SESSIONS & AUTH MIDDLEWARE =============================
+/** True when the request arrived over HTTPS (Render/proxy sets x-forwarded-proto). */
+function isSecureReq(req) {
+  return req && (req.secure || req.headers['x-forwarded-proto'] === 'https');
+}
+function createSession(req, res, companyId, isAdmin) {
+  const token = randomToken();
+  const expires = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+  db.prepare('INSERT INTO sessions (token, company_id, is_admin, created_at, expires_at) VALUES (?,?,?,?,?)')
+    .run(token, companyId, isAdmin ? 1 : 0, now(), expires);
+  res.setHeader('Set-Cookie',
+    `dz_session=${signedCookieValue(token)}; HttpOnly; Path=/; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}; SameSite=Lax${isSecureReq(req) ? '; Secure' : ''}`);
+}
+function destroySession(req, res) {
+  const token = readSignedCookie(req, 'dz_session');
+  if (token) db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+  res.setHeader('Set-Cookie', 'dz_session=; HttpOnly; Path=/; Max-Age=0');
+}
+/** Resolve the current session -> { id, name, isAdmin } or null. */
+function currentUser(req) {
+  const token = readSignedCookie(req, 'dz_session');
+  if (!token) return null;
+  const sess = db.prepare('SELECT * FROM sessions WHERE token = ?').get(token);
+  if (!sess || sess.expires_at < now()) return null;
+  if (sess.is_admin) return { id: 0, name: 'Admin', isAdmin: true };
+  const c = db.prepare('SELECT id, name, status FROM companies WHERE id = ?').get(sess.company_id);
+  if (!c || c.status !== 'approved') return null;
+  return { id: c.id, name: c.name, isAdmin: false };
+}
+/** Guard: approved company session required. */
+function requireCompany(req, res, next) {
+  const user = currentUser(req);
+  if (!user || user.isAdmin) return res.redirect('/login?err=' + encodeURIComponent('Please sign in with an approved company account.'));
+  req.user = user;
+  next();
+}
+/** Guard: admin session required. */
 function requireAdmin(req, res, next) {
-  if (!req.session.adminId) return res.redirect('/signin');
-  next();
-}
-function requireApprovedCompany(req, res, next) {
-  if (!req.session.companyId) return res.redirect('/signin');
-  const c = db.prepare('SELECT * FROM companies WHERE id = ?').get(req.session.companyId);
-  if (!c) { req.session.destroy(() => res.redirect('/signin')); return; }
-  if (c.status !== 'approved') {
-    return res.send(layout('Awaiting approval', '<div class="card"><h2>Registration ' + c.status + '</h2><p class="mut">Your registration is <b>' + c.status + '</b>. ' +
-      (c.status === 'pending' ? 'The platform owner must approve it before you can trade.' : 'Contact the platform owner to re-apply.') +
-      '</p><a class="btn" href="/signout">Sign out</a></div>'));
-  }
-  req.company = c;
+  const user = currentUser(req);
+  if (!user || !user.isAdmin) return res.redirect('/admin?err=' + encodeURIComponent('Admin sign-in required.'));
+  req.user = user;
   next();
 }
 
-/* ---------- page layout ---------- */
-const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
-const usd = (n) => '$' + Number(n).toLocaleString();
-const pill = (s) => `<span class="pill ${s === 'approved' ? 'ok' : s === 'rejected' ? 'no' : 'pend'}">${s}</span>`;
-function navFor(s) {
-  if (s.adminId) return `<div class="nav"><div class="logo" style="width:30px;height:30px;font-size:16px">D</div><b style="color:#fff">Owner dashboard</b><span style="flex:1"></span><a href="/admin">Approvals</a><a href="/admin/password">Change password</a><a href="/signout">Sign out</a></div>`;
-  if (s.companyId) return `<div class="nav"><div class="logo" style="width:30px;height:30px;font-size:16px">D</div><b style="color:#fff">Dealzoin</b><span style="flex:1"></span><a href="/feed">Timeline</a><a href="/companies">Companies</a><a href="/search">Search</a><a href="/dashboard">My deals</a><a href="/password">Change password</a><a href="/signout">Sign out</a></div>`;
-  return '';
-}
-const flashBox = (req) => req.session.flash ? `<div class="flash">${esc(req.session.flash)}</div>` + (delete req.session.flash, '') : '';
-function layout(title, body) {
-  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Dealzoin — ${esc(title)}</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:#0b1220;color:#e2e8f0;min-height:100vh}
-a{color:#a78bfa}
-.wrap{max-width:960px;margin:0 auto;padding:32px 16px}
-.brand{display:flex;align-items:center;gap:10px;margin-bottom:26px}
-.logo{width:40px;height:40px;border-radius:10px;background:linear-gradient(135deg,#7c3aed,#6b21a8);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:22px;color:#fff}
-.brand b{font-size:22px;color:#fff}
-.card{background:#111a2e;border:1px solid #243152;border-radius:14px;padding:22px;margin-bottom:16px}
-h2{color:#fff;margin-bottom:6px;font-size:20px}
-h3{color:#fff;font-size:16px}
-.mut{color:#94a3b8;font-size:14px}
-label{display:block;font-size:12px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:.5px;margin:14px 0 6px}
-input,select,textarea{width:100%;background:#0b1425;border:1px solid #2b3a5e;border-radius:10px;padding:11px 13px;color:#e2e8f0;font:inherit}
-input:focus,select:focus,textarea:focus{outline:none;border-color:#7c3aed}
-.btn{display:inline-block;background:#7c3aed;color:#fff;border:none;border-radius:10px;padding:11px 20px;font-weight:700;font-size:14px;cursor:pointer;text-decoration:none;margin-top:18px}
-.btn:hover{background:#6d28d9}
-.btn.ghost{background:transparent;border:1px solid #33436b;color:#cbd5e1}
-.btn.ghost:hover{background:#1a2540}
-.btn.sm{padding:7px 13px;font-size:13px;margin-top:0;border-radius:8px}
-.btn.green{background:#059669}.btn.green:hover{background:#047857}
-.btn.red{background:#dc2626}.btn.red:hover{background:#b91c1c}
-.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-table{width:100%;border-collapse:collapse;font-size:13.5px;margin-top:8px}
-th{text-align:left;color:#94a3b8;font-size:11.5px;text-transform:uppercase;letter-spacing:.5px;padding:8px 6px}
-td{padding:10px 6px;border-top:1px solid #223155;vertical-align:middle}
-.pill{font-size:11px;font-weight:700;padding:3px 10px;border-radius:999px}
-.pill.pend{background:#78350f;color:#fbbf24}
-.pill.ok{background:#064e3b;color:#34d399}
-.pill.no{background:#7f1d1d;color:#f87171}
-.nav{display:flex;gap:14px;align-items:center;margin-bottom:20px;font-size:14px;flex-wrap:wrap}
-.nav a{color:#cbd5e1;text-decoration:none;font-weight:600}
-.nav a:hover{color:#fff}
-.flash{background:#312e81;border:1px solid #4f46e5;color:#e0e7ff;padding:11px 15px;border-radius:10px;margin-bottom:14px;font-size:14px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:16px}
-.kpi{background:#111a2e;border:1px solid #243152;border-radius:12px;padding:16px}
-.kpi .v{font-size:26px;font-weight:800;color:#fff}
-.kpi .l{font-size:12px;color:#94a3b8;font-weight:600}
-.center{max-width:440px;margin:8vh auto 0}
-.post{border:1px solid #243152;border-radius:12px;padding:16px;margin-bottom:12px;background:#111a2e}
-.post .who{font-weight:700;color:#fff}
-.post .body{margin:10px 0;font-size:14.5px;line-height:1.55;white-space:pre-wrap}
-.acts{display:flex;gap:6px;margin:8px 0;flex-wrap:wrap;align-items:center}
-.like-on{background:#831843;border-color:#be185d;color:#fff}
-.repost-on{background:#0c4a6e;border-color:#0284c7;color:#fff}
-.cmt{border-top:1px solid #1e2b47;padding:8px 0;font-size:13px;color:#94a3b8}
-.cmt b{color:#cbd5e1}
-.cform{display:flex;gap:8px;margin-top:10px}
-.cform input{flex:1}
-.deal-card{border:1px solid #3b2f63;border-left:4px solid #7c3aed;border-radius:12px;padding:16px;margin-bottom:12px;background:#111a2e}
-.msg{border:1px solid #243152;border-radius:12px;padding:10px 14px;margin-bottom:10px;font-size:14px}
-.msg .who{font-size:12px;font-weight:700;color:#a78bfa}
-.msg.me{border-color:#7c3aed}
-.doc{background:#f8fafc;color:#1e293b;border-radius:12px;padding:30px;font-size:14px;line-height:1.6}
-.doc h1{font-size:20px;text-align:center;margin-bottom:4px;color:#0f172a}
-.doc .sub{text-align:center;color:#64748b;font-size:12px;margin-bottom:18px}
-.doc h4{margin:16px 0 4px;color:#0f172a}
-.doc p{margin-bottom:8px}
-</style></head><body><div class="wrap">${body}</div></body></html>`;
-}
-
-/* ---------- AUTH PAGES ---------- */
+// ============================= PUBLIC ROUTES =============================
 app.get('/', (req, res) => {
-  if (req.session.adminId) return res.redirect('/admin');
-  if (req.session.companyId) return res.redirect('/feed');
-  res.redirect('/signin');
+  const user = currentUser(req);
+  const body = `
+  <div class="hero">
+    <h1>Deals happen on Dealzoin.</h1>
+    <p>The B2B social network where verified companies post deals, follow each other,
+       and sign contracts — protected by automated security agents.</p>
+    ${user
+      ? `<a class="btn" href="${user.isAdmin ? '/admin' : '/timeline'}">Open ${user.isAdmin ? 'dashboard' : 'timeline'} &rarr;</a>`
+      : `<a class="btn" href="/signup">Register your company</a>
+         &nbsp; <a class="btn btn-outline" href="/login">Sign in</a>`}
+  </div>
+  <div class="grid2">
+    <div class="card"><h3>📈 Post deals instantly</h3><p class="muted">Deals go live on every company's timeline the moment you publish. Likes, comments and reposts built in.</p></div>
+    <div class="card"><h3>📝 Sign real contracts</h3><p class="muted">Private signing rooms, password re-verification, downloadable contract documents and admin approval.</p></div>
+    <div class="card"><h3>🤖 Security agents</h3><p class="muted">Onboarding screening, 2FA login codes and signing authority checks — all logged to a tamper-evident audit trail.</p></div>
+    <div class="card"><h3>🏢 Companies only</h3><p class="muted">No individual accounts. Every member is a vetted business, approved by an admin before posting.</p></div>
+  </div>`;
+  res.send(page('Welcome', body, user, req.query.msg, req.query.err));
 });
-app.get('/signin', (req, res) => {
-  if (req.session.adminId) return res.redirect('/admin');
-  if (req.session.companyId) return res.redirect('/feed');
-  res.send(layout('Sign in', `<div class="center">
-    <div class="brand"><div class="logo">D</div><b>Dealzoin</b></div>${flashBox(req)}
-    <div class="card">
-      <h2>Sign in</h2><p class="mut">Companies &amp; platform owner</p>
-      <form method="POST" action="/signin">
-        <label>Email</label><input name="email" type="email" required>
-        <label>Password</label><input name="password" type="password" required>
-        <button class="btn" style="width:100%">Sign in</button>
-      </form>
-      <p class="mut" style="margin-top:18px;text-align:center">New company? <a href="/signup">Register your company</a></p>
-    </div></div>`));
-});
-app.post('/signin', (req, res) => {
-  const email = String(req.body.email || '').trim().toLowerCase();
-  const password = String(req.body.password || '');
-  const key = email + '|' + req.ip;
-  if (tooMany(key)) { req.session.flash = 'Too many attempts — try again in 10 minutes.'; return res.redirect('/signin'); }
-  const admin = db.prepare('SELECT * FROM admins WHERE email = ?').get(email);
-  if (admin && verifyPassword(password, admin.salt, admin.pass_hash)) {
-    return req.session.regenerate(() => { req.session.adminId = admin.id; res.redirect('/admin'); });
-  }
-  const company = db.prepare('SELECT * FROM companies WHERE email = ?').get(email);
-  if (company && verifyPassword(password, company.salt, company.pass_hash)) {
-    return req.session.regenerate(() => { req.session.companyId = company.id; res.redirect('/feed'); });
-  }
-  recordFail(key);
-  req.session.flash = 'Invalid email or password.';
-  res.redirect('/signin');
-});
+
+// ----- Company signup (ONBOARDING AGENT runs here) -----
 app.get('/signup', (req, res) => {
-  res.send(layout('Sign up', `<div class="center">
-    <div class="brand"><div class="logo">D</div><b>Dealzoin</b></div>${flashBox(req)}
-    <div class="card">
-      <h2>Register your company</h2><p class="mut">The platform owner approves every registration before you can trade.</p>
-      <form method="POST" action="/signup">
-        <label>Company name</label><input name="name" required maxlength="120">
-        <label>Business email</label><input name="email" type="email" required>
-        <label>Password (min 8 characters)</label><input name="password" type="password" minlength="8" required>
-        <label>Country</label><input name="country" required maxlength="60">
-        <label>Industry</label><input name="industry" required maxlength="80">
-        <button class="btn" style="width:100%">Submit for approval</button>
-      </form>
-      <p class="mut" style="margin-top:18px;text-align:center">Already registered? <a href="/signin">Sign in</a></p>
-    </div></div>`));
+  const body = `
+  <div class="card" style="max-width:520px;margin:0 auto">
+    <h2>Register your company</h2>
+    <p class="muted" style="margin-bottom:14px">Companies only — no individual accounts. New companies are reviewed by an admin.</p>
+    <form method="POST" action="/signup">
+      <label>Company name</label><input type="text" name="name" required maxlength="120">
+      <label>Business email</label><input type="email" name="email" required maxlength="160">
+      <label>Password (min 8 characters)</label><input type="password" name="password" required minlength="8" maxlength="200">
+      <label>Website</label><input type="url" name="website" placeholder="https://example.com" maxlength="200">
+      <label>Description</label><textarea name="description" rows="4" maxlength="2000"></textarea>
+      <button class="btn" type="submit">Create company account</button>
+    </form>
+    <p class="muted" style="margin-top:12px">Already approved? <a href="/login">Sign in</a></p>
+  </div>`;
+  res.send(page('Sign up', body, null, req.query.msg, req.query.err));
 });
+
 app.post('/signup', (req, res) => {
-  const name = String(req.body.name || '').trim();
-  const email = String(req.body.email || '').trim().toLowerCase();
-  const password = String(req.body.password || '');
-  const country = String(req.body.country || '').trim();
-  const industry = String(req.body.industry || '').trim();
-  if (!name || !country || !industry || !isEmail(email) || password.length < 8) {
-    req.session.flash = 'Please fill all fields correctly (password min 8 characters).'; return res.redirect('/signup');
+  const { name, email, password, website, description } = req.body;
+  const nm = String(name || '').trim();
+  const em = String(email || '').trim().toLowerCase();
+  // Sanitize website: only allow http(s) URLs (blocks javascript: etc.); prepend https:// if missing.
+  let site = String(website || '').trim().slice(0, 200);
+  if (site && !/^https?:\/\//i.test(site)) site = 'https://' + site.replace(/^[a-z][a-z0-9+.-]*:/i, '');
+  if (site && !/^https:\/\/[^\s]+$/i.test(site)) site = '';
+
+  if (!nm || !em || !password) {
+    return res.redirect('/signup?err=' + encodeURIComponent('Company name, email and password are required.'));
   }
-  if (db.prepare('SELECT id FROM companies WHERE email = ?').get(email) || db.prepare('SELECT id FROM admins WHERE email = ?').get(email)) {
-    req.session.flash = 'An account with this email already exists.'; return res.redirect('/signup');
+  if (String(password).length < 8) {
+    return res.redirect('/signup?err=' + encodeURIComponent('Password must be at least 8 characters.'));
   }
-  const { salt, hash } = hashPassword(password);
-  db.prepare('INSERT INTO companies (name,email,pass_hash,salt,country,industry) VALUES (?,?,?,?,?,?)').run(name, email, hash, salt, country, industry);
-  req.session.flash = 'Registration submitted. The platform owner will review it shortly.';
-  res.redirect('/signin');
+
+  // --- ONBOARDING AGENT automated checks ---
+  const check = runOnboardingAgent(nm, em);
+  if (check.hardReject) {
+    return res.redirect('/signup?err=' + encodeURIComponent(check.error));
+  }
+
+  const existing = db.prepare('SELECT id FROM companies WHERE email = ?').get(em);
+  if (existing) {
+    return res.redirect('/signup?err=' + encodeURIComponent('A company with this email is already registered.'));
+  }
+
+  const salt = newSalt();
+  db.prepare(`INSERT INTO companies (name, email, password_hash, salt, website, description, status, flagged, flag_reasons, created_at)
+              VALUES (?,?,?,?,?,?, 'pending', ?, ?, ?)`)
+    .run(nm, em, hashPassword(password, salt), salt,
+         site, String(description || '').trim().slice(0, 2000),
+         check.flags.length ? 1 : 0, check.flags.join('; '), now());
+  audit('ONBOARDING AGENT', 'signup decision', check.flags.length ? 'flag' : 'pass',
+        `Company "${nm}" registered as pending${check.flags.length ? ' with warnings: ' + check.flags.join('; ') : ''}`);
+
+  res.redirect('/login?msg=' + encodeURIComponent('Registration received! Your company is pending admin approval.'));
 });
-app.get('/signout', (req, res) => req.session.destroy(() => res.redirect('/signin')));
 
-/* ---------- SOCIAL DATA HELPERS ---------- */
-function socialSets(companyId) {
-  return {
-    likedPosts: new Set(db.prepare('SELECT post_id FROM likes WHERE company_id=? AND post_id IS NOT NULL').all(companyId).map(r => r.post_id)),
-    likedDeals: new Set(db.prepare('SELECT deal_id FROM likes WHERE company_id=? AND deal_id IS NOT NULL').all(companyId).map(r => r.deal_id)),
-    reposted: new Set(db.prepare('SELECT deal_id FROM reposts WHERE company_id=?').all(companyId).map(r => r.deal_id)),
-    following: new Set(db.prepare('SELECT following_id FROM follows WHERE follower_id=?').all(companyId).map(r => r.following_id))
-  };
-}
-function countsBy(sql) { const m = {}; db.prepare(sql).all().forEach(r => m[r.k] = r.n); return m; }
-function commentsGrouped() {
-  const g = {};
-  db.prepare(`SELECT cm.*, c.name AS company FROM comments cm JOIN companies c ON c.id=cm.company_id ORDER BY cm.id`).all()
-    .forEach(cm => { const key = (cm.deal_id ? 'd' + cm.deal_id : 'p' + cm.post_id); (g[key] = g[key] || []).push(cm); });
-  return g;
-}
+// ============================= AUTH ROUTES (login + 2FA + logout) =============================
+app.get('/login', (req, res) => {
+  const body = `
+  <div class="card" style="max-width:440px;margin:0 auto">
+    <h2>Company sign in</h2>
+    <form method="POST" action="/login">
+      <label>Business email</label><input type="email" name="email" required>
+      <label>Password</label><input type="password" name="password" required>
+      <button class="btn" type="submit">Continue</button>
+    </form>
+    <p class="muted" style="margin-top:12px">No account yet? <a href="/signup">Register your company</a></p>
+    <p class="muted" style="margin-top:18px;font-size:12px">🛡️ Protected by Dealzoin security agents</p>
+  </div>`;
+  res.send(page('Sign in', body, null, req.query.msg, req.query.err));
+});
 
-/* ---------- TIMELINE (posts + deals, live for all) ---------- */
-function dealCardHtml(d, me, S) {
-  const liked = S.likedDeals.has(d.id), reposted = S.reposted.has(d.id);
-  const lc = S.likeCounts['d' + d.id] || 0, rc = S.repostCounts[d.id] || 0;
-  const cms = (S.comments['d' + d.id] || []).map(cm => `<div class="cmt"><b>${esc(cm.company)}</b> — ${esc(cm.body)}</div>`).join('');
-  return `<div class="deal-card">
-    <div class="row" style="justify-content:space-between">
-      <div><span class="who">◆ ${esc(d.company)}</span> <span class="mut" style="font-size:12px">· ${esc(d.industry)} · ${d.created_at}</span></div>
-      <span class="pill ok">${usd(d.value_usd)}</span>
-    </div>
-    <h3 style="margin:8px 0 4px">${esc(d.title)}</h3>
-    <p class="mut">${esc(d.terms)}</p>
-    <div class="acts">
-      <form method="POST" action="/feed/like/deal/${d.id}" style="display:inline"><button class="btn sm ghost ${liked ? 'like-on' : ''}">❤ ${lc}</button></form>
-      <form method="POST" action="/feed/repost/${d.id}" style="display:inline"><button class="btn sm ghost ${reposted ? 'repost-on' : ''}">🔁 ${rc}</button></form>
-      <a class="btn sm ghost" href="/deal/${d.id}">✍️ Sign contract</a>
-    </div>${cms}
-    <form class="cform" method="POST" action="/feed/comment/deal/${d.id}">
-      <input name="body" placeholder="Comment on this deal..." maxlength="300" required>
-      <button class="btn sm">Comment</button>
-    </form></div>`;
-}
-function postCardHtml(p, me, S) {
-  const liked = S.likedPosts.has(p.id);
-  const lc = S.likeCounts['p' + p.id] || 0;
-  const cms = (S.comments['p' + p.id] || []).map(cm => `<div class="cmt"><b>${esc(cm.company)}</b> — ${esc(cm.body)}</div>`).join('');
-  return `<div class="post">
-    <div><span class="who">${esc(p.company)}</span> <span class="mut" style="font-size:12px">· ${esc(p.industry)} · ${p.created_at}</span></div>
-    <div class="body">${esc(p.body)}</div>
-    <div class="acts"><form method="POST" action="/feed/like/post/${p.id}" style="display:inline"><button class="btn sm ghost ${liked ? 'like-on' : ''}">❤ ${lc}</button></form></div>${cms}
-    <form class="cform" method="POST" action="/feed/comment/post/${p.id}">
-      <input name="body" placeholder="Write a comment..." maxlength="300" required>
-      <button class="btn sm">Comment</button>
-    </form></div>`;
-}
-app.get('/feed', requireApprovedCompany, (req, res) => {
-  const me = req.company.id;
-  const S = socialSets(me);
-  S.likeCounts = countsBy(`SELECT COALESCE('p'||post_id, 'd'||deal_id) AS k, COUNT(*) n FROM likes GROUP BY 1`);
-  S.repostCounts = countsBy('SELECT deal_id AS k, COUNT(*) n FROM reposts GROUP BY deal_id');
-  S.comments = commentsGrouped();
-  const posts = db.prepare(`SELECT p.*, c.name AS company, c.industry FROM posts p JOIN companies c ON c.id=p.company_id ORDER BY p.id DESC LIMIT 50`).all();
-  const deals = db.prepare(`SELECT d.*, c.name AS company, c.industry FROM deals d JOIN companies c ON c.id=d.company_id ORDER BY d.id DESC LIMIT 50`).all();
-  const items = [
-    ...posts.map(p => ({ t: p.created_at, html: postCardHtml(p, me, S) })),
-    ...deals.map(d => ({ t: d.created_at, html: dealCardHtml(d, me, S) }))
-  ].sort((a, b) => (a.t < b.t ? 1 : -1)).map(x => x.html).join('');
+app.post('/login', (req, res) => {
+  const em = String(req.body.email || '').trim().toLowerCase();
+  const pw = String(req.body.password || '');
+  const company = db.prepare('SELECT * FROM companies WHERE email = ?').get(em);
 
-  res.send(layout('Timeline', navFor(req.session) + flashBox(req) + `
-    <div class="card">
-      <h2>Timeline</h2><p class="mut">Post an update or a deal — everything is visible to all companies instantly.</p>
-      <form method="POST" action="/feed/post">
-        <textarea name="body" rows="2" maxlength="600" placeholder="Share an update from ${esc(req.company.name)}..." required></textarea>
-        <button class="btn">Post</button>
+  if (!company || !verifyPassword(pw, company.salt, company.password_hash)) {
+    audit('AUTHENTICATION AGENT', 'login password check', 'fail', `Failed login for ${em}`);
+    return res.redirect('/login?err=' + encodeURIComponent('Invalid email or password.'));
+  }
+  audit('AUTHENTICATION AGENT', 'login password check', 'pass', `Password OK for ${em}`);
+
+  if (company.status === 'pending') {
+    return res.redirect('/login?err=' + encodeURIComponent('Your company is still pending admin approval.'));
+  }
+  if (company.status === 'rejected') {
+    return res.redirect('/login?err=' + encodeURIComponent('This registration was rejected. Contact support.'));
+  }
+  if (company.status === 'suspended') {
+    return res.redirect('/login?err=' + encodeURIComponent('This account is suspended. Contact support.'));
+  }
+
+  // --- AUTHENTICATION AGENT: sign-in 2FA — issue code, do NOT create session yet ---
+  const code = String(crypto.randomInt(100000, 1000000)); // 6-digit
+  const token = randomToken();
+  db.prepare('DELETE FROM verification_codes WHERE company_id = ? AND purpose = ?').run(company.id, 'login');
+  db.prepare('INSERT INTO verification_codes (token, company_id, code, purpose, expires_at, created_at) VALUES (?,?,?,?,?,?)')
+    .run(token, company.id, code, 'login', new Date(Date.now() + CODE_TTL_MS).toISOString(), now());
+  sendVerificationCode(company.email, code);
+  audit('AUTHENTICATION AGENT', '2FA code issued', 'pass', `Login code issued for ${em} (10-min expiry)`);
+
+  res.setHeader('Set-Cookie', `dz_verify=${signedCookieValue(token)}; HttpOnly; Path=/; Max-Age=600; SameSite=Lax${isSecureReq(req) ? '; Secure' : ''}`);
+  res.redirect('/verify-login');
+});
+
+app.get('/verify-login', (req, res) => {
+  const token = readSignedCookie(req, 'dz_verify');
+  if (!token) return res.redirect('/login?err=' + encodeURIComponent('No verification in progress. Please sign in again.'));
+  const row = db.prepare(`SELECT * FROM verification_codes WHERE token = ? AND purpose = 'login'`).get(token);
+  if (!row) return res.redirect('/login?err=' + encodeURIComponent('Verification expired. Please sign in again.'));
+
+  // DEMO MODE: without BREVO_API_KEY the code is shown on-screen (and console.logged).
+  const demo = BREVO_API_KEY ? '' : `
+    <div class="demo-banner">⚠️ <b>DEMO MODE</b> — no BREVO_API_KEY configured, so the email was not sent.
+    Your verification code is: <b style="font-size:18px;letter-spacing:3px">${esc(row.code)}</b></div>`;
+
+  const body = `
+  <div class="card" style="max-width:440px;margin:0 auto">
+    <h2>Two-factor verification</h2>
+    <p class="muted" style="margin-bottom:12px">The Authentication Agent sent a 6-digit code to your business email. Enter it below to finish signing in.</p>
+    ${demo}
+    <form method="POST" action="/verify-login">
+      <label>6-digit code</label><input type="text" name="code" required pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code">
+      <button class="btn" type="submit">Verify &amp; sign in</button>
+    </form>
+    <p class="muted" style="margin-top:18px;font-size:12px">🛡️ Protected by Dealzoin security agents</p>
+  </div>`;
+  res.send(page('Verify login', body, null, req.query.msg, req.query.err));
+});
+
+app.post('/verify-login', (req, res) => {
+  const token = readSignedCookie(req, 'dz_verify');
+  const code = String(req.body.code || '').trim();
+  if (!token) return res.redirect('/login?err=' + encodeURIComponent('No verification in progress. Please sign in again.'));
+  const row = db.prepare(`SELECT * FROM verification_codes WHERE token = ? AND purpose = 'login'`).get(token);
+
+  if (!row || row.expires_at < now()) {
+    audit('AUTHENTICATION AGENT', '2FA verify', 'fail', 'Code expired or missing');
+    return res.redirect('/login?err=' + encodeURIComponent('Code expired. Please sign in again.'));
+  }
+  const company = db.prepare('SELECT * FROM companies WHERE id = ?').get(row.company_id);
+  if (!company || company.status !== 'approved') {
+    return res.redirect('/login?err=' + encodeURIComponent('Account not available.'));
+  }
+  // constant-time code comparison
+  const a = Buffer.from(code.padEnd(6, ' '));
+  const b = Buffer.from(row.code.padEnd(6, ' '));
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    audit('AUTHENTICATION AGENT', '2FA verify', 'fail', `Wrong code for ${company.email}`);
+    return res.redirect('/verify-login?err=' + encodeURIComponent('Incorrect code. Try again.'));
+  }
+
+  db.prepare('DELETE FROM verification_codes WHERE id = ?').run(row.id);
+  audit('AUTHENTICATION AGENT', '2FA verify', 'pass', `2FA passed for ${company.email} — session created`);
+  res.setHeader('Set-Cookie', 'dz_verify=; HttpOnly; Path=/; Max-Age=0');
+  createSession(req, res, company.id, false);
+  res.redirect('/timeline?msg=' + encodeURIComponent('Welcome back, ' + company.name + '!'));
+});
+
+app.post('/logout', (req, res) => {
+  destroySession(req, res);
+  res.redirect('/?msg=' + encodeURIComponent('Signed out.'));
+});
+
+// ============================= FEED CARD RENDERING =============================
+function companyNameMap() {
+  const map = new Map();
+  for (const c of db.prepare('SELECT id, name FROM companies').all()) map.set(c.id, c.name);
+  return map;
+}
+/** Likes + comments for a card target, plus whether the viewer liked it. */
+function cardSocial(targetType, targetId, viewerId) {
+  const likeCount = db.prepare('SELECT COUNT(*) AS n FROM likes WHERE target_type = ? AND target_id = ?').get(targetType, targetId).n;
+  const liked = viewerId
+    ? !!db.prepare('SELECT 1 FROM likes WHERE company_id = ? AND target_type = ? AND target_id = ?').get(viewerId, targetType, targetId)
+    : false;
+  const comments = db.prepare('SELECT * FROM comments WHERE target_type = ? AND target_id = ? ORDER BY created_at ASC LIMIT 50').all(targetType, targetId);
+  return { likeCount, liked, comments };
+}
+function commentListHtml(comments, names) {
+  if (!comments.length) return '';
+  return comments.map(c =>
+    `<div class="comment"><a href="/company/${c.company_id}"><b>${esc(names.get(c.company_id) || 'Unknown')}</b></a>: ${esc(c.body)}
+     <span class="muted"> · ${esc(c.created_at.slice(0, 16).replace('T', ' '))}</span></div>`
+  ).join('');
+}
+/** Render one feed card. kind: 'deal' | 'post' | 'repost'. */
+function feedCard(item, user, names) {
+  const ownerName = names.get(item.company_id) || 'Unknown';
+  const isOwn = user && !user.isAdmin && user.id === item.company_id;
+
+  // For reposts the social target is the ORIGINAL deal; otherwise the item itself.
+  const targetType = item.kind === 'post' ? 'post' : 'deal';
+  const targetId = item.kind === 'repost' ? item.repost_of : item.ref_id;
+  const soc = cardSocial(targetType, targetId, user && !user.isAdmin ? user.id : null);
+
+  let head, bodyHtml;
+  if (item.kind === 'post') {
+    head = `💬 <a href="/company/${item.company_id}"><b>${esc(ownerName)}</b></a> <span class="muted">posted</span>`;
+    bodyHtml = `<p style="margin-top:8px;white-space:pre-wrap">${esc(item.body)}</p>`;
+  } else if (item.kind === 'deal') {
+    head = `📦 <a href="/company/${item.company_id}"><b>${esc(ownerName)}</b></a> <span class="muted">posted a deal</span>`;
+    bodyHtml = `<h3 style="margin-top:8px"><a href="/deal/${item.ref_id}">${esc(item.title)}</a></h3>
+      ${item.value ? `<p class="muted">Deal value: <b style="color:#c4b5fd">${esc(item.value)}</b></p>` : ''}
+      <p style="margin-top:6px;white-space:pre-wrap">${esc(item.body)}</p>`;
+  } else { // repost
+    const origName = names.get(item.orig_company) || 'Unknown';
+    head = `🔁 Reposted from <a href="/company/${item.orig_company}"><b>${esc(origName)}</b></a>
+            by <a href="/company/${item.company_id}"><b>${esc(ownerName)}</b></a>`;
+    bodyHtml = `<h3 style="margin-top:8px"><a href="/deal/${item.repost_of}">${esc(item.title)}</a></h3>
+      ${item.value ? `<p class="muted">Deal value: <b style="color:#c4b5fd">${esc(item.value)}</b></p>` : ''}
+      <p style="margin-top:6px;white-space:pre-wrap">${esc(item.body)}</p>`;
+  }
+
+  const signBtn = (item.kind !== 'post' && user && !user.isAdmin && !isOwn && item.company_id !== user.id)
+    ? `<a class="btn btn-sm btn-green" href="/deal/${targetId}/contract">📝 Sign contract</a>` : '';
+  const repostBtn = (item.kind !== 'post' && user && !user.isAdmin && item.orig_company !== user.id && item.company_id !== user.id)
+    ? `<form method="POST" action="/repost/${targetId}"><button class="btn btn-sm btn-outline" type="submit">🔁 Repost</button></form>` : '';
+  const interact = user && !user.isAdmin ? `
+    <div class="feed-actions">
+      <form method="POST" action="/like/${targetType}/${targetId}">
+        <button class="btn btn-sm ${soc.liked ? '' : 'btn-outline'}" type="submit">${soc.liked ? '💜 Liked' : '🤍 Like'} (${soc.likeCount})</button>
       </form>
-      <form method="POST" action="/deals" style="margin-top:10px;border-top:1px solid #243152;padding-top:14px">
-        <h3>Post a deal</h3>
-        <div class="row" style="align-items:flex-end">
-          <div style="flex:2;min-width:200px"><label>Deal title</label><input name="title" required maxlength="160"></div>
-          <div style="flex:1;min-width:120px"><label>Value (USD)</label><input name="value" type="number" min="1" step="any" required></div>
-        </div>
-        <label>Terms</label><input name="terms" required maxlength="300" placeholder="Delivery, payment, escrow terms...">
-        <button class="btn">Publish deal to all companies</button>
-      </form>
+      ${repostBtn}
+      ${signBtn}
     </div>
-    ${items || '<p class="mut">Nothing here yet — post the first update or deal.</p>'}`));
-});
-app.post('/feed/post', requireApprovedCompany, (req, res) => {
-  const body = String(req.body.body || '').trim();
-  if (body) db.prepare('INSERT INTO posts (company_id, body) VALUES (?,?)').run(req.company.id, body);
-  res.redirect('/feed');
-});
-app.post('/deals', requireApprovedCompany, (req, res) => {
-  const title = String(req.body.title || '').trim();
-  const value = Number(req.body.value);
-  const terms = String(req.body.terms || '').trim();
-  if (!title || !terms || !(value > 0)) { req.session.flash = 'Invalid deal.'; return res.redirect('/feed'); }
-  db.prepare('INSERT INTO deals (company_id,title,value_usd,terms) VALUES (?,?,?,?)').run(req.company.id, title, value, terms);
-  req.session.flash = 'Your deal is now live in every company\'s timeline.';
-  res.redirect('/feed');
-});
-app.post('/feed/like/:kind/:id', requireApprovedCompany, (req, res) => {
-  const id = Number(req.params.id);
-  const col = req.params.kind === 'deal' ? 'deal_id' : 'post_id';
-  const other = col === 'deal_id' ? 'post_id' : 'deal_id';
-  const existing = db.prepare(`SELECT id FROM likes WHERE company_id=? AND ${col}=?`).get(req.company.id, id);
-  if (existing) db.prepare('DELETE FROM likes WHERE id=?').run(existing.id);
-  else db.prepare(`INSERT INTO likes (company_id,${col}) VALUES (?,?)`).run(req.company.id, id);
-  res.redirect('/feed');
-});
-app.post('/feed/repost/:id', requireApprovedCompany, (req, res) => {
-  const id = Number(req.params.id);
-  const existing = db.prepare('SELECT 1 x FROM reposts WHERE deal_id=? AND company_id=?').get(id, req.company.id);
-  if (existing) db.prepare('DELETE FROM reposts WHERE deal_id=? AND company_id=?').run(id, req.company.id);
-  else db.prepare('INSERT INTO reposts (deal_id,company_id) VALUES (?,?)').run(id, req.company.id);
-  res.redirect('/feed');
-});
-app.post('/feed/comment/:kind/:id', requireApprovedCompany, (req, res) => {
-  const body = String(req.body.body || '').trim();
-  const id = Number(req.params.id);
-  if (body) {
-    if (req.params.kind === 'deal') db.prepare('INSERT INTO comments (company_id,deal_id,body) VALUES (?,?,?)').run(req.company.id, id, body);
-    else db.prepare('INSERT INTO comments (company_id,post_id,body) VALUES (?,?,?)').run(req.company.id, id, body);
-  }
-  res.redirect('/feed');
-});
+    <div style="margin-top:12px">
+      ${commentListHtml(soc.comments, names)}
+      <form method="POST" action="/comment/${targetType}/${targetId}" style="margin-top:8px;display:flex;gap:8px">
+        <input type="text" name="body" placeholder="Write a comment…" required maxlength="500" style="margin-bottom:0">
+        <button class="btn btn-sm" type="submit">Comment</button>
+      </form>
+    </div>` : `<p class="muted" style="margin-top:10px">${soc.likeCount} likes · ${soc.comments.length} comments</p>`;
 
-/* ---------- COMPANIES + FOLLOW (instagram-style) + SEARCH ---------- */
-function companyCard(c, S) {
-  const foll = S.followerCounts[c.id] || 0;
-  const isFollowing = S.following.has(c.id);
-  return `<div class="card" style="display:flex;gap:14px;align-items:center;padding:16px">
-    <div class="logo" style="width:46px;height:46px;font-size:18px">${esc(c.name.charAt(0).toUpperCase())}</div>
-    <div style="flex:1"><b style="color:#fff">${esc(c.name)}</b><br><span class="mut" style="font-size:12.5px">${esc(c.industry)} · ${esc(c.country)} · <span class="num">${foll}</span> followers</span></div>
-    <form method="POST" action="/follow/${c.id}"><button class="btn sm ${isFollowing ? 'ghost' : ''}">${isFollowing ? '✓ Following' : '+ Follow'}</button></form>
+  return `<div class="card">
+    <div class="feed-head"><div>${head}</div>
+    <span class="muted">${esc(item.created_at.slice(0, 16).replace('T', ' '))}</span></div>
+    ${bodyHtml}
+    ${interact}
   </div>`;
 }
-app.get('/companies', requireApprovedCompany, (req, res) => {
-  const q = String(req.query.q || '').trim();
-  const S = socialSets(req.company.id);
-  S.followerCounts = countsBy('SELECT following_id AS k, COUNT(*) n FROM follows GROUP BY following_id');
-  let rows = db.prepare("SELECT * FROM companies WHERE status='approved' AND id != ? ORDER BY name").all(req.company.id);
-  if (q) rows = rows.filter(c => (c.name + ' ' + c.industry + ' ' + c.country).toLowerCase().includes(q.toLowerCase()));
-  const myFollowers = db.prepare('SELECT COUNT(*) n FROM follows WHERE following_id=?').get(req.company.id).n;
-  const myFollowing = S.following.size;
-  res.send(layout('Companies', navFor(req.session) + `
-    <div class="card"><h2>Companies</h2><p class="mut">Follow companies to grow your network — you have <b class="num">${myFollowers}</b> followers and follow <b class="num">${myFollowing}</b>.</p>
-      <form method="GET" action="/companies" class="cform"><input name="q" value="${esc(q)}" placeholder="Search companies by name, industry, country..."><button class="btn sm">Search</button></form>
-    </div>
-    ${rows.map(c => companyCard(c, S)).join('') || '<p class="mut">No companies found.</p>'}`));
-});
-app.post('/follow/:id', requireApprovedCompany, (req, res) => {
-  const id = Number(req.params.id);
-  if (id === req.company.id) return res.redirect('/companies');
-  const existing = db.prepare('SELECT 1 x FROM follows WHERE follower_id=? AND following_id=?').get(req.company.id, id);
-  if (existing) db.prepare('DELETE FROM follows WHERE follower_id=? AND following_id=?').run(req.company.id, id);
-  else db.prepare('INSERT INTO follows (follower_id,following_id) VALUES (?,?)').run(req.company.id, id);
-  res.redirect(req.get('referer') || '/companies');
-});
-app.get('/search', requireApprovedCompany, (req, res) => {
-  const q = String(req.query.q || '').trim();
-  const S = socialSets(req.company.id);
-  S.followerCounts = countsBy('SELECT following_id AS k, COUNT(*) n FROM follows GROUP BY following_id');
-  S.likeCounts = countsBy(`SELECT COALESCE('p'||post_id, 'd'||deal_id) AS k, COUNT(*) n FROM likes GROUP BY 1`);
-  S.repostCounts = countsBy('SELECT deal_id AS k, COUNT(*) n FROM reposts GROUP BY deal_id');
-  S.comments = commentsGrouped();
-  let dealRows = [], coRows = [];
-  if (q) {
-    const like = '%' + q + '%';
-    dealRows = db.prepare(`SELECT d.*, c.name AS company, c.industry FROM deals d JOIN companies c ON c.id=d.company_id WHERE d.title LIKE ? OR d.terms LIKE ? ORDER BY d.id DESC LIMIT 30`).all(like, like);
-    coRows = db.prepare("SELECT * FROM companies WHERE status='approved' AND id != ? AND (name LIKE ? OR industry LIKE ? OR country LIKE ?) ORDER BY name LIMIT 30").all(req.company.id, like, like, like);
-  }
-  res.send(layout('Search', navFor(req.session) + `
-    <div class="card"><h2>Search</h2><p class="mut">Find deals and companies across the whole network.</p>
-      <form method="GET" action="/search" class="cform"><input name="q" value="${esc(q)}" placeholder="e.g. logistics, pharma, Dubai..."><button class="btn sm">Search</button></form>
-    </div>
-    ${q ? `<h2 style="margin:6px 0 10px">Deals matching "${esc(q)}"</h2>` + (dealRows.map(d => dealCardHtml(d, req.company.id, S)).join('') || '<p class="mut">No deals found.</p>')
-      + `<h2 style="margin:20px 0 10px">Companies matching "${esc(q)}"</h2>` + (coRows.map(c => companyCard(c, S)).join('') || '<p class="mut">No companies found.</p>')
-    : ''}`));
+
+// ============================= COMPANY ROUTES (timeline, posts, deals) =============================
+app.get('/timeline', requireCompany, (req, res) => {
+  const names = companyNameMap();
+  const feed = db.prepare(`
+    SELECT * FROM (
+      SELECT 'deal' AS kind, d.id AS ref_id, d.company_id, d.title, d.description AS body,
+             d.value, d.created_at, NULL AS repost_of, NULL AS orig_company
+      FROM deals d
+      UNION ALL
+      SELECT 'post', p.id, p.company_id, NULL, p.body, NULL, p.created_at, NULL, NULL
+      FROM posts p
+      UNION ALL
+      SELECT 'repost', r.id, r.company_id, d.title, d.description, d.value, r.created_at, d.id, d.company_id
+      FROM reposts r JOIN deals d ON d.id = r.deal_id
+    ) ORDER BY created_at DESC LIMIT 100`).all();
+
+  const body = `
+  <div class="card">
+    <h2>Your timeline</h2>
+    <form method="POST" action="/posts">
+      <textarea name="body" rows="3" maxlength="2000" placeholder="Share an update with the network…" required style="margin-bottom:8px"></textarea>
+      <button class="btn btn-sm" type="submit">Post update</button>
+      <a class="btn btn-sm btn-outline" href="/deals/new" style="margin-left:8px">📦 Post a deal</a>
+    </form>
+  </div>
+  ${feed.length ? feed.map(i => feedCard(i, req.user, names)).join('') : '<div class="card"><p class="muted">No activity yet — be the first to post a deal!</p></div>'}`;
+  res.send(page('Timeline', body, req.user, req.query.msg, req.query.err));
 });
 
-/* ---------- CONTRACT: terms page → download → sign → closed room ---------- */
-app.get('/deal/:id', requireApprovedCompany, (req, res) => {
-  const d = db.prepare(`SELECT d.*, c.name AS company, c.industry, c.country FROM deals d JOIN companies c ON c.id=d.company_id WHERE d.id=?`).get(req.params.id);
-  if (!d) return res.redirect('/feed');
-  const contract = db.prepare('SELECT * FROM contracts WHERE deal_id=?').get(d.id);
-  const mine = d.company_id === req.company.id;
-  let action = '';
-  if (!mine && !contract) {
-    action = `<form method="POST" action="/deal/${d.id}/sign"><button class="btn" style="width:100%;padding:14px;font-size:16px">Proceed with signing</button></form>
-      <p class="mut" style="text-align:center;margin-top:8px">This opens a private negotiation room with ${esc(d.company)} and sends the contract to the platform owner for approval.</p>`;
-  } else if (contract) {
-    action = `<div class="row" style="justify-content:center">${pill(contract.status)} <a class="btn" href="/deal/${d.id}/room">Open negotiation room</a></div>`;
-  } else {
-    action = `<p class="mut" style="text-align:center">This is your deal. Contracts signed by others appear here for tracking.</p>`;
-  }
-  res.send(layout('Contract terms', navFor(req.session) + `
-    <div class="card">
-      <div class="row" style="justify-content:space-between;margin-bottom:14px">
-        <a class="btn sm ghost" href="/feed">← Timeline</a>
-        <a class="btn sm ghost" href="/deal/${d.id}/download">⬇ Download contract (.doc)</a>
-      </div>
-      <div class="doc">
-        <h1>DEAL CONTRACT</h1>
-        <div class="sub">Dealzoin Platform · Contract Ref DZ-${String(d.id).padStart(4, '0')} · Generated ${d.created_at}</div>
-        <h4>1. Parties</h4>
-        <p><b>Party A (Deal owner):</b> ${esc(d.company)}, ${esc(d.country)} — ${esc(d.industry)}</p>
-        <p><b>Party B (Signatory):</b> ${esc(req.company.name)} (you)</p>
-        <h4>2. Subject</h4>
-        <p>${esc(d.title)}</p>
-        <h4>3. Contract Value</h4>
-        <p>${usd(d.value_usd)} (USD)</p>
-        <h4>4. Terms &amp; Conditions</h4>
-        <p>${esc(d.terms)}</p>
-        <h4>5. Platform Terms</h4>
-        <p>5.1 This contract is executed on the Dealzoin platform and becomes binding upon platform owner approval.</p>
-        <p>5.2 Both parties confirm they are verified companies with signing authority.</p>
-        <p>5.3 Payments are to be arranged through platform-approved escrow. The platform fee is deducted from the contract value upon completion as per the platform owner's current rate.</p>
-        <p>5.4 The negotiation room (post-signing) is private to both parties; the platform administrator may view it for dispute resolution.</p>
-        <p>5.5 Governing law: the jurisdiction of Party A's registered address, unless otherwise agreed in the negotiation room.</p>
-      </div>
-      <div style="margin-top:18px">${action}</div>
-    </div>`));
+app.post('/posts', requireCompany, (req, res) => {
+  const txt = String(req.body.body || '').trim();
+  if (!txt) return res.redirect('/timeline?err=' + encodeURIComponent('Post cannot be empty.'));
+  db.prepare('INSERT INTO posts (company_id, body, created_at) VALUES (?,?,?)').run(req.user.id, txt.slice(0, 2000), now());
+  res.redirect('/timeline?msg=' + encodeURIComponent('Posted!'));
 });
-app.get('/deal/:id/download', requireApprovedCompany, (req, res) => {
-  const d = db.prepare(`SELECT d.*, c.name AS company, c.industry, c.country FROM deals d JOIN companies c ON c.id=d.company_id WHERE d.id=?`).get(req.params.id);
-  if (!d) return res.redirect('/feed');
-  const html = `<html xmlns:w="urn:schemas-microsoft-com:office:word"><head><meta charset="utf-8"><title>Dealzoin Contract DZ-${d.id}</title>
-<style>body{font-family:Georgia,serif;font-size:12pt;line-height:1.5}h1{text-align:center;font-size:18pt}h4{margin-bottom:4px}</style></head><body>
-<h1>DEAL CONTRACT</h1><p style="text-align:center">Dealzoin Platform · Ref DZ-${String(d.id).padStart(4, '0')} · ${d.created_at}</p>
-<h4>1. Parties</h4><p>Party A (Deal owner): ${d.company}, ${d.country}</p><p>Party B (Signatory): to be completed upon signing</p>
-<h4>2. Subject</h4><p>${d.title}</p><h4>3. Contract Value</h4><p>${usd(d.value_usd)} (USD)</p>
-<h4>4. Terms &amp; Conditions</h4><p>${d.terms}</p>
-<h4>5. Platform Terms</h4><p>5.1 Binding upon platform owner approval. 5.2 Verified companies only. 5.3 Platform-approved escrow; platform fee deducted on completion. 5.4 Private negotiation room; administrator may view for dispute resolution.</p>
+
+app.get('/deals/new', requireCompany, (req, res) => {
+  const body = `
+  <div class="card" style="max-width:560px;margin:0 auto">
+    <h2>📦 Post a new deal</h2>
+    <p class="muted" style="margin-bottom:12px">Deals go live on every company's timeline immediately.</p>
+    <form method="POST" action="/deals">
+      <label>Deal title</label><input type="text" name="title" required maxlength="160">
+      <label>Deal value (e.g. $50,000 / year)</label><input type="text" name="value" maxlength="80">
+      <label>Description</label><textarea name="description" rows="6" required maxlength="4000"></textarea>
+      <button class="btn" type="submit">Publish deal</button>
+    </form>
+  </div>`;
+  res.send(page('New deal', body, req.user, req.query.msg, req.query.err));
+});
+
+app.post('/deals', requireCompany, (req, res) => {
+  const title = String(req.body.title || '').trim();
+  const desc = String(req.body.description || '').trim();
+  const value = String(req.body.value || '').trim().slice(0, 80);
+  if (!title || !desc) return res.redirect('/deals/new?err=' + encodeURIComponent('Title and description are required.'));
+  db.prepare('INSERT INTO deals (company_id, title, description, value, created_at) VALUES (?,?,?,?,?)')
+    .run(req.user.id, title.slice(0, 160), desc.slice(0, 4000), value, now());
+  res.redirect('/timeline?msg=' + encodeURIComponent('Deal published to all timelines!'));
+});
+
+// ============================= SOCIAL ROUTES (likes, comments, reposts, follows) =============================
+app.post('/like/:type/:id', requireCompany, (req, res) => {
+  const type = req.params.type === 'post' ? 'post' : 'deal';
+  const id = parseInt(req.params.id, 10);
+  const table = type === 'post' ? 'posts' : 'deals';
+  if (!db.prepare(`SELECT id FROM ${table} WHERE id = ?`).get(id)) {
+    return res.redirect('/timeline?err=' + encodeURIComponent('Item not found.'));
+  }
+  const existing = db.prepare('SELECT id FROM likes WHERE company_id = ? AND target_type = ? AND target_id = ?').get(req.user.id, type, id);
+  if (existing) {
+    db.prepare('DELETE FROM likes WHERE id = ?').run(existing.id); // toggle off
+  } else {
+    db.prepare('INSERT INTO likes (company_id, target_type, target_id, created_at) VALUES (?,?,?,?)').run(req.user.id, type, id, now());
+  }
+  res.redirect(req.get('referer') || '/timeline');
+});
+
+app.post('/comment/:type/:id', requireCompany, (req, res) => {
+  const type = req.params.type === 'post' ? 'post' : 'deal';
+  const id = parseInt(req.params.id, 10);
+  const txt = String(req.body.body || '').trim();
+  const table = type === 'post' ? 'posts' : 'deals';
+  if (!db.prepare(`SELECT id FROM ${table} WHERE id = ?`).get(id)) {
+    return res.redirect('/timeline?err=' + encodeURIComponent('Item not found.'));
+  }
+  if (!txt) return res.redirect('/timeline?err=' + encodeURIComponent('Comment cannot be empty.'));
+  db.prepare('INSERT INTO comments (company_id, target_type, target_id, body, created_at) VALUES (?,?,?,?,?)')
+    .run(req.user.id, type, id, txt.slice(0, 500), now());
+  res.redirect(req.get('referer') || '/timeline');
+});
+
+app.post('/repost/:dealId', requireCompany, (req, res) => {
+  const dealId = parseInt(req.params.dealId, 10);
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(dealId);
+  if (!deal) return res.redirect('/timeline?err=' + encodeURIComponent('Deal not found.'));
+  if (deal.company_id === req.user.id) return res.redirect('/timeline?err=' + encodeURIComponent('You cannot repost your own deal.'));
+  db.prepare('INSERT INTO reposts (company_id, deal_id, created_at) VALUES (?,?,?)').run(req.user.id, dealId, now());
+  res.redirect('/timeline?msg=' + encodeURIComponent('Reposted to your feed!'));
+});
+
+app.post('/follow/:id', requireCompany, (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (id === req.user.id) return res.redirect('/company/' + id + '?err=' + encodeURIComponent('You cannot follow your own company.'));
+  if (!db.prepare(`SELECT id FROM companies WHERE id = ? AND status = 'approved'`).get(id)) {
+    return res.redirect('/timeline?err=' + encodeURIComponent('Company not found.'));
+  }
+  db.prepare('INSERT OR IGNORE INTO follows (follower_id, followed_id, created_at) VALUES (?,?,?)').run(req.user.id, id, now());
+  res.redirect(req.get('referer') || '/company/' + id);
+});
+
+app.post('/unfollow/:id', requireCompany, (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  db.prepare('DELETE FROM follows WHERE follower_id = ? AND followed_id = ?').run(req.user.id, id);
+  res.redirect(req.get('referer') || '/company/' + id);
+});
+
+// ============================= SEARCH & COMPANY PROFILES =============================
+function followButton(viewer, companyId) {
+  if (!viewer || viewer.isAdmin || viewer.id === companyId) return '';
+  const following = db.prepare('SELECT 1 FROM follows WHERE follower_id = ? AND followed_id = ?').get(viewer.id, companyId);
+  return following
+    ? `<form method="POST" action="/unfollow/${companyId}" style="display:inline"><button class="btn btn-sm btn-outline" type="submit">Following ✓</button></form>`
+    : `<form method="POST" action="/follow/${companyId}" style="display:inline"><button class="btn btn-sm" type="submit">+ Follow</button></form>`;
+}
+function followCounts(companyId) {
+  const followers = db.prepare('SELECT COUNT(*) AS n FROM follows WHERE followed_id = ?').get(companyId).n;
+  const following = db.prepare('SELECT COUNT(*) AS n FROM follows WHERE follower_id = ?').get(companyId).n;
+  return { followers, following };
+}
+
+app.get('/search', requireCompany, (req, res) => {
+  const q = String(req.query.q || '').trim();
+  let dealsHtml = '', companiesHtml = '';
+  if (q) {
+    const like = '%' + q.replace(/[%_]/g, '') + '%';
+    const deals = db.prepare(`SELECT * FROM deals WHERE title LIKE ? OR description LIKE ? ORDER BY created_at DESC LIMIT 30`).all(like, like);
+    const companies = db.prepare(`SELECT * FROM companies WHERE status = 'approved' AND (name LIKE ? OR description LIKE ?) ORDER BY name LIMIT 30`).all(like, like);
+    const names = companyNameMap();
+    dealsHtml = deals.length
+      ? deals.map(d => feedCard({ kind: 'deal', ref_id: d.id, company_id: d.company_id, title: d.title, body: d.description, value: d.value, created_at: d.created_at }, req.user, names)).join('')
+      : '<p class="muted">No deals match your search.</p>';
+    companiesHtml = companies.length
+      ? companies.map(c => {
+          const fc = followCounts(c.id);
+          return `<div class="card">
+            <div class="feed-head"><h3><a href="/company/${c.id}">🏢 ${esc(c.name)}</a></h3>${followButton(req.user, c.id)}</div>
+            <p class="muted">${fc.followers} followers · ${fc.following} following</p>
+            <p style="margin-top:6px">${esc(c.description || '')}</p>
+          </div>`;
+        }).join('')
+      : '<p class="muted">No companies match your search.</p>';
+  }
+  const body = `
+  <div class="card">
+    <h2>🔍 Search Dealzoin</h2>
+    <form method="GET" action="/search" style="display:flex;gap:8px;margin-top:10px">
+      <input type="text" name="q" value="${esc(q)}" placeholder="Search deals and companies…" style="margin-bottom:0">
+      <button class="btn" type="submit">Search</button>
+    </form>
+  </div>
+  ${q ? `<h2 style="margin:10px 0;color:#c4b5fd">Deals matching “${esc(q)}”</h2>${dealsHtml}
+         <h2 style="margin:18px 0 10px;color:#c4b5fd">Companies matching “${esc(q)}”</h2>${companiesHtml}` : ''}`;
+  res.send(page('Search', body, req.user, req.query.msg, req.query.err));
+});
+
+app.get('/company/:id', requireCompany, (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const c = db.prepare('SELECT * FROM companies WHERE id = ?').get(id);
+  if (!c || c.status !== 'approved') {
+    return res.redirect('/timeline?err=' + encodeURIComponent('Company not found.'));
+  }
+  const fc = followCounts(id);
+  const deals = db.prepare('SELECT * FROM deals WHERE company_id = ? ORDER BY created_at DESC LIMIT 50').all(id);
+  const names = companyNameMap();
+  const dealsHtml = deals.length
+    ? deals.map(d => feedCard({ kind: 'deal', ref_id: d.id, company_id: d.company_id, title: d.title, body: d.description, value: d.value, created_at: d.created_at }, req.user, names)).join('')
+    : '<div class="card"><p class="muted">No deals yet.</p></div>';
+
+  const body = `
+  <div class="card">
+    <div class="feed-head"><h2>🏢 ${esc(c.name)}</h2>${followButton(req.user, c.id)}</div>
+    <p class="muted">${fc.followers} followers · ${fc.following} following · member since ${esc(c.created_at.slice(0, 10))}</p>
+    ${c.website ? `<p style="margin-top:8px">🌐 <a href="${esc(c.website)}" rel="noopener noreferrer nofollow">${esc(c.website)}</a></p>` : ''}
+    <p style="margin-top:10px;white-space:pre-wrap">${esc(c.description || '')}</p>
+  </div>
+  <h2 style="margin:14px 0 10px;color:#c4b5fd">Deals by ${esc(c.name)}</h2>
+  ${dealsHtml}`;
+  res.send(page(c.name, body, req.user, req.query.msg, req.query.err));
+});
+
+// ============================= CONTRACT ROUTES =============================
+/** Standard B2B terms clauses shown on every contract. */
+const CONTRACT_CLAUSES = [
+  '1. PARTIES. This agreement is entered into between the deal-owning company ("Provider") and the signing company ("Counterparty"), both registered members of the Dealzoin B2B network.',
+  '2. SCOPE. The Provider agrees to deliver the products/services described in the deal terms, and the Counterparty agrees to the stated deal value and conditions.',
+  '3. PAYMENT. Payment terms are net-30 from invoice date unless otherwise agreed in writing between the parties.',
+  '4. CONFIDENTIALITY. Both parties agree to keep all non-public business information exchanged under this agreement strictly confidential for a period of three (3) years.',
+  '5. WARRANTIES. Each party warrants that it is duly organized, validly existing, and that the individual executing this agreement is an authorized signatory.',
+  '6. LIABILITY. Neither party shall be liable for indirect, incidental, or consequential damages arising from this agreement.',
+  '7. TERMINATION. Either party may terminate this agreement with thirty (30) days written notice, subject to settlement of outstanding obligations.',
+  '8. GOVERNING LAW. This agreement shall be governed by the laws of the jurisdiction in which the Provider is registered.',
+  '9. ENTIRE AGREEMENT. This document constitutes the entire agreement between the parties and supersedes all prior discussions.'
+];
+
+function getDealOr404(req, res) {
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!deal) {
+    res.status(404).send(page('Not found', '<div class="card"><h2>Deal not found</h2></div>', currentUser(req)));
+    return null;
+  }
+  return deal;
+}
+/** Latest contract for a deal (any signer). */
+function latestContract(dealId) {
+  return db.prepare('SELECT * FROM contracts WHERE deal_id = ? ORDER BY id DESC LIMIT 1').get(dealId);
+}
+
+// ----- Deal detail page: shows deal + contract status (visible to both parties) -----
+app.get('/deal/:id', requireCompany, (req, res) => {
+  const deal = getDealOr404(req, res);
+  if (!deal) return;
+  const owner = db.prepare('SELECT id, name FROM companies WHERE id = ?').get(deal.company_id);
+  const contract = latestContract(deal.id);
+  const names = companyNameMap();
+
+  let contractHtml = '';
+  if (contract && (req.user.id === contract.owner_company_id || req.user.id === contract.signer_company_id)) {
+    const signerName = names.get(contract.signer_company_id) || 'Unknown';
+    contractHtml = `<div class="card" style="border-color:#7c3aed">
+      <h3>📝 Contract status: ${statusBadge(contract.status)}</h3>
+      <p class="muted">Signed by <b>${esc(signerName)}</b> at ${esc(contract.signed_at.slice(0, 16).replace('T', ' '))} UTC
+      ${contract.decided_at ? ' · decided ' + esc(contract.decided_at.slice(0, 16).replace('T', ' ')) + ' UTC' : ''}</p>
+    </div>`;
+  }
+
+  const signBtn = req.user.id !== deal.company_id
+    ? `<a class="btn btn-green" href="/deal/${deal.id}/contract">📝 View contract &amp; sign</a>` : '';
+  const body = `
+  <div class="card">
+    <div class="feed-head"><h2>📦 ${esc(deal.title)}</h2>
+      <span class="muted">${esc(deal.created_at.slice(0, 16).replace('T', ' '))}</span></div>
+    <p class="muted">by <a href="/company/${deal.company_id}"><b>${esc(owner ? owner.name : 'Unknown')}</b></a>
+      ${deal.value ? ' · Deal value: <b style="color:#c4b5fd">' + esc(deal.value) + '</b>' : ''}</p>
+    <p style="margin-top:12px;white-space:pre-wrap">${esc(deal.description)}</p>
+    <div class="feed-actions">${signBtn}</div>
+  </div>
+  ${contractHtml}`;
+  res.send(page(deal.title, body, req.user, req.query.msg, req.query.err));
+});
+
+// ----- Contract terms page -----
+app.get('/deal/:id/contract', requireCompany, (req, res) => {
+  const deal = getDealOr404(req, res);
+  if (!deal) return;
+  const owner = db.prepare('SELECT id, name FROM companies WHERE id = ?').get(deal.company_id);
+  const me = db.prepare('SELECT id, name FROM companies WHERE id = ?').get(req.user.id);
+  const isOwn = deal.company_id === req.user.id;
+  const contract = latestContract(deal.id);
+
+  const clauses = CONTRACT_CLAUSES.map(c => `<p style="margin-bottom:10px">${esc(c)}</p>`).join('');
+  const existing = contract && (contract.status === 'pending' || contract.status === 'approved')
+    ? `<p class="muted" style="margin-top:10px">A contract for this deal is currently <b>${esc(contract.status)}</b>.</p>` : '';
+
+  const actions = isOwn
+    ? `<p class="muted" style="margin-top:16px">This is your own deal — you cannot sign a contract with yourself.</p>`
+    : `<div class="feed-actions" style="margin-top:18px">
+         <a class="btn" href="/deal/${deal.id}/contract/download">⬇️ Download contract as document</a>
+         <a class="btn btn-green" href="/deal/${deal.id}/sign">Proceed with signing →</a>
+       </div>`;
+
+  const body = `
+  <div class="card">
+    <h2>📝 B2B Contract — ${esc(deal.title)}</h2>
+    <p class="muted">Generated ${esc(now().slice(0, 10))} · Deal #${deal.id}</p>
+    <hr style="border-color:#3b1d63;margin:14px 0">
+    <p><b>Provider:</b> ${esc(owner ? owner.name : 'Unknown')}</p>
+    <p><b>Counterparty:</b> ${esc(me.name)}</p>
+    ${deal.value ? `<p><b>Deal value:</b> ${esc(deal.value)}</p>` : ''}
+    <h3 style="margin:14px 0 6px">Deal terms</h3>
+    <p style="white-space:pre-wrap">${esc(deal.description)}</p>
+    <h3 style="margin:14px 0 6px">Standard B2B terms</h3>
+    <div class="muted" style="font-size:13px">${clauses}</div>
+    ${existing}
+    ${actions}
+  </div>`;
+  res.send(page('Contract — ' + deal.title, body, req.user, req.query.msg, req.query.err));
+});
+
+// ----- Download contract as a Word-compatible document -----
+app.get('/deal/:id/contract/download', requireCompany, (req, res) => {
+  const deal = getDealOr404(req, res);
+  if (!deal) return;
+  const owner = db.prepare('SELECT id, name FROM companies WHERE id = ?').get(deal.company_id);
+  const me = db.prepare('SELECT id, name FROM companies WHERE id = ?').get(req.user.id);
+  const clauses = CONTRACT_CLAUSES.map(c => `<p>${esc(c)}</p>`).join('');
+  const doc = `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word">
+<head><meta charset="utf-8"><title>Contract #${deal.id}</title></head>
+<body style="font-family:Calibri,Arial,sans-serif">
+  <h1>B2B Contract — Deal #${deal.id}</h1>
+  <h2>${esc(deal.title)}</h2>
+  <p><b>Provider:</b> ${esc(owner ? owner.name : 'Unknown')}<br>
+     <b>Counterparty:</b> ${esc(me.name)}<br>
+     ${deal.value ? `<b>Deal value:</b> ${esc(deal.value)}<br>` : ''}
+     <b>Generated:</b> ${esc(now())}</p>
+  <h3>Deal terms</h3><p>${esc(deal.description)}</p>
+  <h3>Standard B2B terms</h3>${clauses}
+  <p>__________________________&nbsp;&nbsp;&nbsp;__________________________<br>
+  Provider signature&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Counterparty signature</p>
 </body></html>`;
   res.setHeader('Content-Type', 'application/msword');
-  res.setHeader('Content-Disposition', `attachment; filename="Dealzoin-Contract-DZ-${String(d.id).padStart(4, '0')}.doc"`);
-  res.send(html);
-});
-app.post('/deal/:id/sign', requireApprovedCompany, (req, res) => {
-  const d = db.prepare('SELECT * FROM deals WHERE id=?').get(req.params.id);
-  if (!d) return res.redirect('/feed');
-  if (d.company_id === req.company.id) { req.session.flash = 'You cannot sign your own deal.'; return res.redirect('/deal/' + d.id); }
-  const existing = db.prepare('SELECT * FROM contracts WHERE deal_id=?').get(d.id);
-  if (existing) return res.redirect('/deal/' + d.id + '/room');
-  db.prepare('INSERT INTO contracts (deal_id,requester_id) VALUES (?,?)').run(d.id, req.company.id);
-  db.prepare('INSERT INTO messages (deal_id,sender_company_id,body) VALUES (?,?,?)')
-    .run(d.id, req.company.id, 'Contract request submitted. This room is private between both parties; the platform administrator can view it. Awaiting owner approval of the contract.');
-  req.session.flash = 'Contract sent to the platform owner for approval. You can now negotiate in the closed room.';
-  res.redirect('/deal/' + d.id + '/room');
-});
-function roomAccess(req, deal, contract) {
-  if (req.session.adminId) return true;
-  const cid = req.session.companyId;
-  return deal.company_id === cid || (contract && contract.requester_id === cid);
-}
-app.get('/deal/:id/room', (req, res) => {
-  const d = db.prepare(`SELECT d.*, c.name AS company FROM deals d JOIN companies c ON c.id=d.company_id WHERE d.id=?`).get(req.params.id);
-  if (!d) return res.redirect('/');
-  const contract = db.prepare('SELECT * FROM contracts WHERE deal_id=?').get(d.id);
-  if (!roomAccess(req, d, contract)) return res.redirect('/signin');
-  const requester = contract ? db.prepare('SELECT name FROM companies WHERE id=?').get(contract.requester_id) : null;
-  const msgs = db.prepare(`SELECT m.*, c.name AS company FROM messages m LEFT JOIN companies c ON c.id=m.sender_company_id WHERE m.deal_id=? ORDER BY m.id`).all(d.id);
-  const canPost = req.session.adminId || (contract && (contract.status !== 'rejected'));
-  const isAdmin = !!req.session.adminId;
-  const msgHtml = msgs.map(m => {
-    const who = m.sender_admin ? 'Administrator' : m.company;
-    const mine = !isAdmin && m.sender_company_id === req.session.companyId;
-    return `<div class="msg ${mine ? 'me' : ''}"><div class="who">${esc(who)} · ${m.created_at}</div>${esc(m.body)}</div>`;
-  }).join('');
-  res.send(layout('Negotiation room', navFor(req.session) + flashBox(req) + `
-    <div class="card">
-      <div class="row" style="justify-content:space-between">
-        <div><a class="btn sm ghost" href="/deal/${d.id}">← Contract terms</a></div>
-        ${contract ? pill(contract.status) : '<span class="pill pend">no contract</span>'}
-      </div>
-      <h2 style="margin-top:10px">Closed room — ${esc(d.title)}</h2>
-      <p class="mut">Participants: <b style="color:#cbd5e1">${esc(d.company)}</b> (deal owner) &amp; <b style="color:#cbd5e1">${requester ? esc(requester.name) : '—'}</b> (signatory). ${isAdmin ? 'You are viewing as administrator.' : 'Only the platform administrator can also view this room.'}</p>
-      <div style="border-top:1px solid #243152;padding-top:14px;margin-top:10px">
-        ${msgHtml || '<p class="mut">No messages yet.</p>'}
-      </div>
-      ${canPost && !isAdmin ? `<form class="cform" method="POST" action="/deal/${d.id}/room/message">
-        <input name="body" placeholder="Write a message..." maxlength="500" required>
-        <button class="btn sm">Send</button></form>` : ''}
-      ${isAdmin ? `<p class="mut" style="margin-top:10px;font-size:12px">Administrator view — read access. Approve or reject the contract from the owner dashboard.</p>` : ''}
-    </div>`));
-});
-app.post('/deal/:id/room/message', requireApprovedCompany, (req, res) => {
-  const d = db.prepare('SELECT * FROM deals WHERE id=?').get(req.params.id);
-  const contract = d && db.prepare('SELECT * FROM contracts WHERE deal_id=?').get(d.id);
-  if (!d || !roomAccess(req, d, contract)) return res.redirect('/signin');
-  const body = String(req.body.body || '').trim();
-  if (body) db.prepare('INSERT INTO messages (deal_id,sender_company_id,body) VALUES (?,?,?)').run(d.id, req.company.id, body);
-  res.redirect('/deal/' + d.id + '/room');
+  res.setHeader('Content-Disposition', `attachment; filename="contract-${deal.id}.doc"`);
+  res.send(doc);
 });
 
-/* ---------- MY DEALS ---------- */
-app.get('/dashboard', requireApprovedCompany, (req, res) => {
-  const deals = db.prepare(`SELECT d.*,
-      (SELECT COUNT(*) FROM contracts ct WHERE ct.deal_id=d.id) AS contracts,
-      (SELECT COUNT(*) FROM likes l WHERE l.deal_id=d.id) AS likes,
-      (SELECT COUNT(*) FROM reposts r WHERE r.deal_id=d.id) AS reposts
-    FROM deals d WHERE d.company_id=? ORDER BY d.id DESC`).all(req.company.id);
-  res.send(layout('My deals', navFor(req.session) + flashBox(req) + `
-    <div class="card"><h2>My deals</h2><p class="mut">Published instantly to all companies. Track signings below.</p>
-    ${deals.length ? `<table><tr><th>Title</th><th>Value</th><th>Likes</th><th>Reposts</th><th>Contract requests</th><th></th></tr>
-      ${deals.map(d => `<tr><td>${esc(d.title)}</td><td class="num">${usd(d.value_usd)}</td><td>${d.likes}</td><td>${d.reposts}</td><td>${d.contracts}</td>
-      <td><a class="btn sm ghost" href="/deal/${d.id}">View</a></td></tr>`).join('')}</table>`
-    : '<p class="mut">No deals yet — publish one from the Timeline.</p>'}</div>`));
-});
-
-/* ---------- CHANGE PASSWORD ---------- */
-function changePasswordPage(req, action) {
-  return layout('Change password', navFor(req.session) + flashBox(req) + `
-    <div class="center" style="margin-top:0;max-width:480px"><div class="card">
-      <h2>Change password</h2><p class="mut">Minimum 8 characters.</p>
-      <form method="POST" action="${action}">
-        <label>Current password</label><input name="current" type="password" required>
-        <label>New password</label><input name="next" type="password" minlength="8" required>
-        <label>Confirm new password</label><input name="confirm" type="password" minlength="8" required>
-        <button class="btn" style="width:100%">Update password</button>
-      </form></div></div>`);
+// ----- PRIVATE signing room: signer-to-be (non-owner), owner, and admin only -----
+function canViewSigningRoom(req, deal, contract) {
+  const user = currentUser(req);
+  if (!user) return false;
+  if (user.isAdmin) return true;
+  if (user.id === deal.company_id) return true;                    // deal owner
+  if (contract) return user.id === contract.signer_company_id;     // after signing: signer only
+  return true;                                                     // before signing: any approved non-owner company may enter to sign
 }
-function doChange(req, table, idCol, sessionKey, redirectTo) {
-  const row = db.prepare(`SELECT * FROM ${table} WHERE ${idCol}=?`).get(req.session[sessionKey]);
-  if (!row || !verifyPassword(String(req.body.current || ''), row.salt, row.pass_hash)) {
-    req.session.flash = 'Current password is incorrect.'; return res.redirect(redirectTo);
+
+app.get('/deal/:id/sign', (req, res) => {
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!deal) return res.status(404).send(page('Not found', '<div class="card"><h2>Deal not found</h2></div>', currentUser(req)));
+  const contract = latestContract(deal.id);
+  if (!canViewSigningRoom(req, deal, contract)) {
+    const user = currentUser(req);
+    audit('AUTHENTICATION AGENT', 'signing room access', 'fail', `Unauthorized access attempt to deal #${deal.id} signing room by ${user ? user.name : 'anonymous'}`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Private signing room</h2><p class="muted">Only the two contracting parties and the admin can view this page.</p></div>', user));
   }
-  const next = String(req.body.next || '');
-  if (next.length < 8 || next !== String(req.body.confirm || '')) {
-    req.session.flash = 'New passwords do not match (min 8 characters).'; return res.redirect(redirectTo);
+  const user = currentUser(req);
+  if (!user || user.isAdmin) {
+    // Admin can view but not sign; companies must be logged in anyway.
+    if (!user) return res.redirect('/login?err=' + encodeURIComponent('Please sign in.'));
   }
-  const { salt, hash } = hashPassword(next);
-  db.prepare(`UPDATE ${table} SET pass_hash=?, salt=? WHERE ${idCol}=?`).run(hash, salt, row[idCol]);
-  req.session.flash = 'Password changed successfully.';
-  res.redirect(redirectTo);
-}
-app.get('/admin/password', requireAdmin, (req, res) => res.send(changePasswordPage(req, '/admin/password')));
-app.post('/admin/password', requireAdmin, (req, res) => doChange(req, 'admins', 'id', 'adminId', '/admin/password'));
-app.get('/password', requireApprovedCompany, (req, res) => res.send(changePasswordPage(req, '/password')));
-app.post('/password', requireApprovedCompany, (req, res) => doChange(req, 'companies', 'id', 'companyId', '/password'));
+  const owner = db.prepare('SELECT id, name FROM companies WHERE id = ?').get(deal.company_id);
+  const isOwn = !user.isAdmin && user.id === deal.company_id;
 
-/* ---------- ADMIN (OWNER) DASHBOARD ---------- */
-app.get('/admin', requireAdmin, (req, res) => {
-  const pendingCos = db.prepare("SELECT * FROM companies WHERE status='pending' ORDER BY id").all();
-  const approvedCos = db.prepare("SELECT * FROM companies WHERE status='approved' ORDER BY id DESC LIMIT 30").all();
-  const contracts = db.prepare(`SELECT ct.*, d.title, d.value_usd, o.name AS owner, r.name AS requester
-      FROM contracts ct JOIN deals d ON d.id=ct.deal_id
-      JOIN companies o ON o.id=d.company_id JOIN companies r ON r.id=ct.requester_id
-      ORDER BY ct.id DESC LIMIT 50`).all();
-  const pendingContracts = contracts.filter(c => c.status === 'pending');
-  const counts = {
-    pcos: db.prepare("SELECT COUNT(*) n FROM companies WHERE status='pending'").get().n,
-    acos: db.prepare("SELECT COUNT(*) n FROM companies WHERE status='approved'").get().n,
-    pctr: db.prepare("SELECT COUNT(*) n FROM contracts WHERE status='pending'").get().n,
-    gmv: db.prepare("SELECT COALESCE(SUM(value_usd),0) n FROM contracts ct JOIN deals d ON d.id=ct.deal_id WHERE ct.status='approved'").get().n
+  const signForm = (!user.isAdmin && !isOwn && !(contract && contract.status !== 'rejected')) ? `
+    <form method="POST" action="/deal/${deal.id}/sign">
+      <label>Re-enter your account password (signing authority check)</label>
+      <input type="password" name="password" required>
+      <label style="display:flex;gap:8px;align-items:center;margin:10px 0">
+        <input type="checkbox" name="authorized" value="yes" style="width:auto;margin:0" required>
+        I am an authorized signatory of my company</label>
+      <label style="display:flex;gap:8px;align-items:center;margin:10px 0">
+        <input type="checkbox" name="agree" value="yes" style="width:auto;margin:0" required>
+        I agree to the terms of this contract</label>
+      <button class="btn btn-green" type="submit">✍️ Sign contract</button>
+    </form>` : (user.isAdmin
+      ? '<p class="muted" style="margin-top:14px">Admin view — signing is performed by the counterparty company.</p>'
+      : '<p class="muted" style="margin-top:14px">This is your own deal — the counterparty signs here.</p>');
+
+  const body = `
+  <div class="card" style="border-color:#7c3aed">
+    <h2>🔒 Private signing room — Deal #${deal.id}</h2>
+    <p class="muted">Access restricted to the contracting parties and the admin. All checks are logged by the Authentication Agent.</p>
+    <hr style="border-color:#3b1d63;margin:14px 0">
+    <p><b>Deal:</b> ${esc(deal.title)}</p>
+    ${deal.value ? `<p><b>Value:</b> ${esc(deal.value)}</p>` : ''}
+    <p><b>Provider:</b> ${esc(owner ? owner.name : 'Unknown')}</p>
+    ${contract ? `<p><b>Counterparty (signer):</b> ${esc((db.prepare('SELECT name FROM companies WHERE id = ?').get(contract.signer_company_id) || {}).name || 'Unknown')}
+      · status ${statusBadge(contract.status)} · signed at ${esc(contract.signed_at.slice(0, 16).replace('T', ' '))} UTC</p>` : ''}
+    <h3 style="margin:12px 0 6px">Terms summary</h3>
+    <p style="white-space:pre-wrap">${esc(deal.description)}</p>
+    <hr style="border-color:#3b1d63;margin:14px 0">
+    ${signForm}
+  </div>`;
+  res.send(page('Signing room', body, user, req.query.msg, req.query.err));
+});
+
+// ----- Signing action: AUTHENTICATION AGENT re-verifies the signer -----
+app.post('/deal/:id/sign', requireCompany, (req, res) => {
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!deal) return res.redirect('/timeline?err=' + encodeURIComponent('Deal not found.'));
+
+  // Server-side guard: a company cannot sign its OWN deal.
+  if (deal.company_id === req.user.id) {
+    audit('AUTHENTICATION AGENT', 'signing self-deal guard', 'fail', `${req.user.name} attempted to sign own deal #${deal.id}`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — You cannot sign your own deal.</h2></div>', req.user));
+  }
+  // One live contract per deal.
+  const existing = latestContract(deal.id);
+  if (existing && (existing.status === 'pending' || existing.status === 'approved')) {
+    return res.redirect(`/deal/${deal.id}/sign?err=` + encodeURIComponent('A contract for this deal is already ' + existing.status + '.'));
+  }
+
+  // (a) signer must re-enter their account password (signing authority check)
+  const me = db.prepare('SELECT * FROM companies WHERE id = ?').get(req.user.id);
+  if (!verifyPassword(String(req.body.password || ''), me.salt, me.password_hash)) {
+    audit('AUTHENTICATION AGENT', 'signing password re-verification', 'fail', `Wrong password at signing for ${me.email} (deal #${deal.id})`);
+    return res.redirect(`/deal/${deal.id}/sign?err=` + encodeURIComponent('Password verification failed.'));
+  }
+  audit('AUTHENTICATION AGENT', 'signing password re-verification', 'pass', `Password re-verified for ${me.email} (deal #${deal.id})`);
+
+  // (b) authorized-signatory checkbox
+  if (req.body.authorized !== 'yes') {
+    audit('AUTHENTICATION AGENT', 'signatory authority checkbox', 'fail', `Not confirmed by ${me.email} (deal #${deal.id})`);
+    return res.redirect(`/deal/${deal.id}/sign?err=` + encodeURIComponent('You must confirm you are an authorized signatory.'));
+  }
+  audit('AUTHENTICATION AGENT', 'signatory authority checkbox', 'pass', `Authorized signatory confirmed by ${me.email}`);
+
+  // (c) agree-to-terms checkbox
+  if (req.body.agree !== 'yes') {
+    audit('AUTHENTICATION AGENT', 'terms agreement checkbox', 'fail', `Terms not accepted by ${me.email} (deal #${deal.id})`);
+    return res.redirect(`/deal/${deal.id}/sign?err=` + encodeURIComponent('You must agree to the terms.'));
+  }
+  audit('AUTHENTICATION AGENT', 'terms agreement checkbox', 'pass', `Terms accepted by ${me.email}`);
+
+  // (d) record timestamp + create the contract (pending admin approval)
+  const ts = now();
+  db.prepare(`INSERT INTO contracts (deal_id, signer_company_id, owner_company_id, status, signed_at, created_at)
+              VALUES (?,?,?, 'pending', ?, ?)`)
+    .run(deal.id, req.user.id, deal.company_id, ts, ts);
+  audit('AUTHENTICATION AGENT', 'contract signed', 'pass', `${me.name} signed deal #${deal.id} at ${ts} — pending admin approval`);
+
+  res.redirect(`/deal/${deal.id}?msg=` + encodeURIComponent('Contract signed! It is now pending admin approval.'));
+});
+
+// ============================= ADMIN ROUTES =============================
+/** Verify admin credentials: settings-table password override wins, env var is fallback. */
+function adminPasswordOk(pw) {
+  const overrideHash = db.prepare('SELECT value FROM settings WHERE key = ?').get('admin_password_hash');
+  const overrideSalt = db.prepare('SELECT value FROM settings WHERE key = ?').get('admin_password_salt');
+  if (overrideHash && overrideSalt) return verifyPassword(pw, overrideSalt.value, overrideHash.value);
+  return safeEqualPlain(pw, ADMIN_PASSWORD);
+}
+
+app.get('/admin', (req, res) => {
+  const user = currentUser(req);
+  if (!user || !user.isAdmin) {
+    const body = `
+    <div class="card" style="max-width:420px;margin:0 auto">
+      <h2>🛡️ Admin sign in</h2>
+      <form method="POST" action="/admin/login">
+        <label>Admin email</label><input type="email" name="email" required>
+        <label>Password</label><input type="password" name="password" required>
+        <button class="btn" type="submit">Sign in</button>
+      </form>
+    </div>`;
+    return res.send(page('Admin', body, null, req.query.msg, req.query.err));
+  }
+  res.redirect('/admin/dashboard');
+});
+
+app.post('/admin/login', (req, res) => {
+  const em = String(req.body.email || '').trim().toLowerCase();
+  const pw = String(req.body.password || '');
+  if (em !== ADMIN_EMAIL.toLowerCase() || !adminPasswordOk(pw)) {
+    audit('AUTHENTICATION AGENT', 'admin login', 'fail', `Failed admin login for ${em}`);
+    return res.redirect('/admin?err=' + encodeURIComponent('Invalid admin credentials.'));
+  }
+  audit('AUTHENTICATION AGENT', 'admin login', 'pass', `Admin ${em} signed in`);
+  createSession(req, res, null, true);
+  res.redirect('/admin/dashboard');
+});
+
+app.post('/admin/logout', (req, res) => {
+  destroySession(req, res);
+  res.redirect('/admin?msg=' + encodeURIComponent('Admin signed out.'));
+});
+
+// ----- Admin dashboard -----
+app.get('/admin/dashboard', requireAdmin, (req, res) => {
+  const count = (sql, ...args) => db.prepare(sql).get(...args).n;
+  const stats = {
+    companies: count('SELECT COUNT(*) AS n FROM companies'),
+    pending: count(`SELECT COUNT(*) AS n FROM companies WHERE status = 'pending'`),
+    approved: count(`SELECT COUNT(*) AS n FROM companies WHERE status = 'approved'`),
+    flagged: count('SELECT COUNT(*) AS n FROM companies WHERE flagged = 1'),
+    deals: count('SELECT COUNT(*) AS n FROM deals'),
+    contractsPending: count(`SELECT COUNT(*) AS n FROM contracts WHERE status = 'pending'`),
+    follows: count('SELECT COUNT(*) AS n FROM follows')
   };
-  res.send(layout('Owner dashboard', navFor(req.session) + flashBox(req) + `
-    <div class="grid">
-      <div class="kpi"><div class="v">${counts.pcos}</div><div class="l">Pending registrations</div></div>
-      <div class="kpi"><div class="v">${counts.acos}</div><div class="l">Approved companies</div></div>
-      <div class="kpi"><div class="v">${counts.pctr}</div><div class="l">Pending contracts</div></div>
-      <div class="kpi"><div class="v num">${usd(counts.gmv)}</div><div class="l">Approved contract value</div></div>
-    </div>
+  const statsHtml = `<div class="stats">${[
+    ['Total companies', stats.companies], ['Pending', stats.pending], ['Approved', stats.approved],
+    ['Flagged ⚠️', stats.flagged], ['Deals', stats.deals], ['Contracts pending', stats.contractsPending],
+    ['Follows', stats.follows]
+  ].map(([l, n]) => `<div class="stat"><div class="num">${n}</div><div class="lbl">${l}</div></div>`).join('')}</div>`;
 
-    <div class="card"><h2>Pending registrations (${pendingCos.length})</h2>
-      ${pendingCos.length ? `<table><tr><th>Company</th><th>Country</th><th>Industry</th><th>Email</th><th>Applied</th><th></th></tr>
-      ${pendingCos.map(c => `<tr><td><b>${esc(c.name)}</b></td><td>${esc(c.country)}</td><td>${esc(c.industry)}</td><td>${esc(c.email)}</td><td class="mut">${c.created_at}</td>
-        <td class="row"><form method="POST" action="/admin/company/${c.id}/approve"><button class="btn sm green">Approve</button></form>
-        <form method="POST" action="/admin/company/${c.id}/reject"><button class="btn sm red">Reject</button></form></td></tr>`).join('')}</table>`
-      : '<p class="mut">No pending registrations.</p>'}</div>
+  // Pending companies queue (with ONBOARDING AGENT flags)
+  const pending = db.prepare(`SELECT * FROM companies WHERE status = 'pending' ORDER BY created_at ASC`).all();
+  const pendingHtml = pending.length ? pending.map(c => `
+    <tr>
+      <td><b>${esc(c.name)}</b> ${c.flagged ? '<span class="warn-badge">⚠️ flagged</span>' : ''}<br>
+        <span class="muted">${esc(c.email)}${c.website ? ' · ' + esc(c.website) : ''}</span>
+        ${c.flagged ? `<br><span style="color:#fbbf24;font-size:12px">${esc(c.flag_reasons)}</span>` : ''}</td>
+      <td class="muted">${esc(c.created_at.slice(0, 10))}</td>
+      <td style="white-space:nowrap">
+        <form method="POST" action="/admin/companies/${c.id}/approve" style="display:inline"><button class="btn btn-sm btn-green">Approve</button></form>
+        <form method="POST" action="/admin/companies/${c.id}/reject" style="display:inline"><button class="btn btn-sm btn-danger">Reject</button></form>
+      </td>
+    </tr>`).join('') : '<tr><td colspan="3" class="muted">No pending companies 🎉</td></tr>';
 
-    <div class="card"><h2>Pending contracts (${pendingContracts.length})</h2>
-      ${pendingContracts.length ? pendingContracts.map(c => `<div style="border:1px solid #243152;border-radius:10px;padding:14px;margin-top:10px">
-        <div class="row" style="justify-content:space-between"><b>${esc(c.title)}</b><span class="pill ok">${usd(c.value_usd)}</span></div>
-        <p class="mut" style="margin:6px 0">${esc(c.owner)} ⇄ ${esc(c.requester)} · requested ${c.created_at}</p>
-        <div class="row" style="margin-top:10px">
-          <a class="btn sm ghost" href="/deal/${c.deal_id}">Contract terms</a>
-          <a class="btn sm ghost" href="/deal/${c.deal_id}/room">View closed room</a>
-          <form method="POST" action="/admin/contract/${c.id}/approve"><button class="btn sm green">Approve contract</button></form>
-          <form method="POST" action="/admin/contract/${c.id}/reject"><button class="btn sm red">Reject</button></form>
-        </div></div>`).join('')
-      : '<p class="mut">No pending contracts.</p>'}</div>
+  // Pending contracts queue
+  const names = companyNameMap();
+  const pendingContracts = db.prepare(`SELECT * FROM contracts WHERE status = 'pending' ORDER BY signed_at ASC`).all();
+  const contractsHtml = pendingContracts.length ? pendingContracts.map(ct => {
+    const deal = db.prepare('SELECT title FROM deals WHERE id = ?').get(ct.deal_id);
+    return `<tr>
+      <td><b>${esc(deal ? deal.title : '(deal removed)')}</b> <span class="muted">#${ct.deal_id}</span></td>
+      <td>${esc(names.get(ct.owner_company_id) || '?')} ⇄ ${esc(names.get(ct.signer_company_id) || '?')}</td>
+      <td class="muted">${esc(ct.signed_at.slice(0, 16).replace('T', ' '))}</td>
+      <td style="white-space:nowrap">
+        <form method="POST" action="/admin/contracts/${ct.id}/approve" style="display:inline"><button class="btn btn-sm btn-green">Approve</button></form>
+        <form method="POST" action="/admin/contracts/${ct.id}/reject" style="display:inline"><button class="btn btn-sm btn-danger">Reject</button></form>
+      </td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="4" class="muted">No contracts awaiting approval.</td></tr>';
 
-    <div class="grid" style="grid-template-columns:1fr 1fr">
-      <div class="card"><h2>Approved companies</h2>
-        ${approvedCos.length ? `<table><tr><th>Name</th><th>Industry</th><th>Joined</th></tr>
-        ${approvedCos.map(c => `<tr><td>${esc(c.name)}</td><td class="mut">${esc(c.industry)}</td><td class="mut">${c.created_at}</td></tr>`).join('')}</table>` : '<p class="mut">None yet.</p>'}</div>
-      <div class="card"><h2>All contracts</h2>
-        ${contracts.length ? `<table><tr><th>Deal</th><th>Parties</th><th>Value</th><th>Status</th></tr>
-        ${contracts.map(c => `<tr><td>${esc(c.title)}</td><td class="mut">${esc(c.owner)} ⇄ ${esc(c.requester)}</td><td class="num">${usd(c.value_usd)}</td><td>${pill(c.status)}</td></tr>`).join('')}</table>` : '<p class="mut">None yet.</p>'}</div>
-    </div>`));
-});
-app.post('/admin/company/:id/approve', requireAdmin, (req, res) => {
-  db.prepare("UPDATE companies SET status='approved' WHERE id=? AND status='pending'").run(req.params.id);
-  req.session.flash = 'Company approved — it can now sign in and trade.'; res.redirect('/admin');
-});
-app.post('/admin/company/:id/reject', requireAdmin, (req, res) => {
-  db.prepare("UPDATE companies SET status='rejected' WHERE id=? AND status='pending'").run(req.params.id);
-  req.session.flash = 'Company rejected.'; res.redirect('/admin');
-});
-app.post('/admin/contract/:id/approve', requireAdmin, (req, res) => {
-  db.prepare("UPDATE contracts SET status='approved' WHERE id=? AND status='pending'").run(req.params.id);
-  const ct = db.prepare('SELECT deal_id FROM contracts WHERE id=?').get(req.params.id);
-  if (ct) db.prepare('INSERT INTO messages (deal_id,sender_admin,body) VALUES (?,?,?)')
-    .run(ct.deal_id, 1, 'The platform owner has APPROVED this contract. It is now binding. Arrange payment via platform escrow.');
-  req.session.flash = 'Contract approved — both parties have been notified in their room.'; res.redirect('/admin');
-});
-app.post('/admin/contract/:id/reject', requireAdmin, (req, res) => {
-  db.prepare("UPDATE contracts SET status='rejected' WHERE id=? AND status='pending'").run(req.params.id);
-  const ct = db.prepare('SELECT deal_id FROM contracts WHERE id=?').get(req.params.id);
-  if (ct) db.prepare('INSERT INTO messages (deal_id,sender_admin,body) VALUES (?,?,?)')
-    .run(ct.deal_id, 1, 'The platform owner has REJECTED this contract request. You may renegotiate in this room.');
-  req.session.flash = 'Contract rejected — parties notified in their room.'; res.redirect('/admin');
+  // All companies (suspend / reactivate / delete)
+  const allCompanies = db.prepare('SELECT * FROM companies ORDER BY created_at DESC LIMIT 100').all();
+  const companiesHtml = allCompanies.map(c => {
+    const actions = [];
+    if (c.status === 'approved') actions.push(`<form method="POST" action="/admin/companies/${c.id}/suspend" style="display:inline"><button class="btn btn-sm btn-outline">Suspend</button></form>`);
+    if (c.status === 'suspended' || c.status === 'rejected') actions.push(`<form method="POST" action="/admin/companies/${c.id}/reactivate" style="display:inline"><button class="btn btn-sm btn-green">Reactivate</button></form>`);
+    actions.push(`<form method="POST" action="/admin/companies/${c.id}/delete" style="display:inline" onsubmit="return confirm('Delete ${esc(c.name)} and ALL their data?')"><button class="btn btn-sm btn-danger">Delete</button></form>`);
+    return `<tr>
+      <td><b>${esc(c.name)}</b> ${c.flagged ? '<span class="warn-badge">⚠️</span>' : ''}<br><span class="muted">${esc(c.email)}</span></td>
+      <td>${statusBadge(c.status)}</td>
+      <td style="white-space:nowrap">${actions.join(' ')}</td>
+    </tr>`;
+  }).join('');
+
+  // All deals (admin can remove)
+  const allDeals = db.prepare('SELECT * FROM deals ORDER BY created_at DESC LIMIT 100').all();
+  const dealsHtml = allDeals.length ? allDeals.map(d => `<tr>
+      <td><b>${esc(d.title)}</b><br><span class="muted">${esc(names.get(d.company_id) || '?')} · ${esc(d.created_at.slice(0, 10))}${d.value ? ' · ' + esc(d.value) : ''}</span></td>
+      <td><form method="POST" action="/admin/deals/${d.id}/delete" style="display:inline" onsubmit="return confirm('Remove this deal?')"><button class="btn btn-sm btn-danger">Remove</button></form></td>
+    </tr>`).join('') : '<tr><td colspan="2" class="muted">No deals yet.</td></tr>';
+
+  // Agent activity — 50 most recent audit entries
+  const auditRows = db.prepare('SELECT * FROM agent_audit ORDER BY id DESC LIMIT 50').all();
+  const auditHtml = auditRows.length ? auditRows.map(a => `<tr>
+      <td class="muted" style="white-space:nowrap">${esc(a.created_at.slice(0, 19).replace('T', ' '))}</td>
+      <td>${esc(a.agent)}</td><td>${esc(a.action)}</td><td>${resultBadge(a.result)}</td><td class="muted">${esc(a.details)}</td>
+    </tr>`).join('') : '<tr><td colspan="5" class="muted">No agent activity yet.</td></tr>';
+
+  const body = `
+  <h2 style="color:#c4b5fd;margin-bottom:14px">🛡️ Admin dashboard</h2>
+  ${statsHtml}
+  <div class="card"><h3>Pending companies</h3>
+    <table><tr><th>Company</th><th>Registered</th><th>Actions</th></tr>${pendingHtml}</table></div>
+  <div class="card"><h3>Pending contracts</h3>
+    <table><tr><th>Deal</th><th>Parties</th><th>Signed at</th><th>Actions</th></tr>${contractsHtml}</table></div>
+  <div class="card"><h3>All companies</h3>
+    <table><tr><th>Company</th><th>Status</th><th>Actions</th></tr>${companiesHtml}</table></div>
+  <div class="card"><h3>All deals</h3>
+    <table><tr><th>Deal</th><th>Actions</th></tr>${dealsHtml}</table></div>
+  <div class="card"><h3>Change admin password</h3>
+    <form method="POST" action="/admin/password" style="max-width:380px">
+      <label>Current password</label><input type="password" name="current" required>
+      <label>New password (min 10 characters)</label><input type="password" name="next" required minlength="10">
+      <button class="btn btn-sm" type="submit">Update password</button>
+      <p class="muted" style="margin-top:8px">Stored as a salted hash in the settings table; the env var remains a fallback until changed.</p>
+    </form></div>
+  <div class="card"><h3>🤖 Agent activity (latest 50)</h3>
+    <table><tr><th>Time (UTC)</th><th>Agent</th><th>Action</th><th>Result</th><th>Details</th></tr>${auditHtml}</table></div>`;
+  res.send(page('Admin dashboard', body, req.user, req.query.msg, req.query.err));
 });
 
-app.listen(PORT, () => console.log('Dealzoin v2 running → http://localhost:' + PORT));
+// ----- Company moderation -----
+app.post('/admin/companies/:id/approve', requireAdmin, (req, res) => {
+  const c = db.prepare('SELECT * FROM companies WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!c) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Company not found.'));
+  db.prepare(`UPDATE companies SET status = 'approved' WHERE id = ?`).run(c.id);
+  audit('ONBOARDING AGENT', 'admin approve company', 'pass', `Admin approved "${c.name}"`);
+  res.redirect('/admin/dashboard?msg=' + encodeURIComponent(`Approved ${c.name}.`));
+});
+app.post('/admin/companies/:id/reject', requireAdmin, (req, res) => {
+  const c = db.prepare('SELECT * FROM companies WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!c) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Company not found.'));
+  db.prepare(`UPDATE companies SET status = 'rejected' WHERE id = ?`).run(c.id);
+  audit('ONBOARDING AGENT', 'admin reject company', 'fail', `Admin rejected "${c.name}"`);
+  res.redirect('/admin/dashboard?msg=' + encodeURIComponent(`Rejected ${c.name}.`));
+});
+app.post('/admin/companies/:id/suspend', requireAdmin, (req, res) => {
+  const c = db.prepare('SELECT * FROM companies WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!c) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Company not found.'));
+  db.prepare(`UPDATE companies SET status = 'suspended' WHERE id = ?`).run(c.id);
+  db.prepare('DELETE FROM sessions WHERE company_id = ?').run(c.id); // kill active sessions
+  audit('ONBOARDING AGENT', 'admin suspend company', 'flag', `Admin suspended "${c.name}"`);
+  res.redirect('/admin/dashboard?msg=' + encodeURIComponent(`Suspended ${c.name}.`));
+});
+app.post('/admin/companies/:id/reactivate', requireAdmin, (req, res) => {
+  const c = db.prepare('SELECT * FROM companies WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!c) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Company not found.'));
+  db.prepare(`UPDATE companies SET status = 'approved' WHERE id = ?`).run(c.id);
+  audit('ONBOARDING AGENT', 'admin reactivate company', 'pass', `Admin reactivated "${c.name}"`);
+  res.redirect('/admin/dashboard?msg=' + encodeURIComponent(`Reactivated ${c.name}.`));
+});
+app.post('/admin/companies/:id/delete', requireAdmin, (req, res) => {
+  const c = db.prepare('SELECT * FROM companies WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!c) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Company not found.'));
+  const id = c.id;
+  // Delete cascades ALL company data: posts, deals (+their social graph), likes,
+  // comments, follows, reposts, contracts, sessions, verification codes.
+  const wipe = db.transaction(() => {
+    const dealIds = db.prepare('SELECT id FROM deals WHERE company_id = ?').all(id).map(r => r.id);
+    const postIds = db.prepare('SELECT id FROM posts WHERE company_id = ?').all(id).map(r => r.id);
+    for (const d of dealIds) {
+      db.prepare(`DELETE FROM likes WHERE target_type = 'deal' AND target_id = ?`).run(d);
+      db.prepare(`DELETE FROM comments WHERE target_type = 'deal' AND target_id = ?`).run(d);
+      db.prepare('DELETE FROM reposts WHERE deal_id = ?').run(d);
+      db.prepare('DELETE FROM contracts WHERE deal_id = ?').run(d);
+    }
+    for (const p of postIds) {
+      db.prepare(`DELETE FROM likes WHERE target_type = 'post' AND target_id = ?`).run(p);
+      db.prepare(`DELETE FROM comments WHERE target_type = 'post' AND target_id = ?`).run(p);
+    }
+    db.prepare('DELETE FROM deals WHERE company_id = ?').run(id);
+    db.prepare('DELETE FROM posts WHERE company_id = ?').run(id);
+    db.prepare('DELETE FROM likes WHERE company_id = ?').run(id);
+    db.prepare('DELETE FROM comments WHERE company_id = ?').run(id);
+    db.prepare('DELETE FROM reposts WHERE company_id = ?').run(id);
+    db.prepare('DELETE FROM follows WHERE follower_id = ? OR followed_id = ?').run(id, id);
+    db.prepare('DELETE FROM contracts WHERE signer_company_id = ? OR owner_company_id = ?').run(id, id);
+    db.prepare('DELETE FROM sessions WHERE company_id = ?').run(id);
+    db.prepare('DELETE FROM verification_codes WHERE company_id = ?').run(id);
+    db.prepare('DELETE FROM companies WHERE id = ?').run(id);
+  });
+  wipe();
+  audit('ONBOARDING AGENT', 'admin delete company', 'fail', `Admin deleted "${c.name}" and all associated data`);
+  res.redirect('/admin/dashboard?msg=' + encodeURIComponent(`Deleted ${c.name} and all their data.`));
+});
+
+// ----- Deal moderation -----
+app.post('/admin/deals/:id/delete', requireAdmin, (req, res) => {
+  const d = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!d) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Deal not found.'));
+  const wipe = db.transaction(() => {
+    db.prepare(`DELETE FROM likes WHERE target_type = 'deal' AND target_id = ?`).run(d.id);
+    db.prepare(`DELETE FROM comments WHERE target_type = 'deal' AND target_id = ?`).run(d.id);
+    db.prepare('DELETE FROM reposts WHERE deal_id = ?').run(d.id);
+    db.prepare('DELETE FROM contracts WHERE deal_id = ?').run(d.id);
+    db.prepare('DELETE FROM deals WHERE id = ?').run(d.id);
+  });
+  wipe();
+  audit('ONBOARDING AGENT', 'admin remove deal', 'flag', `Admin removed deal #${d.id} "${d.title}"`);
+  res.redirect('/admin/dashboard?msg=' + encodeURIComponent('Deal removed.'));
+});
+
+// ----- Contract approval queue -----
+app.post('/admin/contracts/:id/approve', requireAdmin, (req, res) => {
+  const ct = db.prepare('SELECT * FROM contracts WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!ct) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Contract not found.'));
+  db.prepare(`UPDATE contracts SET status = 'approved', decided_at = ? WHERE id = ?`).run(now(), ct.id);
+  // TODO PHASE 3 — PAYMENT-ESCROW AGENT: when admin approves a contract, hook Stripe escrow initiation here (create escrow, notify both parties, release funds on delivery confirmation). Not implemented in this version.
+  audit('AUTHENTICATION AGENT', 'admin approve contract', 'pass', `Contract #${ct.id} (deal #${ct.deal_id}) approved by admin`);
+  res.redirect('/admin/dashboard?msg=' + encodeURIComponent('Contract approved. Both parties can now see it on the deal page.'));
+});
+app.post('/admin/contracts/:id/reject', requireAdmin, (req, res) => {
+  const ct = db.prepare('SELECT * FROM contracts WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!ct) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Contract not found.'));
+  db.prepare(`UPDATE contracts SET status = 'rejected', decided_at = ? WHERE id = ?`).run(now(), ct.id);
+  audit('AUTHENTICATION AGENT', 'admin reject contract', 'fail', `Contract #${ct.id} (deal #${ct.deal_id}) rejected by admin`);
+  res.redirect('/admin/dashboard?msg=' + encodeURIComponent('Contract rejected.'));
+});
+
+// ----- Change admin password (settings override; env var is fallback) -----
+app.post('/admin/password', requireAdmin, (req, res) => {
+  const current = String(req.body.current || '');
+  const next = String(req.body.next || '');
+  if (!adminPasswordOk(current)) {
+    audit('AUTHENTICATION AGENT', 'admin password change', 'fail', 'Wrong current password');
+    return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Current password is incorrect.'));
+  }
+  if (next.length < 10) {
+    return res.redirect('/admin/dashboard?err=' + encodeURIComponent('New password must be at least 10 characters.'));
+  }
+  const salt = newSalt();
+  const upsert = db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value');
+  upsert.run('admin_password_hash', hashPassword(next, salt));
+  upsert.run('admin_password_salt', salt);
+  audit('AUTHENTICATION AGENT', 'admin password change', 'pass', 'Admin password updated (hashed override stored)');
+  res.redirect('/admin/dashboard?msg=' + encodeURIComponent('Admin password updated.'));
+});
+
+// ============================= 404 & SERVER START =============================
+app.use((req, res) => {
+  res.status(404).send(page('Not found', '<div class="card"><h2>404 — page not found</h2><p class="muted"><a href="/">Back to home</a></p></div>', currentUser(req)));
+});
+
+app.listen(PORT, () => {
+  console.log(`Dealzoin listening on http://localhost:${PORT}`);
+  console.log(`Admin login: ${ADMIN_EMAIL} (env-configured)${BREVO_API_KEY ? '' : ' — DEMO MODE: verification codes shown on screen'}`);
+});
