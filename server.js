@@ -694,8 +694,6 @@ const CSS = `
   .btn-danger:hover { background: var(--danger-deep); color: var(--on-danger); }
   .btn-green { background: var(--mint); color: var(--on-mint); box-shadow: none; }
   .btn-green:hover { background: var(--mint-deep); color: var(--on-mint); }
-  .btn.liked { animation: likepop .15s ease; }
-  @keyframes likepop { 0% { transform: scale(1); } 50% { transform: scale(1.15); } 100% { transform: scale(1); } }
 
   /* Forms / inputs */
   input[type=text], input[type=email], input[type=password], input[type=url], input[type=number], textarea, select {
@@ -718,7 +716,6 @@ const CSS = `
   .flash-ok, .flash-err { border-radius: 10px; padding: 0.8rem 1.1rem; font: 500 0.9375rem var(--font-body); border: 1px solid; margin-bottom: 14px; animation: flashin .3s ease; }
   .flash-ok { background: var(--ok-bg); border-color: var(--ok-border); color: var(--mint); }
   .flash-err { background: var(--err-bg); border-color: var(--err-border); color: var(--danger); }
-  @keyframes flashin { from { transform: translateY(-8px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
   .demo-banner { background: var(--warn-bg); border: 1px solid var(--warn-border); color: var(--warning); border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; font-size: 14px; }
   .demo-banner b { color: var(--warning); }
 
@@ -734,7 +731,6 @@ const CSS = `
   .badge-suspended { background: transparent; color: var(--ink-faint); border: 1px dashed var(--border-soft); }
   .warn-badge { display: inline-block; background: var(--badge-flag-bg); color: var(--badge-flag-fg); border: 1px dashed currentColor; border-radius: 999px; padding: 0.2rem 0.7rem; font: 600 0.75rem var(--font-body); text-transform: uppercase; letter-spacing: 0.08em; }
   .warn-badge .warn-ic { font-style: normal; display: inline-block; animation: warnpulse 2s ease-in-out infinite; }
-  @keyframes warnpulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
 
   /* Tables (admin dashboard) */
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -784,7 +780,6 @@ const CSS = `
   .nav-ic:hover { color: var(--ink-primary); background: var(--bg-spotlight); }
   .nav-ic.active { color: var(--gold); background: var(--gold-glow); border-color: var(--border-gold); }
   .nav-badge { position: absolute; top: -5px; right: -5px; min-width: 18px; height: 18px; border-radius: 999px; background: var(--danger); color: var(--on-danger); font-size: 11px; font-weight: 700; font-family: var(--font-body); display: inline-flex; align-items: center; justify-content: center; padding: 0 5px; line-height: 1; box-shadow: 0 0 0 2px var(--bg-void); pointer-events: none; animation: badge-pulse 2.4s ease-in-out infinite; }
-  @keyframes badge-pulse { 50% { transform: scale(1.12); } }
   .unread-chip { display: inline-flex; align-items: center; justify-content: center; min-width: 20px; height: 20px; border-radius: 999px; background: var(--danger); color: var(--on-danger); font-size: 12px; font-weight: 700; padding: 0 6px; margin-left: 8px; }
   button.nav-ic { background: transparent; cursor: pointer; font-size: 17px; line-height: 1; padding: 0; font-family: var(--font-body); }
   .nav-plus { display: inline-flex; align-items: center; justify-content: center; width: 42px; height: 42px; border-radius: 50%; background: var(--gradient-coin); color: var(--on-gold); margin-left: 6px; box-shadow: var(--gold-shadow-plus); transition: all .18s ease; }
@@ -911,6 +906,146 @@ const CSS = `
   .discover-row { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--border-soft); }
   .discover-row:last-of-type { border-bottom: none; }
   .discover-row .grow { flex: 1; min-width: 0; }
+
+  /* ==================== MOTION DESIGN LAYER ====================
+     Living trading-floor feel: drifting atmosphere, choreographed entrances,
+     micro-interactions. All motion is gated behind prefers-reduced-motion. */
+
+  /* Atmosphere — fixed aurora layers behind all content (painted over the
+     propagated body background, under everything else). Dark: deep gold nebula
+     with a whisper of mint. Transform-only drift = GPU-friendly. */
+  body::before {
+    content: ""; position: fixed; inset: -15%; z-index: -1; pointer-events: none;
+    background:
+      radial-gradient(38% 32% at 18% 22%, rgba(245,185,66,0.10), transparent 70%),
+      radial-gradient(34% 30% at 82% 14%, rgba(63,224,176,0.06), transparent 70%),
+      radial-gradient(42% 38% at 55% 88%, rgba(245,185,66,0.07), transparent 70%);
+    will-change: transform;
+  }
+  body::after {
+    content: ""; position: fixed; inset: -15%; z-index: -1; pointer-events: none;
+    background:
+      radial-gradient(30% 26% at 70% 62%, rgba(245,185,66,0.06), transparent 70%),
+      radial-gradient(26% 24% at 12% 78%, rgba(63,224,176,0.05), transparent 70%);
+    will-change: transform;
+  }
+  /* Light theme — warm parchment light-play (bullion amber on beige, faint mint). */
+  [data-theme="light"] body::before {
+    background:
+      radial-gradient(38% 32% at 18% 22%, rgba(217,160,43,0.16), transparent 70%),
+      radial-gradient(34% 30% at 82% 14%, rgba(11,122,88,0.08), transparent 70%),
+      radial-gradient(42% 38% at 55% 88%, rgba(169,118,15,0.11), transparent 70%);
+  }
+  [data-theme="light"] body::after {
+    background:
+      radial-gradient(30% 26% at 70% 62%, rgba(240,198,104,0.14), transparent 70%),
+      radial-gradient(26% 24% at 12% 78%, rgba(11,122,88,0.06), transparent 70%);
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    /* --- Atmosphere drift: slow 30-45s loops, translate/scale only --- */
+    body::before { animation: dz-drift-a 42s ease-in-out infinite alternate; }
+    body::after  { animation: dz-drift-b 34s ease-in-out infinite alternate; }
+    @keyframes dz-drift-a {
+      from { transform: translate3d(0, 0, 0) scale(1); }
+      50%  { transform: translate3d(2.5%, -2%, 0) scale(1.06); }
+      to   { transform: translate3d(-2%, 2.5%, 0) scale(1.02); }
+    }
+    @keyframes dz-drift-b {
+      from { transform: translate3d(0, 0, 0) scale(1.03); }
+      50%  { transform: translate3d(-3%, 2%, 0) scale(1); }
+      to   { transform: translate3d(2%, -2.5%, 0) scale(1.07); }
+    }
+
+    /* --- Page fade-in (class added by the head/footer scripts) --- */
+    html.dz-js body { opacity: 0; transform: translateY(10px); }
+    html.dz-js body.dz-in { opacity: 1; transform: none; transition: opacity .22s ease-out, transform .22s ease-out; }
+
+    /* --- Staggered entrance + scroll reveal ---
+       Hidden only until .in-view lands; animation uses fill-mode "backwards"
+       so hover transforms keep working after the entrance completes. */
+    html.dz-js [data-reveal]:not(.in-view) { opacity: 0; }
+    html.dz-js [data-reveal].in-view { animation: dz-rise .55s cubic-bezier(.2, .7, .25, 1) backwards; animation-delay: calc(var(--i, 0) * 60ms); }
+    @keyframes dz-rise { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
+
+    /* --- Buttons: shine sweep on the struck-gold primary, press feedback --- */
+    .btn:not(.btn-outline):not(.btn-danger):not(.btn-green)::before {
+      content: ""; position: absolute; top: -10%; bottom: -10%; left: 0; width: 45%;
+      background: linear-gradient(105deg, transparent 0%, rgba(255,255,255,0.5) 50%, transparent 100%);
+      transform: translateX(-170%) skewX(-18deg); transition: transform .55s ease; pointer-events: none;
+    }
+    .btn:not(.btn-outline):not(.btn-danger):not(.btn-green):hover::before { transform: translateX(330%) skewX(-18deg); }
+    .btn:active { transform: scale(.97); }
+    .btn-outline { transition: border-color .18s ease, transform .18s ease, background .18s ease, color .18s ease; }
+    .btn-outline:hover { transform: translateY(-1px); border-color: var(--gold); }
+
+    /* --- Cards: hover lift with stronger gold shadow + border glow --- */
+    .card { transition: transform .18s ease-out, box-shadow .18s ease-out, border-color .18s ease-out; }
+    .card:hover { transform: translateY(-3px); box-shadow: var(--card-shadow-hover), 0 0 0 1px var(--border-gold); border-color: var(--border-gold); }
+    .card-deal:hover { transform: translateY(-3px); box-shadow: var(--card-shadow-hover), var(--shadow-gold), 0 0 0 1px var(--border-gold); }
+
+    /* --- Nav icons: micro-bounce + gold underlight; active page gets a pulsing gold dot --- */
+    .nav-ic:hover { transform: translateY(-2px) scale(1.08); }
+    .nav-ic::after { content: ""; position: absolute; left: 9px; right: 9px; bottom: 1px; height: 5px; border-radius: 50%; background: var(--gold); filter: blur(5px); opacity: 0; transition: opacity .2s ease; pointer-events: none; }
+    .nav-ic:hover::after { opacity: .45; }
+    .nav-ic.active::before { content: ""; position: absolute; bottom: 4px; left: 50%; width: 5px; height: 5px; margin-left: -2.5px; border-radius: 50%; background: var(--gold); box-shadow: 0 0 6px var(--gold); animation: dz-navdot 2s ease-in-out infinite; pointer-events: none; }
+    @keyframes dz-navdot { 0%, 100% { transform: scale(1); opacity: .9; } 50% { transform: scale(1.35); opacity: .5; } }
+
+    /* --- Unread / notification badges: gentle pulse --- */
+    .unread-chip { animation: badge-pulse 2s ease-in-out infinite; }
+    @keyframes badge-pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.12); } }
+
+    /* --- Wax seals: slow idle sway (sealed letters only) --- */
+    .mail-row--sealed .wax-seal { animation: dz-seal-sway 4s ease-in-out infinite alternate; }
+    @keyframes dz-seal-sway { from { transform: rotate(-8deg); } to { transform: rotate(-5deg); } }
+
+    /* --- Like button: one-time heart-burst pop on render when .liked --- */
+    .btn.liked { animation: dz-likeburst .3s ease-out; }
+    @keyframes dz-likeburst { 0% { transform: scale(1); } 40% { transform: scale(1.35); } 100% { transform: scale(1); } }
+    .feed-actions .btn:active { transform: scale(.93); }
+
+    /* --- Flash messages: slide-in + 5s countdown progress bar (matches auto-dismiss) --- */
+    .flash-ok, .flash-err { position: relative; overflow: hidden; }
+    .flash-ok::after, .flash-err::after {
+      content: ""; position: absolute; left: 0; bottom: 0; height: 3px; width: 100%;
+      background: currentColor; opacity: .45; transform-origin: left center;
+      animation: dz-flashbar 5s linear forwards;
+    }
+    @keyframes dz-flashbar { from { transform: scaleX(1); } to { transform: scaleX(0); } }
+    @keyframes flashin { from { transform: translateY(-8px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+    @keyframes warnpulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+    /* --- Signing-room vault: breathing mint inner ring ("the vault is listening") ---
+       Opacity-animated pseudo-element (inset shadows stay inside the clipped vault). */
+    .vault::after {
+      content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+      box-shadow: inset 0 0 0 1px var(--ok-border), inset 0 0 26px rgba(63,224,176,0.22);
+      opacity: 0; animation: dz-vault-breathe 3.8s ease-in-out infinite;
+    }
+    @keyframes dz-vault-breathe { 0%, 100% { opacity: 0; } 50% { opacity: .85; } }
+
+    /* --- Finalized / approved contract badges: shimmer sweep --- */
+    .badge-contract {
+      background-image: linear-gradient(100deg, transparent 20%, rgba(63,224,176,0.35) 50%, transparent 80%);
+      background-size: 220% 100%; background-repeat: no-repeat;
+      animation: dz-shimmer 3.2s linear infinite;
+    }
+    @keyframes dz-shimmer { from { background-position: 200% 0; } to { background-position: -120% 0; } }
+
+    /* --- Search inputs: focus glow expand --- */
+    input[name="q"] { transition: box-shadow .2s ease, transform .2s ease, border-color .2s ease, background .2s ease; }
+    input[name="q"]:focus { box-shadow: 0 0 0 4px var(--gold-glow), 0 0 26px var(--gold-glow); transform: scale(1.01); }
+  }
+
+  /* Reduced motion: kill every animation/transition globally, show content instantly. */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
 `;
 
 /** Inline SVG icons for the company nav (no emoji in the nav bar). */
@@ -968,7 +1103,7 @@ function page(title, body, user, msg, err, active, headExtra) {
        <a class="navlink" href="/signup">Register company</a>`;
   return `<!DOCTYPE html>
 <html lang="en"><head>
-<script>try{if(localStorage.getItem('dz-theme')==='light'){document.documentElement.dataset.theme='light';}}catch(e){}</script>
+<script>try{if(localStorage.getItem('dz-theme')==='light'){document.documentElement.dataset.theme='light';}}catch(e){}document.documentElement.classList.add('dz-js');</script>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)} — Dealzoin</title>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -987,8 +1122,13 @@ ${headExtra || ''}
   ${body}
 </main>
 <div class="footer">Dealzoin — the B2B deal network. Companies only. 🪙</div>
-<script>setTimeout(function(){document.querySelectorAll('.flash-ok,.flash-err').forEach(function(e){e.style.transition='opacity .4s';e.style.opacity='0';setTimeout(function(){e.remove();},400);});},5000);</script>
 <script>(function(){
+  var reduce=!!(window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  // Page fade-in: add the class on the next frame so the CSS transition fires.
+  requestAnimationFrame(function(){if(document.body)document.body.classList.add('dz-in');});
+  // Flash messages: auto-dismiss after 5s (matches the CSS countdown bar).
+  setTimeout(function(){document.querySelectorAll('.flash-ok,.flash-err').forEach(function(e){e.style.transition='opacity .4s';e.style.opacity='0';setTimeout(function(){e.remove();},400);});},5000);
+  // Theme toggle (persists to localStorage).
   var root=document.documentElement,btn=document.getElementById('theme-toggle');
   function paintIcon(){if(btn)btn.textContent=root.dataset.theme==='light'?'\\u2600\\uFE0F':'\\uD83C\\uDF19';}
   if(btn){paintIcon();btn.addEventListener('click',function(){
@@ -996,6 +1136,7 @@ ${headExtra || ''}
     try{localStorage.setItem('dz-theme',root.dataset.theme==='light'?'light':'dark');}catch(e){}
     paintIcon();
   });}
+  // Styled file-input labels.
   document.querySelectorAll('input.file-input').forEach(function(inp){
     inp.addEventListener('change',function(){
       var lbl=inp.closest('.file-btn');if(!lbl)return;
@@ -1004,6 +1145,39 @@ ${headExtra || ''}
       t.textContent=(inp.files&&inp.files.length)?'\\uD83D\\uDCCE '+Array.prototype.map.call(inp.files,function(f){return f.name;}).join(', '):def;
     });
   });
+  // Stat tiles: count-up 0 -> value over 800ms ease-out (fallback: plain number stays).
+  function countUp(el){
+    var target=parseFloat(el.getAttribute('data-count'));
+    if(!isFinite(target))return;
+    if(reduce){el.textContent=String(target);return;}
+    var t0=null,dur=800;
+    var step=function(ts){
+      if(t0===null)t0=ts;
+      var p=Math.min(1,(ts-t0)/dur),e=1-Math.pow(1-p,3);
+      el.textContent=String(Math.round(target*e));
+      if(p<1)requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  }
+  // Scroll reveal: one shared IntersectionObserver adds .in-view / triggers count-ups.
+  var motionEls=document.querySelectorAll('[data-reveal],[data-count]');
+  if('IntersectionObserver' in window&&motionEls.length){
+    var io=new IntersectionObserver(function(entries){
+      entries.forEach(function(en){
+        if(!en.isIntersecting)return;
+        var el=en.target;
+        if(el.hasAttribute('data-reveal'))el.classList.add('in-view');
+        if(el.hasAttribute('data-count')&&!el.getAttribute('data-counted')){el.setAttribute('data-counted','1');countUp(el);}
+        io.unobserve(el);
+      });
+    },{threshold:0.12});
+    motionEls.forEach(function(el){io.observe(el);});
+  }else{
+    motionEls.forEach(function(el){
+      if(el.hasAttribute('data-reveal'))el.classList.add('in-view');
+      if(el.hasAttribute('data-count'))countUp(el);
+    });
+  }
 })();</script>
 </body></html>`;
 }
@@ -1316,8 +1490,9 @@ function dealFeedItem(d) {
            contract_state: d.contract_state || null, contract_party: d.contract_party || '',
            created_at: d.created_at, media_id: d.media_id };
 }
-/** Render one feed card. kind: 'deal' | 'post' | 'repost'. */
-function feedCard(item, user, names) {
+/** Render one feed card. kind: 'deal' | 'post' | 'repost'. idx = loop index (entrance stagger). */
+function feedCard(item, user, names, idx) {
+  const stagger = Math.min(Number.isInteger(idx) ? idx : 0, 10);
   const ownerName = names.get(item.company_id) || 'Unknown';
   const isOwn = user && !user.isAdmin && user.id === item.company_id;
 
@@ -1376,7 +1551,7 @@ function feedCard(item, user, names) {
       </form>
     </div>` : `<p class="muted" style="margin-top:10px">${soc.likeCount} likes · ${soc.comments.length} comments</p>`;
 
-  return `<div class="card${item.kind === 'post' ? '' : ' card-deal'}">
+  return `<div class="card${item.kind === 'post' ? '' : ' card-deal'}" data-reveal style="--i:${stagger}">
     <div class="feed-head"><div>${head}</div>
     ${headRight}</div>
     ${bodyHtml}
@@ -1420,7 +1595,7 @@ app.get('/timeline', requireCompany, (req, res) => {
       SELECT id, name, avatar_media_id, reputation FROM companies
       WHERE status = 'approved' AND id != ? ORDER BY reputation DESC, name ASC LIMIT 8`).all(req.user.id);
     const discoverHtml = discover.length ? `
-      <div class="card">
+      <div class="card" data-reveal>
         <div class="kicker">Discover companies</div>
         <h3 style="margin:6px 0 4px">Start your ledger</h3>
         ${discover.map(c => `
@@ -1437,10 +1612,10 @@ app.get('/timeline', requireCompany, (req, res) => {
       <a class="btn" href="/search">Find companies to follow</a>
     </div>
     ${discoverHtml}
-    ${feed.length ? feed.map(i => feedCard(i, req.user, names)).join('') : ''}`;
+    ${feed.length ? feed.map((i, idx) => feedCard(i, req.user, names, idx)).join('') : ''}`;
   } else {
     feedHtml = feed.length
-      ? feed.map(i => feedCard(i, req.user, names)).join('')
+      ? feed.map((i, idx) => feedCard(i, req.user, names, idx)).join('')
       : '<div class="card"><p class="muted">Nothing yet from the companies you follow. <a href="/search">Discover more companies →</a></p></div>';
   }
 
@@ -1579,12 +1754,12 @@ app.get('/search', requireCompany, (req, res) => {
     const companies = db.prepare(`SELECT * FROM companies WHERE status = 'approved' AND (name LIKE ? OR description LIKE ?) ORDER BY name LIMIT 30`).all(like, like);
     const names = companyNameMap();
     dealsHtml = deals.length
-      ? deals.map(d => feedCard(dealFeedItem(d), req.user, names)).join('')
+      ? deals.map((d, idx) => feedCard(dealFeedItem(d), req.user, names, idx)).join('')
       : '<p class="muted">No deals match your search.</p>';
     companiesHtml = companies.length
-      ? companies.map(c => {
+      ? companies.map((c, idx) => {
           const fc = followCounts(c.id);
-          return `<div class="card">
+          return `<div class="card" data-reveal style="--i:${Math.min(idx, 10)}">
             <div class="feed-head"><h3>${avatarHtml(c.name, c.avatar_media_id)}<a href="/company/${c.id}">${esc(c.name)}</a></h3>${followButton(req.user, c.id)}</div>
             <p class="muted">${fc.followers} followers · ${fc.following} following</p>
             <p style="margin-top:6px">${esc(c.description || '')}</p>
@@ -1615,7 +1790,7 @@ app.get('/company/:id', requireCompany, (req, res) => {
   const deals = db.prepare('SELECT * FROM deals WHERE company_id = ? ORDER BY created_at DESC LIMIT 50').all(id);
   const names = companyNameMap();
   const dealsHtml = deals.length
-    ? deals.map(d => feedCard(dealFeedItem(d), req.user, names)).join('')
+    ? deals.map((d, idx) => feedCard(dealFeedItem(d), req.user, names, idx)).join('')
     : '<div class="card"><p class="muted">No deals yet.</p></div>';
 
   // Research Agent intelligence card — shown only when at least one intel field is set.
@@ -2424,12 +2599,13 @@ app.get('/contracts', requireCompany, (req, res) => {
     return true;
   });
 
-  const rowHtml = shown.length ? shown.map(pc => {
+  const rowHtml = shown.length ? shown.map((pc, idx) => {
     const sealed = pcIsSealed(pc, req.user.id);
     const otherId = tab === 'sent' ? pc.recipient_company_id : pc.sender_company_id;
     const otherName = names.get(otherId) || 'Unknown';
     const amount = Number(pc.value) > 0 ? `<span class="mail-amount">${esc(fmtAmount(Number(pc.value)))} ${esc(pc.currency || 'USD')}</span>` : '';
     return `<a class="mail-row ${sealed ? 'mail-row--sealed' : 'mail-row--opened'}" href="/contracts/${pc.id}"
+        data-reveal style="--i:${Math.min(idx, 10)}"
         title="${sealed ? 'Sealed — open to read the terms' : 'Opened · seal spent'}">
       <span class="wax-seal"><span>Dz</span></span>
       <div class="mail-main">
@@ -2810,10 +2986,10 @@ app.get('/profile', requireCompany, (req, res) => {
   const deals = db.prepare('SELECT * FROM deals WHERE company_id = ? ORDER BY created_at DESC LIMIT 50').all(c.id);
   const posts = db.prepare('SELECT * FROM posts WHERE company_id = ? ORDER BY created_at DESC LIMIT 50').all(c.id);
   const dealsHtml = deals.length
-    ? deals.map(d => feedCard(dealFeedItem(d), req.user, names)).join('')
+    ? deals.map((d, idx) => feedCard(dealFeedItem(d), req.user, names, idx)).join('')
     : '<div class="card"><p class="muted">No deals yet — <a href="/deals/new">post your first deal</a>.</p></div>';
   const postsHtml = posts.length
-    ? posts.map(p => feedCard({ kind: 'post', ref_id: p.id, company_id: p.company_id, body: p.body, created_at: p.created_at, media_id: p.media_id }, req.user, names)).join('')
+    ? posts.map((p, idx) => feedCard({ kind: 'post', ref_id: p.id, company_id: p.company_id, body: p.body, created_at: p.created_at, media_id: p.media_id }, req.user, names, idx)).join('')
     : '<div class="card"><p class="muted">No posts yet — share an update from the <a href="/new">create menu</a>.</p></div>';
 
   const coverHtml = c.header_media_id ? `<img class="profile-cover" src="/media/${c.header_media_id}" alt="${esc(c.name)} header image" loading="lazy">` : '';
@@ -2856,10 +3032,10 @@ app.get('/profile', requireCompany, (req, res) => {
     </form>
   </div>
   <div class="stats">
-    <div class="stat"><div class="num gold">${deals.length}</div><div class="lbl">My deals</div></div>
-    <div class="stat"><div class="num">${posts.length}</div><div class="lbl">My posts</div></div>
-    <div class="stat"><div class="num mint">${fc.followers}</div><div class="lbl">Followers</div></div>
-    <div class="stat"><div class="num">${fc.following}</div><div class="lbl">Following</div></div>
+    <div class="stat" data-reveal style="--i:0"><div class="num gold" data-count="${deals.length}">${deals.length}</div><div class="lbl">My deals</div></div>
+    <div class="stat" data-reveal style="--i:1"><div class="num" data-count="${posts.length}">${posts.length}</div><div class="lbl">My posts</div></div>
+    <div class="stat" data-reveal style="--i:2"><div class="num mint" data-count="${fc.followers}">${fc.followers}</div><div class="lbl">Followers</div></div>
+    <div class="stat" data-reveal style="--i:3"><div class="num" data-count="${fc.following}">${fc.following}</div><div class="lbl">Following</div></div>
   </div>
   <h2 class="sec-h">My deals</h2>
   ${dealsHtml}
@@ -2918,7 +3094,7 @@ app.get('/dashboard', requireCompany, (req, res) => {
     ['Contracts I signed', stats.signedPending + ' pending · ' + stats.signedApproved + ' approved', ''],
     ['Contracts on my deals', stats.minePending + ' pending · ' + stats.mineApproved + ' approved', '']
   ];
-  const tilesHtml = `<div class="stats">${tiles.map(([l, n, cls]) => `<div class="stat"><div class="num${cls}">${n}</div><div class="lbl">${l}</div></div>`).join('')}</div>`;
+  const tilesHtml = `<div class="stats">${tiles.map(([l, n, cls], ti) => `<div class="stat" data-reveal style="--i:${Math.min(ti, 10)}"><div class="num${cls}"${typeof n === 'number' ? ` data-count="${n}"` : ''}>${n}</div><div class="lbl">${l}</div></div>`).join('')}</div>`;
 
   // My deals table + per-deal chart data
   const myDeals = db.prepare('SELECT * FROM deals WHERE company_id = ? ORDER BY created_at DESC LIMIT 50').all(myId);
@@ -2942,11 +3118,11 @@ app.get('/dashboard', requireCompany, (req, res) => {
   const statusRows = db.prepare(`SELECT status, COUNT(*) AS n FROM contracts WHERE signer_company_id = ? OR owner_company_id = ? GROUP BY status`).all(myId, myId);
 
   const barCard = myDeals.length
-    ? `<div class="card"><h3>Likes &amp; comments per deal</h3><div class="chart-wrap"><canvas id="chart-deals"></canvas></div></div>`
-    : `<div class="card"><h3>Likes &amp; comments per deal</h3><div class="dash-empty">No deals yet — this chart appears once you publish a deal.</div></div>`;
+    ? `<div class="card" data-reveal><h3>Likes &amp; comments per deal</h3><div class="chart-wrap"><canvas id="chart-deals"></canvas></div></div>`
+    : `<div class="card" data-reveal><h3>Likes &amp; comments per deal</h3><div class="dash-empty">No deals yet — this chart appears once you publish a deal.</div></div>`;
   const doughnutCard = statusRows.length
-    ? `<div class="card"><h3>My contract statuses</h3><div class="chart-wrap"><canvas id="chart-contracts"></canvas></div></div>`
-    : `<div class="card"><h3>My contract statuses</h3><div class="dash-empty">No contracts yet — sign a deal or receive a signature to see the breakdown.</div></div>`;
+    ? `<div class="card" data-reveal><h3>My contract statuses</h3><div class="chart-wrap"><canvas id="chart-contracts"></canvas></div></div>`
+    : `<div class="card" data-reveal><h3>My contract statuses</h3><div class="dash-empty">No contracts yet — sign a deal or receive a signature to see the breakdown.</div></div>`;
 
   const chartScript = `
   <script>
@@ -2991,7 +3167,7 @@ app.get('/dashboard', requireCompany, (req, res) => {
     <a class="btn btn-sm${stats.inboxActions ? '' : ' btn-outline'}" href="/deals/inbox">Open inbox${stats.inboxActions ? ` <span class="unread-chip" style="margin-left:6px">${stats.inboxActions}</span>` : ''}</a>
   </div>
   ${tilesHtml}
-  <div class="card"><h3>My deals</h3>
+  <div class="card" data-reveal><h3>My deals</h3>
     <table><tr><th>Title</th><th>Value</th><th>Likes</th><th>Comments</th><th>Contract</th></tr>${dealsRows}</table></div>
   ${barCard}
   ${doughnutCard}
@@ -3268,8 +3444,8 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
     ['Total companies', stats.companies, ''], ['Pending', stats.pending, ''], ['Approved', stats.approved, ' mint'],
     ['Flagged ⚠️', stats.flagged, ''], ['Deals', stats.deals, ' gold'], ['Contracts pending', stats.contractsPending, ' gold'],
     ['Follows', stats.follows, '']
-  ].map(([l, n, cls]) => `<div class="stat"><div class="num${cls}">${n}</div><div class="lbl">${l}</div></div>`).join('')}
-    <div class="stat"><div class="num gold" style="font-size:1.15rem;line-height:1.4">${commissionText}</div><div class="lbl">Platform commission (approved deals) · ${PLATFORM_FEE_PCT}%</div></div></div>`;
+  ].map(([l, n, cls], ti) => `<div class="stat" data-reveal style="--i:${Math.min(ti, 10)}"><div class="num${cls}" data-count="${n}">${n}</div><div class="lbl">${l}</div></div>`).join('')}
+    <div class="stat" data-reveal style="--i:7"><div class="num gold" style="font-size:1.15rem;line-height:1.4">${commissionText}</div><div class="lbl">Platform commission (approved deals) · ${PLATFORM_FEE_PCT}%</div></div></div>`;
 
   // Pending companies queue (with ONBOARDING AGENT flags)
   const pending = db.prepare(`SELECT * FROM companies WHERE status = 'pending' ORDER BY created_at ASC`).all();
@@ -3358,13 +3534,13 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
   const body = `
   <h2 class="sec-h" style="margin-top:0;margin-bottom:14px">🛡️ Admin dashboard</h2>
   ${statsHtml}
-  <div class="card"><h3>Pending companies</h3>
+  <div class="card" data-reveal><h3>Pending companies</h3>
     <table><tr><th>Company</th><th>Registered</th><th>Actions</th></tr>${pendingHtml}</table></div>
-  <div class="card"><h3>Pending contracts — final approval</h3>
+  <div class="card" data-reveal><h3>Pending contracts — final approval</h3>
     <table><tr><th>Deal</th><th>Parties</th><th>Signed at</th><th>Actions</th></tr>${contractsHtml}</table></div>
-  <div class="card"><h3>All companies</h3>
+  <div class="card" data-reveal><h3>All companies</h3>
     <table><tr><th>Company</th><th>Status</th><th>Reputation</th><th>Actions</th></tr>${companiesHtml}</table></div>
-  <div class="card"><h3>All deals</h3>
+  <div class="card" data-reveal><h3>All deals</h3>
     <table><tr><th>Deal</th><th>Actions</th></tr>${dealsHtml}</table></div>
   <div class="card"><h3>Change admin password</h3>
     <form method="POST" action="/admin/password" style="max-width:380px">
@@ -3373,7 +3549,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
       <button class="btn btn-sm" type="submit">Update password</button>
       <p class="muted" style="margin-top:8px">Stored as a salted hash in the settings table; the env var remains a fallback until changed.</p>
     </form></div>
-  <div class="card"><h3>🤖 Agent activity (latest 50)</h3>
+  <div class="card" data-reveal><h3>🤖 Agent activity (latest 50)</h3>
     <table><tr><th>Time (UTC)</th><th>Agent</th><th>Action</th><th>Result</th><th>Details</th></tr>${auditHtml}</table></div>`;
   res.send(page('Admin dashboard', body, req.user, req.query.msg, req.query.err));
 });
