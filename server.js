@@ -228,6 +228,23 @@ try { db.exec("ALTER TABLE deals ADD COLUMN status_note TEXT DEFAULT ''"); } cat
 try { db.exec("ALTER TABLE deals ADD COLUMN tracking_number TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
 try { db.exec("ALTER TABLE deals ADD COLUMN tracking_url TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
 try { db.exec('ALTER TABLE deals ADD COLUMN contract_party_id INTEGER'); } catch (e) { /* column already exists */ }
+
+// Shipment tracking map: optional destination + lazily-resolved geocoordinates for origin/destination.
+try { db.exec("ALTER TABLE deals ADD COLUMN destination TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE deals ADD COLUMN dest_lat REAL'); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE deals ADD COLUMN dest_lng REAL'); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE deals ADD COLUMN origin_lat REAL'); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE deals ADD COLUMN origin_lng REAL'); } catch (e) { /* column already exists */ }
+
+// Persistent geocoding cache (Nominatim lookups are lazy and cached forever; failures are not cached).
+db.exec(`
+CREATE TABLE IF NOT EXISTS geocache (
+  place      TEXT PRIMARY KEY,
+  lat        REAL,
+  lng        REAL,
+  created_at TEXT NOT NULL
+);
+`);
 // Unique deal numbers (DZ-<year>-<seq>); old rows stay NULL until backfilled below.
 try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_deals_deal_number ON deals(deal_number)'); } catch (e) { /* index may already exist */ }
 
@@ -1041,6 +1058,13 @@ const CSS = `
     --guilloche:     repeating-radial-gradient(circle at 50% -60%, transparent 0 7px, rgba(140,110,40,0.06) 7px 8px);
     --radius-card:   16px;
     --radius-ctl:    10px;
+    /* KINETIC physics system — 6 named easings */
+    --ez-out:     cubic-bezier(.16,1,.3,1);     /* ENTRANCES — fast attack, long silk settle */
+    --ez-spring:  cubic-bezier(.34,1.56,.64,1); /* POPS — overshoot: likes, badges, magnet release */
+    --ez-slam:    cubic-bezier(.55,0,.84,.36);  /* STRIKES — accelerating: wax stamp, coin drop */
+    --ez-press:   cubic-bezier(.3,0,.2,1);      /* PRESS DOWN — 80–120ms */
+    --ez-release: cubic-bezier(.22,1.4,.36,1);  /* RELEASE — small settle bounce */
+    --ez-drift:   cubic-bezier(.45,0,.55,1);    /* AMBIENT LOOPS — symmetric, seamless */
   }
   /* Light theme — "Day Ledger": 100% beige-family parchment, espresso ink, darkened bullion gold. No white anywhere. */
   [data-theme="light"] {
@@ -1137,11 +1161,11 @@ const CSS = `
   .avatar { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; border-radius: 10px; background: var(--bg-spotlight); border: 1px solid var(--border-soft); color: var(--gold); font-family: var(--font-display); font-weight: 700; font-size: 15px; vertical-align: middle; margin-right: 8px; }
 
   /* Buttons — primary .btn is the struck gold coin (reeded bottom edge) */
-  .btn { display: inline-block; background: var(--gradient-coin); color: var(--on-gold); border: 1px solid transparent; border-radius: 10px; padding: 0.7rem 1.4rem; font: 600 0.9375rem var(--font-body); cursor: pointer; transition: all .18s ease; box-shadow: var(--gold-shadow-md), inset 0 1px 0 rgba(255,255,255,0.35); }
-  .btn:not(.btn-outline):not(.btn-danger):not(.btn-green) { position: relative; overflow: hidden; }
+  .btn { position: relative; overflow: hidden; display: inline-block; background: var(--gradient-coin); color: var(--on-gold); border: 1px solid transparent; border-radius: 10px; padding: 0.7rem 1.4rem; font: 600 0.9375rem var(--font-body); cursor: pointer; transition: all .18s var(--ez-release); box-shadow: var(--gold-shadow-md), inset 0 1px 0 rgba(255,255,255,0.35); }
   .btn:not(.btn-outline):not(.btn-danger):not(.btn-green)::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: var(--coin-reed); opacity: .35; pointer-events: none; }
   .btn:hover { transform: translateY(-2px); box-shadow: var(--gold-shadow-lg); color: var(--on-gold); }
-  .btn:active { transform: translateY(0); box-shadow: var(--gold-shadow-md); }
+  /* KINETIC press contract: 90ms hard press, spring-eased release (release easing lives on .btn) */
+  .btn:active { transform: scale(.94); box-shadow: var(--gold-shadow-md); transition-duration: .09s; transition-timing-function: var(--ez-press); }
   .btn:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
   .btn-sm { padding: 5px 11px; font-size: 13px; }
   .btn-outline { background: transparent; color: var(--ink-primary); border-color: var(--border-soft); box-shadow: none; }
@@ -1395,81 +1419,78 @@ const CSS = `
   .stepper .step-lbl { display: block; margin-top: 6px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-faint); }
   .stepper .step-node.done .step-lbl, .stepper .step-node.current .step-lbl { color: var(--gold); }
   @media (prefers-reduced-motion: no-preference) {
-    html.dz-js .stepper .step-node { opacity: 0; animation: dz-rise .45s cubic-bezier(.2,.7,.25,1) forwards; animation-delay: calc(var(--i, 0) * 90ms); }
+    html.dz-js .stepper .step-node { opacity: 0; animation: dz-rise .45s var(--ez-out) forwards; animation-delay: calc(var(--i, 0) * 90ms); }
     .stepper .step-node.current .step-dot { animation: dz-steppulse 2.2s ease-in-out infinite; }
     @keyframes dz-steppulse { 0%, 100% { box-shadow: 0 0 0 3px var(--gold-glow); } 50% { box-shadow: 0 0 0 7px var(--gold-glow); } }
+    /* KINETIC: animated gold fill on the stepper bar + pop as each dot is reached */
+    .stepper__bar::after { animation: kf-stepfill .9s var(--ez-out) both; }
+    @keyframes kf-stepfill { from { width: 0; } }
+    .stepper .step-node.done .step-dot { animation: kf-pop .4s var(--ez-spring); }
+    /* KINETIC map pins: pulsing trust rings on the Leaflet ship dot + origin/destination markers */
+    .dz-ship-dot::after, .dz-marker::after { content: ""; position: absolute; inset: -5px; border-radius: 50%;
+      border: 2px solid currentColor; animation: kf-pin 2s var(--ez-out) infinite; }
+    .dz-ship-dot { color: var(--gold); } /* already positioned by Leaflet (.leaflet-marker-icon) */
+    .dz-marker-gold { color: var(--gold); }
+    .dz-marker-mint { color: var(--mint); }
+    .dz-pulse::before { animation-timing-function: var(--ez-out); }
   }
 
   /* ==================== MOTION DESIGN LAYER ====================
      Living trading-floor feel: drifting atmosphere, choreographed entrances,
      micro-interactions. All motion is gated behind prefers-reduced-motion. */
 
-  /* Atmosphere — fixed aurora layers behind all content (painted over the
-     propagated body background, under everything else). Dark: deep gold nebula
-     with a whisper of mint. Transform-only drift = GPU-friendly. */
-  body::before {
-    content: ""; position: fixed; inset: -15%; z-index: -1; pointer-events: none;
-    background:
-      radial-gradient(38% 32% at 18% 22%, rgba(245,185,66,0.10), transparent 70%),
-      radial-gradient(34% 30% at 82% 14%, rgba(63,224,176,0.06), transparent 70%),
-      radial-gradient(42% 38% at 55% 88%, rgba(245,185,66,0.07), transparent 70%);
-    will-change: transform;
-  }
-  body::after {
-    content: ""; position: fixed; inset: -15%; z-index: -1; pointer-events: none;
-    background:
-      radial-gradient(30% 26% at 70% 62%, rgba(245,185,66,0.06), transparent 70%),
-      radial-gradient(26% 24% at 12% 78%, rgba(63,224,176,0.05), transparent 70%);
-    will-change: transform;
-  }
-  /* Light theme — warm parchment light-play (bullion amber on beige, faint mint). */
-  [data-theme="light"] body::before {
-    background:
-      radial-gradient(38% 32% at 18% 22%, rgba(217,160,43,0.16), transparent 70%),
-      radial-gradient(34% 30% at 82% 14%, rgba(11,122,88,0.08), transparent 70%),
-      radial-gradient(42% 38% at 55% 88%, rgba(169,118,15,0.11), transparent 70%);
-  }
-  [data-theme="light"] body::after {
-    background:
-      radial-gradient(30% 26% at 70% 62%, rgba(240,198,104,0.14), transparent 70%),
-      radial-gradient(26% 24% at 12% 78%, rgba(11,122,88,0.06), transparent 70%);
-  }
+  /* ==================== KINETIC — Living background ====================
+     Orbiting vault light + faint scrolling ledger grid. Radial gradients only
+     (no blur filters), transform/opacity only, theme-aware. The markup lives
+     once as the first child of <body>: .bg-fx > .bg-grid + .orb--gold + .orb--mint. */
+  .bg-fx { position: fixed; inset: 0; z-index: -1; overflow: hidden; pointer-events: none; }
+  .orb { position: absolute; width: 46vmax; height: 46vmax; border-radius: 50%; }
+  .orb--gold { top: -14vmax; left: -10vmax; background: radial-gradient(circle, rgba(245,185,66,.10), transparent 65%);
+    animation: kf-orb-a 62s var(--ez-drift) infinite alternate; }
+  .orb--mint { bottom: -16vmax; right: -12vmax; background: radial-gradient(circle, rgba(63,224,176,.07), transparent 65%);
+    animation: kf-orb-b 84s var(--ez-drift) infinite alternate; }
+  [data-theme="light"] .orb--gold { background: radial-gradient(circle, rgba(138,92,8,.09), transparent 65%); }
+  [data-theme="light"] .orb--mint { background: radial-gradient(circle, rgba(11,122,88,.06), transparent 65%); }
+  @keyframes kf-orb-a { to { transform: translate(16vw,12vh) scale(1.18); } }
+  @keyframes kf-orb-b { to { transform: translate(-14vw,-10vh) scale(1.12); } }
+  .bg-grid { position: absolute; inset: -60%; opacity: .5;
+    background: linear-gradient(rgba(245,185,66,.05) 1px, transparent 1px), linear-gradient(90deg, rgba(245,185,66,.05) 1px, transparent 1px);
+    background-size: 56px 56px; animation: kf-grid 36s linear infinite;
+    -webkit-mask: radial-gradient(70% 60% at 50% 40%, #000, transparent); mask: radial-gradient(70% 60% at 50% 40%, #000, transparent); }
+  [data-theme="light"] .bg-grid { background: linear-gradient(rgba(138,92,8,.06) 1px, transparent 1px), linear-gradient(90deg, rgba(138,92,8,.06) 1px, transparent 1px); background-size: 56px 56px; }
+  @keyframes kf-grid { to { transform: translate(56px,56px); } }
+
+  /* ==================== KINETIC — Choreography ====================
+     Load staging (nav -> hero -> cards), IO scroll reveals, MPA page transitions.
+     Every hidden-by-default state is gated behind .js so no-JS = fully visible. */
+  .js .a-enter { opacity: 0; transform: translateY(18px); animation: kf-rise .7s var(--ez-out) both;
+    animation-delay: calc(var(--i,0) * 90ms + var(--stage,0ms)); }
+  [data-stage="hero"] { --stage: 250ms; }
+  [data-stage="cards"] { --stage: 500ms; }
+  @keyframes kf-rise { to { opacity: 1; transform: none; } }
+  /* Scroll reveal: .rv (or legacy [data-reveal]) + optional --i; JS adds .is-in at 18% visibility */
+  .js .rv, .js [data-reveal] { opacity: 0; transform: translateY(22px) scale(.985);
+    transition: opacity .6s var(--ez-out), transform .6s var(--ez-out); transition-delay: calc(var(--i,0) * 70ms); }
+  .js .rv.is-in, .js [data-reveal].is-in { opacity: 1; transform: none; }
+  /* New feed item (server re-render or JS insert) */
+  .feed-in { animation: kf-feed .55s var(--ez-spring) both; }
+  @keyframes kf-feed { from { opacity: 0; transform: translateY(14px) scale(.96); } }
+  /* MPA page transitions: fade/slide in on load, 170ms out on same-origin nav clicks */
+  .js body { animation: kf-pagein .32s var(--ez-out); }
+  @keyframes kf-pagein { from { opacity: 0; transform: translateY(-6px); } }
+  body.is-leaving { opacity: 0; transform: translateY(10px); transition: opacity .17s var(--ez-press), transform .17s var(--ez-press); }
 
   @media (prefers-reduced-motion: no-preference) {
-    /* --- Atmosphere drift: slow 30-45s loops, translate/scale only --- */
-    body::before { animation: dz-drift-a 42s ease-in-out infinite alternate; }
-    body::after  { animation: dz-drift-b 34s ease-in-out infinite alternate; }
-    @keyframes dz-drift-a {
-      from { transform: translate3d(0, 0, 0) scale(1); }
-      50%  { transform: translate3d(2.5%, -2%, 0) scale(1.06); }
-      to   { transform: translate3d(-2%, 2.5%, 0) scale(1.02); }
-    }
-    @keyframes dz-drift-b {
-      from { transform: translate3d(0, 0, 0) scale(1.03); }
-      50%  { transform: translate3d(-3%, 2%, 0) scale(1); }
-      to   { transform: translate3d(2%, -2.5%, 0) scale(1.07); }
-    }
-
-    /* --- Page fade-in (class added by the head/footer scripts) --- */
-    html.dz-js body { opacity: 0; transform: translateY(10px); }
-    html.dz-js body.dz-in { opacity: 1; transform: none; transition: opacity .22s ease-out, transform .22s ease-out; }
-
-    /* --- Staggered entrance + scroll reveal ---
-       Hidden only until .in-view lands; animation uses fill-mode "backwards"
-       so hover transforms keep working after the entrance completes. */
-    html.dz-js [data-reveal]:not(.in-view) { opacity: 0; }
-    html.dz-js [data-reveal].in-view { animation: dz-rise .55s cubic-bezier(.2, .7, .25, 1) backwards; animation-delay: calc(var(--i, 0) * 60ms); }
     @keyframes dz-rise { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
 
-    /* --- Buttons: shine sweep on the struck-gold primary, press feedback --- */
+    /* --- Buttons: shine sweep on the struck-gold primary --- */
     .btn:not(.btn-outline):not(.btn-danger):not(.btn-green)::before {
       content: ""; position: absolute; top: -10%; bottom: -10%; left: 0; width: 45%;
       background: linear-gradient(105deg, transparent 0%, rgba(255,255,255,0.5) 50%, transparent 100%);
       transform: translateX(-170%) skewX(-18deg); transition: transform .55s ease; pointer-events: none;
     }
     .btn:not(.btn-outline):not(.btn-danger):not(.btn-green):hover::before { transform: translateX(330%) skewX(-18deg); }
-    .btn:active { transform: scale(.97); }
-    .btn-outline { transition: border-color .18s ease, transform .18s ease, background .18s ease, color .18s ease; }
+    .btn-outline { transition: border-color .18s var(--ez-release), transform .18s var(--ez-release), background .18s var(--ez-release), color .18s var(--ez-release); }
     .btn-outline:hover { transform: translateY(-1px); border-color: var(--gold); }
 
     /* --- Cards: hover lift with stronger gold shadow + border glow --- */
@@ -1495,7 +1516,7 @@ const CSS = `
     /* --- Like button: one-time heart-burst pop on render when .liked --- */
     .btn.liked { animation: dz-likeburst .3s ease-out; }
     @keyframes dz-likeburst { 0% { transform: scale(1); } 40% { transform: scale(1.35); } 100% { transform: scale(1); } }
-    .feed-actions .btn:active { transform: scale(.93); }
+    /* press feedback unified under the KINETIC contract on .btn:active */
 
     /* --- Flash messages: slide-in + 5s countdown progress bar (matches auto-dismiss) --- */
     .flash-ok, .flash-err { position: relative; overflow: hidden; }
@@ -1564,6 +1585,153 @@ const CSS = `
   .cal-event.cal-signing { background: rgba(63,224,176,.14); color: var(--mint); }
   @media (max-width: 700px) { .cal-cell { min-height: 52px; } .cal-event { font-size: 10px; } }
 
+  /* --- Shipment tracking maps (library + tiles via CDN on map pages only, no API keys) --- */
+  .map-embed { height: 350px; border-radius: 14px; border: 1px solid var(--border-gold); overflow: hidden;
+    margin-top: 10px; background: var(--bg-elevated); box-shadow: var(--gold-shadow-sm); }
+  .map-embed.map-full { height: min(62vh, 560px); margin-top: 14px; }
+  .map-fallback { display: flex; align-items: center; justify-content: center; height: 100%; padding: 22px;
+    text-align: center; color: var(--ink-muted); font-size: 0.9rem;
+    background: repeating-linear-gradient(45deg, var(--gold-glow) 0 14px, transparent 14px 28px), var(--bg-elevated); }
+  .map-placeholder { border: 1px dashed var(--border-gold); }
+  /* Round map markers: gold = origin / other companies, mint = destination / my company. */
+  .dz-marker { border-radius: 50%; border: 2px solid rgba(255,255,255,.35); }
+  .dz-marker-gold { background: var(--gold); box-shadow: 0 0 12px var(--gold); }
+  .dz-marker-mint { background: var(--mint); box-shadow: 0 0 12px var(--mint); }
+  .dz-ship-dot { background: var(--gold-bright); border-radius: 50%; border: 2px solid var(--on-gold);
+    box-shadow: 0 0 0 4px var(--gold-glow), 0 0 14px var(--gold); }
+  /* Pulsing in-transit markers on the global tracking map. */
+  .dz-pulse { display: block; width: 14px; height: 14px; border-radius: 50%; position: relative; }
+  .dz-pulse-gold { background: var(--gold); box-shadow: 0 0 10px var(--gold); }
+  .dz-pulse-mint { background: var(--mint); box-shadow: 0 0 10px var(--mint); }
+  .dz-pulse::before { content: ''; position: absolute; inset: -7px; border-radius: 50%;
+    border: 2px solid currentColor; opacity: .7; animation: dz-ping 1.8s ease-out infinite; }
+  .dz-pulse-gold::before { color: var(--gold); }
+  .dz-pulse-mint::before { color: var(--mint); }
+  @keyframes dz-ping { 0% { transform: scale(.5); opacity: .8; } 100% { transform: scale(1.7); opacity: 0; } }
+  /* In-transit strip on /tracking. */
+  .track-strip { display: flex; gap: 12px; overflow-x: auto; padding: 4px 2px 12px; }
+  .track-card { min-width: 250px; flex: 0 0 auto; padding: 12px 14px; }
+  .track-card h4 { margin: 0 0 6px; }
+
+  /* ==================== KINETIC — Signature moment: THE MINT ====================
+     The 96px brand coin drops from off-screen, spins two full turns, strikes the
+     ledger with a squash and fires a gold shockwave ring — then idles in a slow
+     3D float. One per page, hero only. JS gates the drop to once per session
+     (.is-mint); repeat visits get .is-static (fully static coin); click re-flips. */
+  .coin-hero { width: 96px; height: 96px; border-radius: 50%; display: grid; place-items: center; position: relative; cursor: pointer;
+    margin: 0 auto; user-select: none; -webkit-user-select: none;
+    background: var(--gradient-coin); font: 700 2rem var(--font-display); color: #14100A;
+    box-shadow: inset 0 0 0 3px rgba(0,0,0,.18), inset 0 2px 4px rgba(255,255,255,.4), var(--shadow-gold);
+    animation: kf-float 6s var(--ez-drift) infinite; }
+  .coin-hero::before { content: ""; position: absolute; inset: 0; border-radius: 50%; opacity: .5;
+    background: repeating-conic-gradient(rgba(0,0,0,.28) 0 3deg, transparent 3deg 7deg);
+    -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 6px), #000 calc(100% - 5px));
+            mask: radial-gradient(farthest-side, transparent calc(100% - 6px), #000 calc(100% - 5px)); }
+  .coin-hero::after { content: ""; position: absolute; inset: -6px; border-radius: 50%; border: 2px solid var(--border-gold); opacity: 0; }
+  .coin-hero.is-mint { animation: kf-mint 1.15s var(--ez-out) .15s both, kf-float 6s var(--ez-drift) 1.5s infinite; }
+  .coin-hero.is-mint::after { animation: kf-shock .9s var(--ez-out) .95s; }
+  .coin-hero.is-static, .coin-hero.is-static::after { animation: none; }
+  .coin-hero.is-flip { animation: kf-flip .8s var(--ez-spring), kf-float 6s var(--ez-drift) .9s infinite; }
+  @keyframes kf-mint { 0% { transform: translateY(-40vh) rotateY(720deg) scale(.6); opacity: 0; }
+    55% { transform: translateY(8px) rotateY(1080deg) scale(1.08,.88); opacity: 1; }
+    72% { transform: translateY(-9px) scale(.97,1.05); } 100% { transform: none; } }
+  @keyframes kf-float { 50% { transform: translateY(-6px) rotateY(16deg); } }
+  @keyframes kf-flip { 50% { transform: rotateY(540deg) scale(1.12); } }
+  @keyframes kf-shock { 0% { opacity: .9; transform: scale(.6); } 100% { opacity: 0; transform: scale(2.4); } }
+
+  /* ==================== KINETIC — Deal Floor ticker ====================
+     Live marquee under the nav; the item list is printed twice for a seamless
+     loop. Deal numbers in gold, "NEW" riser pulse in mint. Values never shown.
+     Pauses on hover and (via JS) when off-screen. */
+  .ticker { overflow: hidden; border-bottom: 1px solid var(--border-soft); background: var(--bg-elevated); font: 600 .8125rem var(--font-body); }
+  .ticker__track { display: flex; gap: 2.75rem; width: max-content; padding: .45rem 0; animation: kf-ticker 30s linear infinite; }
+  .ticker:hover .ticker__track { animation-play-state: paused; }
+  .ticker__item { white-space: nowrap; color: var(--ink-muted); }
+  .ticker b { color: var(--gold); font-variant-numeric: tabular-nums; }
+  .ticker .up { color: var(--mint); }
+  .ticker .dn { color: var(--danger); }
+  .ticker .up.new { display: inline-block; animation: kf-newpulse 1.6s var(--ez-drift) infinite; }
+  @keyframes kf-ticker { to { transform: translateX(-50%); } }
+  @keyframes kf-newpulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+
+  /* ==================== KINETIC — Reactive surfaces: tilt, glare, magnet, ripple ==================== */
+  /* Bullion shimmer: cursor-tracked gold glare, driven by --gx/--gy (child div inside .card-deal / .stat) */
+  .card__glare { position: absolute; inset: -45%; pointer-events: none; opacity: 0; transition: opacity .35s var(--ez-out);
+    background: radial-gradient(circle, rgba(245,185,66,.16), transparent 55%); transform: translate(var(--gx,0), var(--gy,0)); }
+  [data-theme="light"] .card__glare { background: radial-gradient(circle, rgba(138,92,8,.14), transparent 55%); }
+  .js-tilt:hover .card__glare { opacity: 1; }
+  .js-tilt { transform: perspective(800px) rotateX(var(--rx,0)) rotateY(var(--ry,0)); will-change: transform; }
+  .js-tilt.is-tilting { transition: transform .05s linear; }
+  .js-tilt:not(.is-tilting) { transition: transform .5s var(--ez-spring), box-shadow .2s ease, border-color .18s ease; }
+  /* The tilt transform owns the element while physics are attached — hover lifts must not fight it */
+  .card-deal.js-tilt:hover, .card.js-tilt:hover, .stat.js-tilt:hover { transform: perspective(800px) rotateX(var(--rx,0)) rotateY(var(--ry,0)); }
+  .card-deal.js-tilt:hover { box-shadow: var(--card-shadow-hover), var(--shadow-gold), 0 0 0 1px var(--border-gold); }
+  /* Magnetic primary buttons: pull within a 40px halo, <=10px travel, spring back */
+  .js-magnet { transition: transform .28s var(--ez-spring); will-change: transform; }
+  /* Click ripples from the exact click point (span injected by the delegated click handler) */
+  .ripple { position: absolute; border-radius: 50%; pointer-events: none; transform: scale(0); z-index: 1;
+    background: color-mix(in srgb, currentColor 28%, transparent); animation: kf-ripple .55s var(--ez-out) forwards; }
+  .btn:not(.btn-outline):not(.btn-danger):not(.btn-green) .ripple { background: rgba(255,255,255,.5); }
+  @keyframes kf-ripple { to { transform: scale(3); opacity: 0; } }
+  /* Press/release contract on every control (restated late so it beats every :hover transform) */
+  .btn:active { transform: scale(.94); transition-duration: .09s; transition-timing-function: var(--ez-press); }
+
+  /* ==================== KINETIC — Micro-interactions ==================== */
+  /* LIKE — gold burst: JS toggles .is-on, spawns 6 .spark particles */
+  .btn-like { position: relative; }
+  .btn-like.btn-outline.is-on { color: var(--gold); border-color: var(--border-gold); } /* ghost -> gold; the liked (gold-fill) state keeps --on-gold ink */
+  .btn-like.is-on .ic { display: inline-block; animation: kf-pop .45s var(--ez-spring); }
+  @keyframes kf-pop { 40% { transform: scale(1.45) rotate(-8deg); } 70% { transform: scale(.92); } }
+  .spark { position: absolute; left: 50%; top: 50%; width: 5px; height: 5px; border-radius: 50%; background: var(--gold);
+    pointer-events: none; animation: kf-spark .6s var(--ez-out) forwards; }
+  @keyframes kf-spark { to { transform: translate(var(--sx), var(--sy)) scale(.2); opacity: 0; } }
+  /* FOLLOW — state morph (min-width keeps layout stable; server or JS swaps .is-following) */
+  .btn-follow { min-width: 112px; transition: all .3s var(--ez-spring); }
+  .btn-follow.is-following { background: transparent; border-color: var(--mint); color: var(--mint); animation: kf-morph .4s var(--ez-spring); }
+  @keyframes kf-morph { 45% { transform: scale(.9,.85); } }
+  /* SEND MESSAGE — fly-off: JS clones the new .bubble.mine into a .fly-clone */
+  .fly-clone { position: fixed; z-index: 60; margin: 0; pointer-events: none; animation: kf-fly .7s var(--ez-out) forwards; }
+  @keyframes kf-fly { 55% { opacity: 1; } to { transform: translate(56px,-90px) scale(.85) rotate(3deg); opacity: 0; } }
+  .js-send.is-sent { animation: kf-kick .4s var(--ez-spring); }
+  @keyframes kf-kick { 40% { transform: rotate(-7deg) scale(.92); } }
+  /* SEAL & SEND — wax stamp slam (pre-submit visual only; never blocks submission) */
+  .wax-seal--fx { opacity: 0; margin-right: 10px; vertical-align: middle; }
+  .wax-seal--stamp { opacity: 1; animation: kf-slam .55s var(--ez-slam) both; }
+  .wax-seal--stamp::after { content: ""; position: absolute; inset: -8px; border-radius: 50%; border: 2px solid var(--border-gold);
+    animation: kf-shock .7s var(--ez-out) .25s both; }
+  @keyframes kf-slam { 0% { transform: scale(2.3) rotate(-24deg); opacity: 0; }
+    60% { transform: scale(.92) rotate(-8deg); opacity: 1; } 80% { transform: scale(1.06) rotate(-8deg); } 100% { transform: scale(1) rotate(-8deg); } }
+  /* UPLOAD DROPZONE — breathing border; drag state kills the loop and locks gold */
+  .dropzone { border: 1.5px dashed var(--border-soft); border-radius: var(--radius-ctl); transition: transform .2s var(--ez-spring);
+    animation: kf-breathe 3.2s var(--ez-drift) infinite; }
+  @keyframes kf-breathe { 50% { border-color: var(--border-gold); box-shadow: 0 0 0 5px rgba(245,185,66,.06); } }
+  [data-theme="light"] .dropzone { animation-name: kf-breathe-l; }
+  @keyframes kf-breathe-l { 50% { border-color: var(--border-gold); box-shadow: 0 0 0 5px rgba(138,92,8,.08); } }
+  .dropzone.is-over { animation: none; border-color: var(--gold); border-style: solid; transform: scale(1.015); }
+  /* THEME TOGGLE — sun/moon spin: JS adds .is-spin for 650ms, swaps glyph at midpoint */
+  .btn-theme .ic { display: inline-block; transition: transform .6s var(--ez-spring); font-style: normal; }
+  .btn-theme.is-spin .ic { transform: rotate(360deg) scale(1.15); }
+  /* STATUS STEPPER — animated gold fill under the node rail (--p set inline), dots pop as reached */
+  .stepper__bar { height: 3px; background: var(--border-soft); border-radius: 2px; overflow: hidden; margin: 2px 34px 0; }
+  .stepper__bar::after { content: ""; display: block; height: 100%; width: var(--p,0%); background: var(--gradient-coin); }
+  /* MAP PINS — mint trust pulse (Leaflet divIcons: ship dot + origin/destination markers) */
+  .pin { position: relative; width: 10px; height: 10px; border-radius: 50%; background: var(--mint); }
+  .pin::after { content: ""; position: absolute; inset: -5px; border-radius: 50%; border: 2px solid var(--mint);
+    animation: kf-pin 2s var(--ez-out) infinite; }
+  @keyframes kf-pin { from { transform: scale(.5); opacity: .9; } to { transform: scale(2.4); opacity: 0; } }
+
+  /* ==================== KINETIC — Data motion: bars, donut, live ticks ==================== */
+  /* Bars: IO adds .is-in to the .chart wrapper; --i per bar for cascade (Chart.js canvases
+     already grow/draw natively on dashboards — this covers CSS bar charts). */
+  .chart .bar { transform: scaleY(0); transform-origin: bottom;
+    transition: transform .9s var(--ez-out); transition-delay: calc(var(--i,0) * 80ms); }
+  .chart.is-in .bar { transform: scaleY(1); }
+  /* Donut: inline SVG — JS strokes .fg[data-p] when revealed */
+  .donut .fg { transition: stroke-dashoffset 1.1s var(--ez-out); }
+  /* Live badge tick: JS re-adds .tick whenever the value changes (dzTick helper) */
+  .tick { animation: kf-tick .5s var(--ez-spring); }
+  @keyframes kf-tick { 35% { transform: scale(1.18); color: var(--gold); } }
+
   /* Reduced motion: kill every animation/transition globally, show content instantly. */
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after {
@@ -1572,6 +1740,10 @@ const CSS = `
       transition-duration: 0.01ms !important;
       scroll-behavior: auto !important;
     }
+    /* KINETIC kill-switch: every entrance/reveal state forced visible, ambient loops stopped */
+    .js .a-enter, .js .rv, .js [data-reveal] { opacity: 1 !important; transform: none !important; animation: none !important; transition: none !important; }
+    .orb, .bg-grid, .ticker__track, .pin::after, .dropzone, .coin-hero, .coin-hero::after, .feed-in { animation: none !important; }
+    .js body { animation: none !important; }
   }
 `;
 
@@ -1585,7 +1757,8 @@ const NAV_ICONS = {
   plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
   bell: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8.5a6 6 0 0 0-12 0c0 6.5-2.5 7.5-2.5 7.5h17S18 15 18 8.5z"/><path d="M10 20a2.2 2.2 0 0 0 4 0"/></svg>',
   contracts: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7.5 9 6 9-6"/></svg>',
-  calendar: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 9.5h18M8 3v4M16 3v4"/><path d="M7.5 14h3M13.5 14h3M7.5 17.5h3"/></svg>'
+  calendar: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 9.5h18M8 3v4M16 3v4"/><path d="M7.5 14h3M13.5 14h3M7.5 17.5h3"/></svg>',
+  globe: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17"/><path d="M12 3.5c2.4 2.3 3.7 5.2 3.7 8.5s-1.3 6.2-3.7 8.5c-2.4-2.3-3.7-5.2-3.7-8.5s1.3-6.2 3.7-8.5z"/></svg>'
 };
 function navIcon(key, href, label, active, badge) {
   const badgeHtml = badge > 0 ? `<span class="nav-badge" aria-label="${badge} unread">${badge > 99 ? '99+' : badge}</span>` : '';
@@ -1602,7 +1775,7 @@ function totalUnread(companyId) {
 }
 
 /** Moon/sun theme toggle button (client-side only, persists to localStorage). */
-const THEME_TOGGLE_BTN = '<button class="nav-ic theme-toggle" id="theme-toggle" type="button" title="Toggle light/dark theme" aria-label="Toggle light/dark theme">🌙</button>';
+const THEME_TOGGLE_BTN = '<button class="nav-ic theme-toggle btn-theme js-theme" id="theme-toggle" type="button" title="Toggle light/dark theme" aria-label="Toggle light/dark theme"><span class="ic">🌙</span></button>';
 
 /** Render the full HTML page shell. */
 function page(title, body, user, msg, err, active, headExtra) {
@@ -1619,6 +1792,7 @@ function page(title, body, user, msg, err, active, headExtra) {
          ${navIcon('chats', '/chats', 'Chats', active, unread)}
          ${navIcon('contracts', '/contracts', 'Contracts', active, contractsUnread)}
          ${navIcon('calendar', '/calendar', 'Calendar', active)}
+         ${navIcon('globe', '/tracking', 'Tracking', active)}
          ${navIcon('bell', '/notifications', 'Notifications', active, notifUnread)}
          ${navIcon('search', '/search', 'Search', active)}
          ${navIcon('profile', '/profile', 'Profile', active)}
@@ -1630,8 +1804,24 @@ function page(title, body, user, msg, err, active, headExtra) {
     : `${THEME_TOGGLE_BTN}
        <a class="navlink" href="/login">Sign in</a>
        <a class="navlink" href="/signup">Register company</a>`;
+  // KINETIC — Deal Floor ticker: latest 5 open deals, server-rendered (deal numbers + categories
+  // only; values are NEVER shown). The item list is printed twice for a seamless marquee loop.
+  // Logged-in pages only; pauses on hover (CSS) and when off-screen (JS below).
+  let ticker = '';
+  if (user) {
+    let tDeals = [];
+    try {
+      tDeals = db.prepare(`SELECT deal_number, category, deal_type FROM deals
+        WHERE COALESCE(status, 'open') = 'open' AND COALESCE(contract_state, '') != 'approved'
+        ORDER BY created_at DESC LIMIT 5`).all();
+    } catch (e) { tDeals = []; }
+    if (tDeals.length) {
+      const items = tDeals.map(d => `<span class="ticker__item"><b>№ ${esc(d.deal_number || '—')}</b> · ${esc(d.category || (d.deal_type === 'buy' ? 'Buying' : 'Selling'))} <span class="up new">▲ NEW</span></span>`).join('');
+      ticker = `<div class="ticker a-enter" data-stage="nav" style="--i:1" role="marquee" aria-label="Deal floor — latest open deals"><div class="ticker__track">${items}${items}</div></div>`;
+    }
+  }
   return `<!DOCTYPE html>
-<html lang="en"><head>
+<html lang="en" class="no-js"><head>
 <script>try{if(localStorage.getItem('dz-theme')==='light'){document.documentElement.dataset.theme='light';}}catch(e){}document.documentElement.classList.add('dz-js');</script>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)} — Dealzoin</title>
@@ -1640,11 +1830,13 @@ function page(title, body, user, msg, err, active, headExtra) {
 <style>${CSS}</style>
 ${headExtra || ''}
 </head><body>
-<nav class="nav">
+<div class="bg-fx" aria-hidden="true"><div class="bg-grid"></div><div class="orb orb--gold"></div><div class="orb orb--mint"></div></div>
+<nav class="nav a-enter" data-stage="nav" style="--i:0">
   <a href="/" class="brand"><span class="coin">Dz</span>Dealzoin</a>
   <span class="spacer"></span>
   ${navLinks}
 </nav>
+${ticker}
 <main class="container">
   ${msg ? `<div class="flash-ok">✓ ${esc(msg)}</div>` : ''}
   ${err ? `<div class="flash-err">⚠ ${esc(err)}</div>` : ''}
@@ -1652,18 +1844,31 @@ ${headExtra || ''}
 </main>
 <div class="footer">Dealzoin — the B2B deal network. Companies only. 🪙</div>
 <script>(function(){
-  var reduce=!!(window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches);
-  // Page fade-in: add the class on the next frame so the CSS transition fires.
-  requestAnimationFrame(function(){if(document.body)document.body.classList.add('dz-in');});
+  /* ===== KINETIC — the one shared script: physics, reactive surfaces, choreography ===== */
+  var RM=!!(window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  var FINE=!!(window.matchMedia&&window.matchMedia('(pointer: fine)').matches);
+  var root=document.documentElement;
+  if(root.classList.replace){root.classList.replace('no-js','js');}
+  if(!root.classList.contains('js')){root.classList.remove('no-js');root.classList.add('js');}
+  /* The Mint — coin drops once per session; repeat visits get a fully static coin. */
+  var mintCoin=document.querySelector('.coin-hero');
+  if(mintCoin){
+    var minted=false;
+    try{minted=sessionStorage.getItem('dz-minted')==='1';}catch(e0){}
+    if(RM||minted){mintCoin.classList.add('is-static');}
+    else{mintCoin.classList.add('is-mint');try{sessionStorage.setItem('dz-minted','1');}catch(e1){}}
+    mintCoin.addEventListener('keydown',function(ev){if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();mintCoin.click();}});
+  }
   // Flash messages: auto-dismiss after 5s (matches the CSS countdown bar).
   setTimeout(function(){document.querySelectorAll('.flash-ok,.flash-err').forEach(function(e){e.style.transition='opacity .4s';e.style.opacity='0';setTimeout(function(){e.remove();},400);});},5000);
-  // Theme toggle (persists to localStorage).
-  var root=document.documentElement,btn=document.getElementById('theme-toggle');
-  function paintIcon(){if(btn)btn.textContent=root.dataset.theme==='light'?'\\u2600\\uFE0F':'\\uD83C\\uDF19';}
+  // Theme toggle (persists to localStorage); glyph swaps at the 360-degree spin midpoint.
+  var btn=document.getElementById('theme-toggle');
+  var btnIc=btn?btn.querySelector('.ic'):null;
+  function paintIcon(){if(btnIc)btnIc.textContent=root.dataset.theme==='light'?'\\u2600\\uFE0F':'\\uD83C\\uDF19';}
   if(btn){paintIcon();btn.addEventListener('click',function(){
     if(root.dataset.theme==='light'){root.removeAttribute('data-theme');}else{root.dataset.theme='light';}
     try{localStorage.setItem('dz-theme',root.dataset.theme==='light'?'light':'dark');}catch(e){}
-    paintIcon();
+    if(RM){paintIcon();}else{setTimeout(paintIcon,325);}
   });}
   // Styled file-input labels.
   document.querySelectorAll('input.file-input').forEach(function(inp){
@@ -1674,11 +1879,11 @@ ${headExtra || ''}
       t.textContent=(inp.files&&inp.files.length)?'\\uD83D\\uDCCE '+Array.prototype.map.call(inp.files,function(f){return f.name;}).join(', '):def;
     });
   });
-  // Stat tiles: count-up 0 -> value over 800ms ease-out (fallback: plain number stays).
+  // Stat tiles: count-up 0 -> value over 800ms ease-out (reduced motion: jumps to final).
   function countUp(el){
     var target=parseFloat(el.getAttribute('data-count'));
     if(!isFinite(target))return;
-    if(reduce){el.textContent=String(target);return;}
+    if(RM){el.textContent=String(target);return;}
     var t0=null,dur=800;
     var step=function(ts){
       if(t0===null)t0=ts;
@@ -1688,25 +1893,123 @@ ${headExtra || ''}
     };
     requestAnimationFrame(step);
   }
-  // Scroll reveal: one shared IntersectionObserver adds .in-view / triggers count-ups.
-  var motionEls=document.querySelectorAll('[data-reveal],[data-count]');
+  /* A) Scroll reveals + charts + donuts + count-ups — one IntersectionObserver, unobserve after fire. */
+  var motionEls=document.querySelectorAll('.rv,[data-reveal],.chart,.donut,[data-count]');
   if('IntersectionObserver' in window&&motionEls.length){
     var io=new IntersectionObserver(function(entries){
       entries.forEach(function(en){
         if(!en.isIntersecting)return;
-        var el=en.target;
-        if(el.hasAttribute('data-reveal'))el.classList.add('in-view');
-        if(el.hasAttribute('data-count')&&!el.getAttribute('data-counted')){el.setAttribute('data-counted','1');countUp(el);}
-        io.unobserve(el);
+        var t=en.target;
+        t.classList.add('is-in');
+        if(t.hasAttribute('data-reveal'))t.classList.add('in-view');
+        var f=t.querySelector?t.querySelector('.fg[data-p]'):null;
+        if(f){var L=2*Math.PI*18;f.style.strokeDasharray=L;f.style.strokeDashoffset=L;
+          requestAnimationFrame(function(){requestAnimationFrame(function(){f.style.strokeDashoffset=L*(1-parseFloat(f.getAttribute('data-p'))/100);});});}
+        if(t.hasAttribute('data-count')&&!t.getAttribute('data-counted')){t.setAttribute('data-counted','1');countUp(t);}
+        io.unobserve(t);
       });
-    },{threshold:0.12});
+    },{threshold:0.18});
     motionEls.forEach(function(el){io.observe(el);});
   }else{
     motionEls.forEach(function(el){
+      el.classList.add('is-in');
       if(el.hasAttribute('data-reveal'))el.classList.add('in-view');
       if(el.hasAttribute('data-count'))countUp(el);
     });
   }
+  /* B) Pause the Deal Floor ticker while it is off-screen. */
+  var tk=document.querySelector('.ticker__track');
+  if(tk&&'IntersectionObserver' in window){
+    new IntersectionObserver(function(es){es.forEach(function(e){tk.style.animationPlayState=e.isIntersecting?'':'paused';});}).observe(tk);
+  }
+  /* C) Tilt + gold glare — fine pointers only; touch devices never get tilt listeners. */
+  if(FINE&&!RM)document.querySelectorAll('.js-tilt').forEach(function(t){
+    t.addEventListener('pointermove',function(e){
+      var r=t.getBoundingClientRect(),
+      x=(e.clientX-r.left)/r.width-.5,y=(e.clientY-r.top)/r.height-.5;
+      t.classList.add('is-tilting');
+      t.style.setProperty('--rx',(-y*8).toFixed(2)+'deg');  /* ±4 deg max */
+      t.style.setProperty('--ry',( x*8).toFixed(2)+'deg');
+      t.style.setProperty('--gx',(x*130)+'px');t.style.setProperty('--gy',(y*130)+'px');
+    });
+    t.addEventListener('pointerleave',function(){
+      t.classList.remove('is-tilting');
+      ['--rx','--ry','--gx','--gy'].forEach(function(p){t.style.removeProperty(p);});
+    });
+  });
+  /* D) Magnetic buttons — 40px halo, <=10px pull, rAF-throttled. */
+  var M=[].slice.call(document.querySelectorAll('.js-magnet'));
+  if(FINE&&!RM&&M.length){var raf=0;
+    addEventListener('pointermove',function(e){
+      if(raf)return;
+      raf=requestAnimationFrame(function(){raf=0;
+        M.forEach(function(b){
+          var r=b.getBoundingClientRect(),dx=e.clientX-(r.left+r.width/2),dy=e.clientY-(r.top+r.height/2),
+          d=Math.hypot(dx,dy),halo=Math.max(r.width,r.height)/2+40;
+          if(d<halo){
+            var tx=dx*.22,ty=dy*.22,m=Math.hypot(tx,ty);
+            if(m>10){tx=tx/m*10;ty=ty/m*10;}
+            b.style.transform='translate('+tx.toFixed(1)+'px,'+ty.toFixed(1)+'px)';
+          }else{b.style.transform='';}
+        });
+      });
+    },{passive:true});
+  }
+  /* E) Delegated clicks: ripple, like burst, coin re-flip, theme spin, send kick, seal slam, page-out. */
+  addEventListener('click',function(e){
+    var tgt=e.target&&e.target.closest?e.target:null;
+    if(!tgt)return;
+    var b=tgt.closest('.btn');
+    if(b&&!RM){var r=b.getBoundingClientRect(),d=Math.max(r.width,r.height)*1.1,s=document.createElement('span');
+      s.className='ripple';
+      s.style.cssText='width:'+d+'px;height:'+d+'px;left:'+(e.clientX-r.left-d/2)+'px;top:'+(e.clientY-r.top-d/2)+'px';
+      b.appendChild(s);s.addEventListener('animationend',function(){s.remove();});}
+    var lk=tgt.closest('.btn-like');
+    if(lk){lk.classList.toggle('is-on');
+      if(!RM&&lk.classList.contains('is-on'))for(var i=0;i<6;i++){
+        var sp=document.createElement('span'),an=i*60+Math.random()*24;
+        sp.className='spark';
+        sp.style.setProperty('--sx',Math.cos(an*Math.PI/180)*34+'px');
+        sp.style.setProperty('--sy',Math.sin(an*Math.PI/180)*34+'px');
+        lk.appendChild(sp);sp.addEventListener('animationend',function(){this.remove();});}}
+    var coin=tgt.closest('.coin-hero');
+    if(coin&&!RM){coin.classList.remove('is-flip');void coin.offsetWidth;coin.classList.add('is-flip');}
+    var th=tgt.closest('.js-theme');
+    if(th&&!RM){th.classList.add('is-spin');setTimeout(function(){th.classList.remove('is-spin');},650);}
+    var sd=tgt.closest('.js-send');
+    if(sd&&!RM){sd.classList.remove('is-sent');void sd.offsetWidth;sd.classList.add('is-sent');}
+    /* Wax-stamp slam on mailbox send — pre-submit visual only, never blocks submission. */
+    var sl=tgt.closest('.js-sealsend');
+    if(sl&&!RM){var fm=sl.closest('form');var wx=fm?fm.querySelector('.wax-seal--fx'):null;
+      if(wx){wx.classList.remove('wax-seal--stamp');void wx.offsetWidth;wx.classList.add('wax-seal--stamp');}}
+    /* MPA page-out: 170ms fade/slide before same-origin navigations (bfcache restores via pageshow). */
+    var a=tgt.closest('a[href]');
+    if(a&&!RM&&!a.target&&!e.metaKey&&!e.ctrlKey&&!a.hasAttribute('download')){
+      var href=a.getAttribute('href')||'';
+      if(href.charAt(0)!=='#'&&new URL(a.href,location.href).origin===location.origin){
+        e.preventDefault();document.body.classList.add('is-leaving');
+        setTimeout(function(){location.href=a.href;},170);
+      }
+    }
+  });
+  addEventListener('pageshow',function(){document.body.classList.remove('is-leaving');});
+  /* F) Send fly-off — dzFly(lastBubbleEl); auto-wired to the chat form (optimistic bubble). */
+  window.dzFly=function(el){if(RM||!el)return;
+    var r=el.getBoundingClientRect(),c=el.cloneNode(true);
+    c.classList.add('fly-clone');
+    c.style.cssText='left:'+r.left+'px;top:'+r.top+'px;width:'+r.width+'px';
+    document.body.appendChild(c);c.addEventListener('animationend',function(){c.remove();});};
+  /* G) Live tick helper — call after updating a stat/badge: dzTick(el) */
+  window.dzTick=function(el){if(RM||!el)return;el.classList.remove('tick');void el.offsetWidth;el.classList.add('tick');};
+  var chatForm=document.getElementById('chatform');
+  if(chatForm)chatForm.addEventListener('submit',function(){
+    if(RM)return;
+    setTimeout(function(){
+      var box=document.getElementById('chatbox');
+      var last=box?box.querySelector('.bubble.mine:last-child'):null;
+      if(last)window.dzFly(last);
+    },0);
+  });
 })();</script>
 </body></html>`;
 }
@@ -1780,9 +2083,187 @@ function stepperHtml(deal) {
     const cls = closed || i < doneThrough ? 'done' : (i === doneThrough ? (closed ? 'done' : 'current done') : '');
     return `<div class="step-node ${cls}" style="--i:${i}"><span class="step-dot">${closed || i <= doneThrough ? '✓' : (i + 1)}</span><span class="step-lbl">${esc(s)}</span></div>`;
   }).join('');
+  const fillPct = closed ? 100 : Math.round((doneThrough / (DEAL_STATUSES.length - 1)) * 100);
   return `<div class="stepper" role="list" aria-label="Deal status">${nodes}</div>`
+    + `<div class="stepper__bar" aria-hidden="true" style="--p:${fillPct}%"></div>`
     + (closed ? '<p style="margin-top:8px"><span class="badge badge-contract">Deal closed — contract finalized ✓</span></p>' : '');
 }
+
+// ----- Shipment tracking maps (Leaflet 1.9.4 + OpenStreetMap via CDN, no API keys) -----
+/** Leaflet assets + leaflet-only theme overrides — loaded ONLY on pages that render a map,
+ *  via the page() headExtra slot. No API keys anywhere; tiles come from OpenStreetMap. */
+const LEAFLET_HEAD = '<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">\n'
+  + '<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>\n'
+  + '<style>'
+  + '.map-embed .leaflet-tile-pane{filter:saturate(.92)}'
+  + 'html:not([data-theme="light"]) .map-embed .leaflet-tile-pane{filter:brightness(.78) saturate(.72) contrast(1.06)}'
+  + '.map-embed .leaflet-container{font:inherit;background:var(--bg-elevated)}'
+  + '.map-embed .leaflet-popup-content-wrapper{background:var(--surface-card);color:var(--ink-primary);border:1px solid var(--border-gold);border-radius:12px;box-shadow:var(--gold-shadow-md)}'
+  + '.map-embed .leaflet-popup-tip{background:var(--surface-card);border:1px solid var(--border-gold)}'
+  + '.map-embed .leaflet-popup-content{font:500 0.82rem var(--font-body);color:var(--ink-primary)}'
+  + '.map-embed .leaflet-popup-content a{color:var(--gold)}'
+  + '.map-embed .leaflet-bar a{background:var(--surface-card);color:var(--gold);border-color:var(--border-soft)}'
+  + '.map-embed .leaflet-control-attribution{background:rgba(0,0,0,.35);color:var(--ink-muted);font-size:10px}'
+  + '.map-embed .leaflet-control-attribution a{color:var(--gold)}'
+  + '</style>';
+
+/** JSON-encode a value for safe embedding in an inline <script>: escapes "<" so an injected
+ *  place name can never close the script block or open a tag. */
+function jsJson(v) {
+  return JSON.stringify(v).replace(/</g, '\\u003c');
+}
+
+/** True for a plausible latitude/longitude pair (SQLite NULLs and NaNs fail). */
+function validLatLng(lat, lng) {
+  return typeof lat === 'number' && typeof lng === 'number'
+    && isFinite(lat) && isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180;
+}
+
+/** Geocode a place name via OSM Nominatim (free, key-less) backed by the permanent geocache table.
+ *  Lazy — only called when a map page actually needs coordinates. Any failure (offline, 5s timeout,
+ *  no result) resolves to null; callers render the map placeholder instead. Never throws. */
+async function geocode(place) {
+  const key = String(place || '').trim().slice(0, 200);
+  if (!key) return null;
+  try {
+    const cached = db.prepare('SELECT lat, lng FROM geocache WHERE place = ?').get(key);
+    if (cached && validLatLng(cached.lat, cached.lng)) return { lat: cached.lat, lng: cached.lng };
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => { try { ctrl.abort(); } catch (e) { /* already settled */ } }, 5000);
+    let rows = null;
+    try {
+      const resp = await fetch('https://nominatim.openstreetmap.org/search?format=json&limit=1&q=' + encodeURIComponent(key), {
+        headers: { 'User-Agent': 'Dealzoin/1.0 (contact: admin)', 'Accept': 'application/json' },
+        signal: ctrl.signal
+      });
+      if (resp && resp.ok) rows = await resp.json();
+    } finally {
+      clearTimeout(timer);
+    }
+    const lat = rows && rows[0] ? parseFloat(rows[0].lat) : NaN;
+    const lng = rows && rows[0] ? parseFloat(rows[0].lon) : NaN;
+    if (!validLatLng(lat, lng)) return null;
+    try {
+      db.prepare('INSERT INTO geocache (place, lat, lng, created_at) VALUES (?,?,?,?) ON CONFLICT(place) DO UPDATE SET lat = excluded.lat, lng = excluded.lng, created_at = excluded.created_at')
+        .run(key, lat, lng, now());
+    } catch (e) { /* cache write is best-effort */ }
+    return { lat, lng };
+  } catch (e) {
+    return null; // offline / DNS failure / timeout / abort — the map shows its placeholder
+  }
+}
+
+/** Lazily resolve + persist a deal's origin/destination coordinates (geocoded on first map view,
+ *  then cached in the deals row and the geocache table). Never throws — missing pieces stay null. */
+async function dealGeo(deal) {
+  const geo = { oLat: null, oLng: null, dLat: null, dLng: null };
+  try {
+    if (validLatLng(deal.origin_lat, deal.origin_lng)) { geo.oLat = deal.origin_lat; geo.oLng = deal.origin_lng; }
+    else if (deal.origin) {
+      const g = await geocode(deal.origin);
+      if (g) {
+        geo.oLat = g.lat; geo.oLng = g.lng;
+        try { db.prepare('UPDATE deals SET origin_lat = ?, origin_lng = ? WHERE id = ?').run(g.lat, g.lng, deal.id); } catch (e) { /* best-effort */ }
+      }
+    }
+  } catch (e) { /* keep nulls */ }
+  try {
+    if (validLatLng(deal.dest_lat, deal.dest_lng)) { geo.dLat = deal.dest_lat; geo.dLng = deal.dest_lng; }
+    else if (deal.destination) {
+      const g = await geocode(deal.destination);
+      if (g) {
+        geo.dLat = g.lat; geo.dLng = g.lng;
+        try { db.prepare('UPDATE deals SET dest_lat = ?, dest_lng = ? WHERE id = ?').run(g.lat, g.lng, deal.id); } catch (e) { /* best-effort */ }
+      }
+    }
+  } catch (e) { /* keep nulls */ }
+  return geo;
+}
+
+/** Shipment progress fraction (0..1) along the origin→destination route, derived from the current
+ *  deal status at render time: open/production 5%, dispatched 35%, shipped 65%, delivered/closed 100%. */
+function statusProgress(deal) {
+  if (!deal) return 0.05;
+  if (deal.contract_state === 'approved' || deal.status === 'closed' || deal.status === 'delivered') return 1;
+  if (deal.status === 'dispatched') return 0.35;
+  if (deal.status === 'shipped') return 0.65;
+  return 0.05; // open | production
+}
+
+/** Client-side per-deal map script: origin (gold) + destination (mint) markers, dashed gold route,
+ *  and a shipment dot that eases toward the status-derived position with gentle idle bobbing.
+ *  Fully defensive: no Leaflet / bad coords / render errors degrade to a themed fallback note. */
+const DEAL_MAP_SCRIPT = `<script>(function(){
+  var el=document.getElementById('deal-map');
+  if(!el)return;
+  function escH(s){return String(s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+  function fallback(msg){el.innerHTML='<div class="map-fallback">'+escH(msg)+'</div>';}
+  if(typeof L==='undefined'){fallback('🗺️ Map unavailable — the mapping library could not be loaded (you may be offline).');return;}
+  var oLat=parseFloat(el.getAttribute('data-olat')),oLng=parseFloat(el.getAttribute('data-olng'));
+  var dLat=parseFloat(el.getAttribute('data-dlat')),dLng=parseFloat(el.getAttribute('data-dlng'));
+  var target=parseFloat(el.getAttribute('data-progress'));
+  if(!isFinite(oLat)||!isFinite(oLng)||!isFinite(dLat)||!isFinite(dLng)){fallback('Location could not be geocoded yet.');return;}
+  if(!isFinite(target))target=0.05;
+  var originName=el.getAttribute('data-origin')||'Origin';
+  var destName=el.getAttribute('data-dest')||'Destination';
+  var dealNum=el.getAttribute('data-dealnum')||'';
+  var status=el.getAttribute('data-status')||'';
+  try{
+    var map=L.map(el,{scrollWheelZoom:false});
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18,attribution:'&copy; OpenStreetMap contributors'}).addTo(map);
+    L.marker([oLat,oLng],{icon:L.divIcon({className:'dz-marker dz-marker-gold',iconSize:[16,16],iconAnchor:[8,8]})}).addTo(map)
+      .bindPopup('<b>'+escH(originName)+'</b><br>Deal '+escH(dealNum)+' · origin · '+escH(status));
+    L.marker([dLat,dLng],{icon:L.divIcon({className:'dz-marker dz-marker-mint',iconSize:[16,16],iconAnchor:[8,8]})}).addTo(map)
+      .bindPopup('<b>'+escH(destName)+'</b><br>Deal '+escH(dealNum)+' · destination · '+escH(status));
+    L.polyline([[oLat,oLng],[dLat,dLng]],{color:'#F5B942',weight:2.5,dashArray:'7 7',opacity:.9}).addTo(map);
+    var ship=L.marker([oLat,oLng],{icon:L.divIcon({className:'dz-ship-dot',iconSize:[14,14],iconAnchor:[7,7]}),interactive:false}).addTo(map);
+    map.fitBounds([[oLat,oLng],[dLat,dLng]],{padding:[36,36]});
+    function lerp(a,b,t){return a+(b-a)*t;}
+    function posAt(t,bob){var lt=lerp(oLat,dLat,t),ln=lerp(oLng,dLng,t);if(bob)lt+=Math.sin(bob)*0.003*(Math.abs(dLng-oLng)+1);return [lt,ln];}
+    var reduce=!!(window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+    if(reduce){ship.setLatLng(posAt(target,0));}
+    else{
+      var cur=0,t0=null;
+      var frame=function(ts){
+        if(t0===null)t0=ts;
+        var dt=Math.min(0.05,(ts-t0)/1000);t0=ts;
+        cur+=(target-cur)*Math.min(1,dt*1.8);
+        if(Math.abs(target-cur)<0.0005)cur=target;
+        ship.setLatLng(posAt(cur,ts/900));
+        requestAnimationFrame(frame);
+      };
+      requestAnimationFrame(frame);
+    }
+  }catch(e){fallback('🗺️ Map could not be rendered here.');}
+})();</script>`;
+
+/** Per-deal shipment tracking map section (CIF/CRF only; caller enforces parties + admin guard).
+ *  Returns { html, needsLeaflet }. When either end lacks coordinates a themed placeholder card is
+ *  rendered instead — the deal page never errors on geocoding failures. */
+function dealMapSection(deal, geo) {
+  const hasO = validLatLng(geo.oLat, geo.oLng);
+  const hasD = validLatLng(geo.dLat, geo.dLng);
+  if (!hasO || !hasD) {
+    const bits = [];
+    if (!hasO) bits.push(deal.origin ? `origin "${esc(deal.origin)}" could not be geocoded yet` : 'no origin set');
+    if (!hasD) bits.push(deal.destination ? `destination "${esc(deal.destination)}" could not be geocoded yet` : 'no destination set yet');
+    return { needsLeaflet: false, html: `<div class="card map-placeholder" data-reveal>
+      <h3>🗺️ Shipment tracking map</h3>
+      <p class="muted" style="margin-top:8px">Map activates once origin &amp; destination are geocoded.</p>
+      <p class="muted" style="font-size:12px;margin-top:6px">${bits.join(' · ')}.</p>
+    </div>` };
+  }
+  const statusLabel = (deal.contract_state === 'approved' || deal.status === 'closed') ? 'closed' : (deal.status || 'open');
+  return { needsLeaflet: true, html: `<div class="card" data-reveal>
+    <h3>🗺️ Shipment tracking map <span class="muted" style="font-weight:400">· ${esc(deal.incoterm || 'CIF')} · ${esc(deal.origin || '?')} → ${esc(deal.destination || '?')}</span></h3>
+    <div id="deal-map" class="map-embed" role="img" aria-label="Shipment route map"
+      data-olat="${geo.oLat}" data-olng="${geo.oLng}" data-dlat="${geo.dLat}" data-dlng="${geo.dLng}"
+      data-progress="${statusProgress(deal)}" data-origin="${esc(deal.origin || 'Origin')}" data-dest="${esc(deal.destination || 'Destination')}"
+      data-dealnum="${esc(deal.deal_number || '#' + deal.id)}" data-status="${esc(statusLabel)}"></div>
+    ${DEAL_MAP_SCRIPT}
+  </div>` };
+}
+
 /** Shared deal composer fields (used by /deals/new and /new). */
 function dealFormFieldsHtml() {
   return `
@@ -1798,6 +2279,8 @@ function dealFormFieldsHtml() {
         <div><label>Category (required)</label><select name="category" required><option value="">— choose —</option>${optionsHtml(COMPANY_CATEGORIES, '')}</select></div>
         <div><label>Origin location (required)</label><input type="text" name="origin" required maxlength="160" placeholder="e.g. Rotterdam, NL"></div>
       </div>
+      <label>Destination (optional)</label><input type="text" name="destination" maxlength="160" placeholder="e.g. Jebel Ali, Dubai">
+      <p class="muted" style="margin:-6px 0 12px">Sell deals: the buyer's port/city — can be set from the buyer's LOI later. Powers the CIF/CRF shipment tracking map.</p>
       <label>Incoterm</label>
       <select name="incoterm" id="incoterm-select">${optionsHtml(DEAL_INCOTERMS, 'CIF')}</select>
       <p class="muted" style="margin:-6px 0 12px">${esc(INCOTERM_EXPLAINERS.FOP)}<br>${esc(INCOTERM_EXPLAINERS.CIF)}<br>${esc(INCOTERM_EXPLAINERS.CRF)}</p>
@@ -1817,7 +2300,7 @@ function dealFormFieldsHtml() {
             <input type="radio" name="proof_mode" value="manual" style="width:auto;margin:0"> Describe manually</label>
         </div>
         <div id="proof-pdf-block">
-          <label class="file-btn"><span class="file-btn-text" data-default="📎 Upload product proof (PDF, max 15 MB)">📎 Upload product proof (PDF, max 15 MB)</span>
+          <label class="file-btn dropzone"><span class="file-btn-text" data-default="📎 Upload product proof (PDF, max 15 MB)">📎 Upload product proof (PDF, max 15 MB)</span>
             <input type="file" class="file-input" name="product_proof" accept="application/pdf,.pdf"></label>
           <p class="muted" style="margin:-4px 0 10px">Screened by the Document Authenticity Agent.</p>
         </div>
@@ -1844,7 +2327,7 @@ function dealFormFieldsHtml() {
 const MEDIA_ACCEPT = 'image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm';
 function fileButtonHtml(labelText) {
   const def = labelText || '📎 Attach photo or video';
-  return `<label class="file-btn"><span class="file-btn-text" data-default="${esc(def)}">${esc(def)}</span><input type="file" class="file-input" name="media" accept="${MEDIA_ACCEPT}"></label>`;
+  return `<label class="file-btn dropzone"><span class="file-btn-text" data-default="${esc(def)}">${esc(def)}</span><input type="file" class="file-input" name="media" accept="${MEDIA_ACCEPT}"></label>`;
 }
 
 // ============================= SESSIONS & AUTH MIDDLEWARE =============================
@@ -1902,28 +2385,29 @@ app.get('/', (req, res) => {
   const user = currentUser(req);
   const body = `
   <div class="hero">
-    <div class="kicker">The B2B deal network</div>
-    <h1>Where <span class="gold">companies</span> close.</h1>
-    <p>Dealzoin is the social network for businesses — post deals to every company's timeline,
+    <div class="coin-hero" role="button" tabindex="0" aria-label="Dealzoin mint coin — activate to flip">Dz</div>
+    <div class="kicker a-enter" data-stage="hero" style="--i:0">The B2B deal network</div>
+    <h1 class="a-enter" data-stage="hero" style="--i:1">Where <span class="gold">companies</span> close.</h1>
+    <p class="a-enter" data-stage="hero" style="--i:2">Dealzoin is the social network for businesses — post deals to every company's timeline,
        follow the players in your industry, and sign binding contracts in AI-guarded signing rooms.</p>
     ${user
-      ? `<a class="btn" href="${user.isAdmin ? '/admin' : '/timeline'}">Open ${user.isAdmin ? 'dashboard' : 'timeline'} &rarr;</a>`
-      : `<a class="btn" href="/signup">Register your company</a>
-         &nbsp; <a class="btn btn-outline" href="/login">Sign in</a>`}
+      ? `<a class="btn js-magnet a-enter" data-stage="hero" style="--i:3" href="${user.isAdmin ? '/admin' : '/timeline'}">Open ${user.isAdmin ? 'dashboard' : 'timeline'} &rarr;</a>`
+      : `<a class="btn js-magnet a-enter" data-stage="hero" style="--i:3" href="/signup">Register your company</a>
+         &nbsp; <a class="btn btn-outline a-enter" data-stage="hero" style="--i:4" href="/login">Sign in</a>`}
   </div>
   <div class="grid2">
-    <div class="card"><h3>📣 Deals on every timeline</h3><p class="muted">Publish a deal once; it's live on every follower company's feed instantly. Likes, comments and reposts built in — dealmaking with a pulse.</p></div>
-    <div class="card"><h3>✍️ Private signing rooms</h3><p class="muted">Take it off the feed and into the vault. Password re-verification, signing-authority checks, and downloadable contract documents — from handshake to signature in minutes.</p></div>
-    <div class="card"><h3>🤖 AI security agents on duty</h3><p class="muted">Automated agents screen onboarding, verify 2FA login codes and watch every signature — all logged to a tamper-evident audit trail.</p></div>
-    <div class="card"><h3>🏢 Companies only. No noise.</h3><p class="muted">No personal profiles, no influencers. Every member is a vetted business, approved before it can post a single deal.</p></div>
+    <div class="card a-enter" data-stage="cards" style="--i:0"><h3>📣 Deals on every timeline</h3><p class="muted">Publish a deal once; it's live on every follower company's feed instantly. Likes, comments and reposts built in — dealmaking with a pulse.</p></div>
+    <div class="card a-enter" data-stage="cards" style="--i:1"><h3>✍️ Private signing rooms</h3><p class="muted">Take it off the feed and into the vault. Password re-verification, signing-authority checks, and downloadable contract documents — from handshake to signature in minutes.</p></div>
+    <div class="card a-enter" data-stage="cards" style="--i:2"><h3>🤖 AI security agents on duty</h3><p class="muted">Automated agents screen onboarding, verify 2FA login codes and watch every signature — all logged to a tamper-evident audit trail.</p></div>
+    <div class="card a-enter" data-stage="cards" style="--i:3"><h3>🏢 Companies only. No noise.</h3><p class="muted">No personal profiles, no influencers. Every member is a vetted business, approved before it can post a single deal.</p></div>
   </div>
-  <div class="kicker" style="margin:26px 0 10px">How it works</div>
+  <div class="kicker a-enter" data-stage="cards" style="--i:4;margin-top:26px;margin-bottom:10px">How it works</div>
   <div class="steps">
-    <div class="step"><div class="stepnum">01</div><h3>Register &amp; get vetted</h3><p class="muted">Your company joins the network after admin approval.</p></div>
-    <div class="step"><div class="stepnum">02</div><h3>Post or follow deals</h3><p class="muted">Put your offer on the wire; watch the right companies react.</p></div>
-    <div class="step"><div class="stepnum">03</div><h3>Sign in the vault</h3><p class="muted">Close in a private signing room, guarded by AI agents.</p></div>
+    <div class="step a-enter" data-stage="cards" style="--i:5"><div class="stepnum">01</div><h3>Register &amp; get vetted</h3><p class="muted">Your company joins the network after admin approval.</p></div>
+    <div class="step a-enter" data-stage="cards" style="--i:6"><div class="stepnum">02</div><h3>Post or follow deals</h3><p class="muted">Put your offer on the wire; watch the right companies react.</p></div>
+    <div class="step a-enter" data-stage="cards" style="--i:7"><div class="stepnum">03</div><h3>Sign in the vault</h3><p class="muted">Close in a private signing room, guarded by AI agents.</p></div>
   </div>
-  <div class="trust">
+  <div class="trust rv">
     <div class="kicker">Security, built in</div>
     <p>Every onboarding, login and signature is screened by Dealzoin's AI security agents and written to a tamper-evident audit trail. Real contracts deserve real locks.</p>
   </div>`;
@@ -1996,7 +2480,7 @@ app.get('/signup', (req, res) => {
         <span>${esc(text)}</span></label>`).join('');
   const docInput = (name, label, required) => `
       <label>${esc(label)}${required ? ' (required, PDF)' : ' (optional, PDF)'}</label>
-      <label class="file-btn"><span class="file-btn-text" data-default="📎 ${esc(label)}">📎 ${esc(label)}</span>
+      <label class="file-btn dropzone"><span class="file-btn-text" data-default="📎 ${esc(label)}">📎 ${esc(label)}</span>
         <input type="file" class="file-input" name="${name}" accept="application/pdf,.pdf"${required ? ' required' : ''}></label>`;
   const body = `
   <div class="card" style="max-width:620px;margin:0 auto" data-reveal>
@@ -2007,7 +2491,7 @@ app.get('/signup', (req, res) => {
     <div class="card" style="background:var(--bg-elevated)">
       <h3 style="margin-bottom:6px">Step 1 — Company profile PDF <span class="muted">(optional, encouraged)</span></h3>
       <p class="muted" style="margin-bottom:10px">Upload your company profile and our agent will auto-fill the form below for you to review.</p>
-      <label class="file-btn"><span class="file-btn-text" id="profile-label" data-default="📎 Upload your company profile (PDF)">📎 Upload your company profile (PDF)</span>
+      <label class="file-btn dropzone"><span class="file-btn-text" id="profile-label" data-default="📎 Upload your company profile (PDF)">📎 Upload your company profile (PDF)</span>
         <input type="file" class="file-input" id="profile-pdf" name="profile_pdf" accept="application/pdf,.pdf" form="signup-form"></label>
       <div id="parse-note"></div>
     </div>
@@ -2033,7 +2517,7 @@ app.get('/signup', (req, res) => {
       <label>Signed Terms &amp; Conditions (required, PDF)</label>
       <p class="muted" style="margin-bottom:8px"><a href="/legal/terms">Read the Terms &amp; Conditions</a> — download, print, sign, and upload the signed copy below.
         <a href="/legal/terms/download">Download the Terms &amp; Conditions (.doc)</a></p>
-      <label class="file-btn"><span class="file-btn-text" data-default="📎 Upload signed Terms &amp; Conditions">📎 Upload signed Terms &amp; Conditions</span>
+      <label class="file-btn dropzone"><span class="file-btn-text" data-default="📎 Upload signed Terms &amp; Conditions">📎 Upload signed Terms &amp; Conditions</span>
         <input type="file" class="file-input" name="signed_terms" accept="application/pdf,.pdf" required></label>
       ${docInput('activity_proof', 'Activity proof (e.g. portfolio, catalog, past invoices)', false)}
 
@@ -2043,7 +2527,7 @@ app.get('/signup', (req, res) => {
       <label>Typed legal signature — type your full legal name; this acts as your signature</label>
       <input type="text" name="signature_name" required maxlength="120" placeholder="Full legal name of the authorized signatory">
       <p class="muted" style="margin-bottom:12px">Your signature timestamp and IP address are recorded with this registration.</p>
-      <button class="btn" type="submit">Create company account</button>
+      <button class="btn js-magnet" type="submit">Create company account</button>
     </form>
     <p class="muted" style="margin-top:12px">Already approved? <a href="/login">Sign in</a></p>
     <p class="shield-note">🛡️ Screened by the Onboarding &amp; Document Authenticity agents</p>
@@ -2336,7 +2820,7 @@ function dealFeedItem(d) {
 }
 /** Render one feed card. kind: 'deal' | 'post' | 'repost'. idx = loop index (entrance stagger). */
 function feedCard(item, user, names, idx) {
-  const stagger = Math.min(Number.isInteger(idx) ? idx : 0, 10);
+  const stagger = Math.min(Number.isInteger(idx) ? idx : 0, 8);
   const ownerName = names.get(item.company_id) || 'Unknown';
   const isOwn = user && !user.isAdmin && user.id === item.company_id;
   // Member attribution: "— by {member name}" when a sub-account authored the item.
@@ -2357,7 +2841,7 @@ function feedCard(item, user, names, idx) {
     ${user && !user.isAdmin ? `
     <div class="feed-actions">
       <form method="POST" action="/like/post/${item.ref_id}">
-        <button class="btn btn-sm ${soc.liked ? 'liked' : 'btn-outline'}" type="submit" title="Celebrate">${soc.liked ? 'Liked' : 'Like'} (${soc.likeCount})</button>
+        <button class="btn btn-sm btn-like${soc.liked ? ' liked' : ' btn-outline'}" type="submit" title="Celebrate"><span class="ic">${soc.liked ? 'Liked' : 'Like'} (${soc.likeCount})</span></button>
       </form>
     </div>` : `<p class="muted" style="margin-top:10px">${soc.likeCount} likes</p>`}
   </div>`;
@@ -2402,7 +2886,7 @@ function feedCard(item, user, names, idx) {
   const interact = user && !user.isAdmin ? `
     <div class="feed-actions">
       <form method="POST" action="/like/${targetType}/${targetId}">
-        <button class="btn btn-sm ${soc.liked ? 'liked' : 'btn-outline'}" type="submit" title="Back this deal">${soc.liked ? 'Liked' : 'Like'} (${soc.likeCount})</button>
+        <button class="btn btn-sm btn-like${soc.liked ? ' liked' : ' btn-outline'}" type="submit" title="Back this deal"><span class="ic">${soc.liked ? 'Liked' : 'Like'} (${soc.likeCount})</span></button>
       </form>
       ${repostBtn}
       ${signBtn}
@@ -2415,7 +2899,8 @@ function feedCard(item, user, names, idx) {
       </form>
     </div>` : `<p class="muted" style="margin-top:10px">${soc.likeCount} likes · ${soc.comments.length} comments</p>`;
 
-  return `<div class="card${item.kind === 'post' ? '' : ' card-deal'}" data-reveal style="--i:${stagger}">
+  return `<div class="card${item.kind === 'post' ? '' : ' card-deal js-tilt'}" data-reveal style="--i:${stagger}">
+    ${item.kind === 'post' ? '' : '<div class="card__glare" aria-hidden="true"></div>'}
     <div class="feed-head"><div>${head}</div>
     ${headRight}</div>
     ${bodyHtml}
@@ -2526,7 +3011,7 @@ app.get('/deals/new', requireCompany, (req, res) => {
       ${dealFormFieldsHtml()}
       <label>Photo or video (optional — image ≤ 5 MB, video ≤ 25 MB)</label>
       ${fileButtonHtml()}
-      <button class="btn" type="submit">Publish deal</button>
+      <button class="btn js-magnet" type="submit">Publish deal</button>
     </form>
   </div>`;
   res.send(page('New deal', body, req.user, req.query.msg, req.query.err, 'new'));
@@ -2541,6 +3026,7 @@ app.post('/deals', requireCompany, dealUpload, async (req, res) => {
   const dealType = DEAL_TYPES.includes(req.body.deal_type) ? req.body.deal_type : 'sell';
   const category = COMPANY_CATEGORIES.includes(req.body.category) ? req.body.category : '';
   const origin = String(req.body.origin || '').trim().slice(0, 160);
+  const destination = String(req.body.destination || '').trim().slice(0, 160);
   const incoterm = DEAL_INCOTERMS.includes(req.body.incoterm) ? req.body.incoterm : 'CIF';
   const proofMode = req.body.proof_mode === 'manual' ? 'manual' : 'pdf';
   const proofText = String(req.body.product_proof_text || '').trim().slice(0, 2000);
@@ -2574,10 +3060,10 @@ app.post('/deals', requireCompany, dealUpload, async (req, res) => {
 
   const number = nextDealNumber();
   db.prepare(`INSERT INTO deals (company_id, title, description, value, created_at, media_id, currency, time_period,
-              deal_type, deal_number, category, origin, incoterm, product_proof, product_proof_doc_id, status, author_name)
-              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?)`)
+              deal_type, deal_number, category, origin, destination, incoterm, product_proof, product_proof_doc_id, status, author_name)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?)`)
     .run(req.user.id, title.slice(0, 160), desc.slice(0, 4000), value, now(), mediaId, currency, timePeriod,
-         dealType, number, category, origin, incoterm,
+         dealType, number, category, origin, destination, incoterm,
          dealType === 'sell' && proofMode === 'manual' ? proofText : '', proofDocId, req.user.memberName || null);
   audit('DEAL AGENT', 'deal published', 'pass', `${req.user.name} posted ${dealType.toUpperCase()} deal ${number} "${title.slice(0, 60)}" (${category}, ${incoterm}, origin ${origin})`);
   res.redirect('/timeline?msg=' + encodeURIComponent(`Deal ${number} published to all timelines!`));
@@ -2644,8 +3130,8 @@ function followButton(viewer, companyId) {
   if (!viewer || viewer.isAdmin || viewer.id === companyId) return '';
   const following = db.prepare('SELECT 1 FROM follows WHERE follower_id = ? AND followed_id = ?').get(viewer.id, companyId);
   return following
-    ? `<form method="POST" action="/unfollow/${companyId}" style="display:inline"><button class="btn btn-sm btn-outline" type="submit">Following ✓</button></form>`
-    : `<form method="POST" action="/follow/${companyId}" style="display:inline"><button class="btn btn-sm" type="submit">Follow</button></form>`;
+    ? `<form method="POST" action="/unfollow/${companyId}" style="display:inline"><button class="btn btn-sm btn-outline btn-follow is-following" type="submit">Following ✓</button></form>`
+    : `<form method="POST" action="/follow/${companyId}" style="display:inline"><button class="btn btn-sm btn-follow" type="submit">Follow</button></form>`;
 }
 function followCounts(companyId) {
   const followers = db.prepare('SELECT COUNT(*) AS n FROM follows WHERE followed_id = ?').get(companyId).n;
@@ -2682,7 +3168,7 @@ app.get('/search', requireCompany, (req, res) => {
     companiesHtml = companies.length
       ? companies.map((c, idx) => {
           const fc = followCounts(c.id);
-          return `<div class="card" data-reveal style="--i:${Math.min(idx, 10)}">
+          return `<div class="card" data-reveal style="--i:${Math.min(idx, 8)}">
             <div class="feed-head"><h3>${avatarHtml(c.name, c.avatar_media_id)}<a href="/company/${c.id}">${esc(c.name)}</a></h3>${followButton(req.user, c.id)}</div>
             <p class="muted">${c.category ? `<span class="chip chip-category">${esc(c.category)}</span> · ` : ''}${fc.followers} followers · ${fc.following} following</p>
             ${c.activity ? `<p class="muted" style="margin-top:4px">⚙️ ${esc(c.activity)}</p>` : ''}
@@ -2726,7 +3212,7 @@ app.get('/companies', requireCompany, (req, res) => {
 
   const cards = companies.length ? companies.map((c, idx) => {
     const fc = followCounts(c.id);
-    return `<div class="card" data-reveal style="--i:${Math.min(idx, 10)}">
+    return `<div class="card" data-reveal style="--i:${Math.min(idx, 8)}">
       <div class="feed-head">
         <h3>${avatarHtml(c.name, c.avatar_media_id)}<a href="/company/${c.id}">${esc(c.name)}</a></h3>
         ${followButton(req.user, c.id)}
@@ -2933,7 +3419,7 @@ function dealCounterpartyName(deal, names) {
   return 'To be determined via negotiation';
 }
 
-app.get('/deal/:id', requireCompanyOrAdmin, (req, res) => {
+app.get('/deal/:id', requireCompanyOrAdmin, async (req, res) => {
   const deal = getDealOr404(req, res);
   if (!deal) return;
   const owner = db.prepare('SELECT id, name, avatar_media_id FROM companies WHERE id = ?').get(deal.company_id);
@@ -3014,6 +3500,22 @@ app.get('/deal/:id', requireCompanyOrAdmin, (req, res) => {
     </div>`;
   }
 
+  // ---- Shipment tracking map (CIF/CRF only; parties + admin — the deal's insider audience:
+  // owner, negotiating/contracted buyer, admin — same parties the status stepper controls serve).
+  // Coordinates are geocoded lazily here (first map view), never on deal creation; failures render a placeholder.
+  let mapHtml = '', mapHead = '';
+  if (!isFop && canViewDealTerms(req.user, deal)) {
+    try {
+      const geo = await dealGeo(deal);
+      const section = dealMapSection(deal, geo);
+      mapHtml = section.html;
+      if (section.needsLeaflet) mapHead = LEAFLET_HEAD;
+    } catch (e) {
+      mapHtml = `<div class="card map-placeholder" data-reveal><h3>🗺️ Shipment tracking map</h3>
+        <p class="muted" style="margin-top:8px">Map activates once origin &amp; destination are geocoded.</p></div>`;
+    }
+  }
+
   // ---- Product proof (sell deals) ----
   let proofHtml = '';
   if ((deal.deal_type || 'sell') === 'sell' && (deal.product_proof || deal.product_proof_doc_id)) {
@@ -3047,7 +3549,7 @@ app.get('/deal/:id', requireCompanyOrAdmin, (req, res) => {
       <h4 style="margin-bottom:8px">Upload a response document</h4>
       <form method="POST" action="/deal/${deal.id}/documents" enctype="multipart/form-data">
         <label>Document (PDF or image, max 15 MB)</label>
-        <label class="file-btn"><span class="file-btn-text" data-default="📎 Attach PDF or image">📎 Attach PDF or image</span>
+        <label class="file-btn dropzone"><span class="file-btn-text" data-default="📎 Attach PDF or image">📎 Attach PDF or image</span>
           <input type="file" class="file-input" name="doc" accept="application/pdf,.pdf,image/jpeg,image/png,image/gif,image/webp" required></label>
         <label>Note for the requester (optional)</label><input type="text" name="note" maxlength="300" placeholder="e.g. Certificate of origin for the full batch">
         <button class="btn btn-sm" type="submit">Upload &amp; share with requesters</button>
@@ -3081,7 +3583,8 @@ app.get('/deal/:id', requireCompanyOrAdmin, (req, res) => {
   }
 
   const body = `
-  <div class="card card-deal">
+  <div class="card card-deal js-tilt">
+    <div class="card__glare" aria-hidden="true"></div>
     <div class="feed-head"><h2>${esc(deal.title)}</h2>
       ${dealValueHtml}</div>
     <div style="margin:8px 0 4px">
@@ -3097,10 +3600,11 @@ app.get('/deal/:id', requireCompanyOrAdmin, (req, res) => {
     <div class="feed-actions">${signBtn}</div>
   </div>
   ${statusHtml}
+  ${mapHtml}
   ${proofHtml}
   ${contractHtml}
   ${docsHtml}`;
-  res.send(page(deal.title, body, req.user, req.query.msg, req.query.err));
+  res.send(page(deal.title, body, req.user, req.query.msg, req.query.err, undefined, mapHead));
 });
 
 // ----- POST /deal/:id/status — owner, contracted buyer or admin advances the pipeline (CIF/CRF only) -----
@@ -3540,7 +4044,7 @@ app.get('/deal/:id/sign/verify', requireCompany, (req, res) => {
     ${demo}
     <form method="POST" action="/deal/${deal.id}/sign/verify">
       <label>6-digit signing code</label><input type="text" name="code" required pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code">
-      <button class="btn btn-green" type="submit">Sign contract</button>
+      <button class="btn btn-green js-magnet" type="submit">Sign contract</button>
     </form>
     <p class="shield-note">🛡️ Protected by Dealzoin security agents</p>
   </div>`;
@@ -3837,7 +4341,7 @@ app.get('/deals/inbox', requireCompany, (req, res) => {
   const negsHtml = myNegs.length ? myNegs.map((n, i) => {
     const role = n.buyer_id === myId ? 'buyer' : 'seller';
     const otherName = names.get(role === 'buyer' ? n.seller_id : n.buyer_id) || 'Unknown';
-    return `<div class="card" data-reveal style="--i:${Math.min(i, 10)}">
+    return `<div class="card" data-reveal style="--i:${Math.min(i, 8)}">
       <div class="feed-head">
         <h3>🤝 <a href="/negotiation/${n.id}">${esc(n.deal_title || 'Deal #' + n.deal_id)}</a></h3>
         ${statusBadge(n.state)}
@@ -4011,7 +4515,7 @@ function negTimelineHtml(negId, names) {
     const valLine = e.value ? `<div class="deal-value" style="font-size:1rem;margin:4px 0">${esc(e.value)} ${esc(e.currency || '')}</div>` : '';
     const termsLine = e.terms ? `<p class="muted" style="white-space:pre-wrap;margin-top:4px">${esc(e.terms.slice(0, 600))}</p>` : '';
     const noteLine = e.note ? `<p class="muted" style="margin-top:4px">${esc(e.note)}</p>` : '';
-    return `<div class="tl-item" data-reveal style="--i:${Math.min(i, 10)}">
+    return `<div class="tl-item" data-reveal style="--i:${Math.min(i, 8)}">
       <div class="tl-dot"></div>
       <div class="tl-body">
         <div class="feed-head" style="margin:0"><b>${negEventLabel(e.kind)}</b>
@@ -4051,7 +4555,7 @@ app.get('/deal/:id/loi', requireCompany, (req, res) => {
       </div>
       <label>Wishes / conditions (optional)</label>
       <textarea name="loi_wishes" rows="3" maxlength="2000" placeholder="Delivery windows, inspection, certificates…"></textarea>
-      <button class="btn btn-green" type="submit">Send Letter of Intent →</button>
+      <button class="btn btn-green js-magnet" type="submit">Send Letter of Intent →</button>
       <p class="muted" style="margin-top:8px">Logged by the Deal Agent. The seller sees your company profile and this letter.</p>
     </form>
   </div>`;
@@ -4333,6 +4837,12 @@ app.post('/negotiation/:id/send-po', requireCompany, (req, res) => {
   const neg = negGuard(req, res, ['BUYER_APPROVED'], 'seller');
   if (!neg) return;
   negSetState(neg.id, 'PO_SENT');
+  // Shipment map: auto-copy the buyer's LOI location into the deal destination (only when unset).
+  try {
+    if (neg.loi_location) {
+      db.prepare(`UPDATE deals SET destination = ? WHERE id = ? AND (destination IS NULL OR destination = '')`).run(neg.loi_location, neg.deal_id);
+    }
+  } catch (e) { /* destination column may be missing on very old databases */ }
   negEvent(neg.id, req.user.id, 'po', { value: neg.offer_value, currency: neg.offer_currency });
   audit('DEAL AGENT', 'purchase order sent', 'pass', `${req.user.name} issued the PO on negotiation #${neg.id}`);
   notify(neg.buyer_id, 'po_sent', `${req.user.name} issued the Purchase Order for negotiation #${neg.id}. Review it and proceed to signing.`, `/deal/${neg.deal_id}/sign`);
@@ -4495,7 +5005,7 @@ app.get('/contracts/new', requireCompany, (req, res) => {
       <label>Terms of the offer</label>
       <textarea name="terms" rows="6" required maxlength="4000" placeholder="Scope, deliverables, payment schedule…"></textarea>
       ${'<div class="muted" style="font-size:12px;margin-bottom:12px">🏦 A transparent ' + platformFeePct() + '% Dealzoin platform fee applies and is disclosed to both parties.</div>'}
-      <button class="btn" type="submit">Seal &amp; send</button>
+      <span class="wax-seal wax-seal--fx" aria-hidden="true"><span>Dz</span></span><button class="btn js-sealsend js-magnet" type="submit">Seal &amp; send</button>
       <a class="btn btn-outline" href="/contracts" style="margin-left:8px">Discard draft</a>
     </form>` : `<p class="muted">No approved companies match. <a href="/contracts/new">Clear the search</a> to list all.</p>`}
   </div>`;
@@ -4524,7 +5034,7 @@ app.get('/contracts', requireCompany, (req, res) => {
     const otherName = names.get(otherId) || 'Unknown';
     const amount = Number(pc.value) > 0 ? `<span class="mail-amount">${esc(fmtAmount(Number(pc.value)))} ${esc(pc.currency || 'USD')}</span>` : '';
     return `<a class="mail-row ${sealed ? 'mail-row--sealed' : 'mail-row--opened'}" href="/contracts/${pc.id}"
-        data-reveal style="--i:${Math.min(idx, 10)}"
+        data-reveal style="--i:${Math.min(idx, 8)}"
         title="${sealed ? 'Sealed — open to read the terms' : 'Opened · seal spent'}">
       <span class="wax-seal"><span>Dz</span></span>
       <div class="mail-main">
@@ -4768,7 +5278,7 @@ app.get('/contracts/:id/sign/verify', requireCompany, (req, res) => {
     ${demo}
     <form method="POST" action="/contracts/${pc.id}/sign/verify">
       <label>6-digit signing code</label><input type="text" name="code" required pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code">
-      <button class="btn btn-green" type="submit">Sign contract</button>
+      <button class="btn btn-green js-magnet" type="submit">Sign contract</button>
     </form>
     <p class="shield-note">🛡️ Protected by Dealzoin security agents</p>
   </div>`;
@@ -4885,14 +5395,15 @@ app.get('/new', requireCompany, (req, res) => {
     <p class="muted">Deals carry a value and can be signed into contracts; feed posts keep the network warm.</p>
   </div>
   <div class="grid2">
-    <div class="card card-deal create-card">
+    <div class="card card-deal create-card js-tilt">
+      <div class="card__glare" aria-hidden="true"></div>
       <div class="big-ic">📄</div>
       <h2>Post a deal</h2>
       <p class="muted">Title, value, description — plus an optional photo or video.</p>
       <form method="POST" action="/deals" enctype="multipart/form-data" style="margin-top:14px;text-align:left">
         ${dealFormFieldsHtml()}
         <label>Photo or video (optional — image ≤ 5 MB, video ≤ 25 MB)</label>${mediaInput}
-        <button class="btn" type="submit">Publish deal</button>
+        <button class="btn js-magnet" type="submit">Publish deal</button>
       </form>
     </div>
     <div class="card create-card">
@@ -4967,10 +5478,10 @@ app.get('/profile', requireCompany, (req, res) => {
     </form>`}
   </div>
   <div class="stats">
-    <div class="stat" data-reveal style="--i:0"><div class="num gold" data-count="${deals.length}">${deals.length}</div><div class="lbl">My deals</div></div>
-    <div class="stat" data-reveal style="--i:1"><div class="num" data-count="${posts.length}">${posts.length}</div><div class="lbl">My posts</div></div>
-    <div class="stat" data-reveal style="--i:2"><div class="num mint" data-count="${fc.followers}">${fc.followers}</div><div class="lbl">Followers</div></div>
-    <div class="stat" data-reveal style="--i:3"><div class="num" data-count="${fc.following}">${fc.following}</div><div class="lbl">Following</div></div>
+    <div class="stat js-tilt" data-reveal style="--i:0"><div class="num gold" data-count="${deals.length}">${deals.length}</div><div class="lbl">My deals</div></div>
+    <div class="stat js-tilt" data-reveal style="--i:1"><div class="num" data-count="${posts.length}">${posts.length}</div><div class="lbl">My posts</div></div>
+    <div class="stat js-tilt" data-reveal style="--i:2"><div class="num mint" data-count="${fc.followers}">${fc.followers}</div><div class="lbl">Followers</div></div>
+    <div class="stat js-tilt" data-reveal style="--i:3"><div class="num" data-count="${fc.following}">${fc.following}</div><div class="lbl">Following</div></div>
   </div>
   <h2 class="sec-h">My deals</h2>
   ${dealsHtml}
@@ -5104,7 +5615,7 @@ app.get('/dashboard', requireCompany, (req, res) => {
     ['Contracts I signed', stats.signedPending + ' pending · ' + stats.signedApproved + ' approved', ''],
     ['Contracts on my deals', stats.minePending + ' pending · ' + stats.mineApproved + ' approved', '']
   ];
-  const tilesHtml = `<div class="stats">${tiles.map(([l, n, cls], ti) => `<div class="stat" data-reveal style="--i:${Math.min(ti, 10)}"><div class="num${cls}"${typeof n === 'number' ? ` data-count="${n}"` : ''}>${n}</div><div class="lbl">${l}</div></div>`).join('')}</div>`;
+  const tilesHtml = `<div class="stats">${tiles.map(([l, n, cls], ti) => `<div class="stat js-tilt" data-reveal style="--i:${Math.min(ti, 8)}"><div class="num${cls}"${typeof n === 'number' ? ` data-count="${n}"` : ''}>${n}</div><div class="lbl">${l}</div></div>`).join('')}</div>`;
 
   // My deals table + per-deal chart data
   const myDeals = db.prepare('SELECT * FROM deals WHERE company_id = ? ORDER BY created_at DESC LIMIT 50').all(myId);
@@ -5355,7 +5866,7 @@ app.get('/chat/:id', (req, res) => {
     ? '<p class="muted">Admin view — conversations are read-only for admins.</p>'
     : `<form method="POST" action="/chat/${conv.id}/send" class="chat-send" id="chatform">
          <input type="text" name="body" required maxlength="2000" placeholder="Write a message…" autocomplete="off">
-         <button class="btn" type="submit">Send</button>
+         <button class="btn js-send" type="submit">Send</button>
        </form>`;
 
   // Live updates via SSE (EventSource). The 8s <meta refresh> below is the no-JS / SSE-error fallback —
@@ -5548,7 +6059,7 @@ app.get('/calendar', requireCompany, (req, res) => {
   const upcomingHtml = upcoming.length ? upcoming.map((e, i) => {
     const parts = db.prepare('SELECT company_id FROM event_participants WHERE event_id = ?').all(e.id).map(p => names.get(p.company_id) || '?');
     const dealLink = e.type === 'signing' && e.deal_id ? ` · <a href="/deal/${e.deal_id}">linked deal / contract</a>` : '';
-    return `<div class="card" data-reveal style="--i:${Math.min(i, 10)}" id="ev-${e.id}">
+    return `<div class="card" data-reveal style="--i:${Math.min(i, 8)}" id="ev-${e.id}">
       <div class="feed-head">
         <h3>${e.type === 'signing' ? '✍️' : '📅'} ${esc(e.title)}</h3>
         <span class="badge ${e.type === 'signing' ? 'badge-sealed' : 'badge-pending'}">${esc(e.type)}</span>
@@ -5655,6 +6166,91 @@ app.get('/calendar/join/:id', (req, res) => {
   res.redirect(`https://meet.jit.si/${encodeURIComponent(ev.room)}`);
 });
 
+// ============================= GLOBAL SHIPMENT TRACKING MAP (/tracking) =============================
+/** Client script for the global tracking map: one pulsing marker per in-transit deal
+ *  (gold = other companies, mint = mine), popups with route + status, fit-bounds. Defensive:
+ *  missing Leaflet or empty marker data degrades to a themed fallback note, never an error. */
+const TRACKING_MAP_SCRIPT = `<script>(function(){
+  var el=document.getElementById('tracking-map');
+  if(!el)return;
+  function escH(s){return String(s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+  function fallback(msg){el.innerHTML='<div class="map-fallback">'+escH(msg)+'</div>';}
+  if(typeof L==='undefined'){fallback('🗺️ Map unavailable — the mapping library could not be loaded (you may be offline).');return;}
+  var deals=window.DZ_TRACKING_DEALS||[];
+  if(!deals.length){fallback('No geocoded shipments in transit right now.');return;}
+  try{
+    var map=L.map(el,{scrollWheelZoom:true});
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18,attribution:'&copy; OpenStreetMap contributors'}).addTo(map);
+    var bounds=[];
+    deals.forEach(function(d){
+      var lat=parseFloat(d.lat),lng=parseFloat(d.lng);
+      if(!isFinite(lat)||!isFinite(lng))return;
+      bounds.push([lat,lng]);
+      var cls=d.mine?'dz-pulse dz-pulse-mint':'dz-pulse dz-pulse-gold';
+      L.marker([lat,lng],{icon:L.divIcon({className:'dz-pulse-wrap',html:'<span class="'+cls+'"></span>',iconSize:[14,14],iconAnchor:[7,7]})}).addTo(map)
+        .bindPopup('<b>Deal '+escH(d.num)+'</b> · '+escH(d.type)+'<br>📍 '+escH(d.origin)+' → '+escH(d.dest)+'<br>Status: '+escH(d.status)+'<br><a href="/deal/'+encodeURIComponent(d.id)+'">Open deal →</a>');
+    });
+    if(bounds.length>1)map.fitBounds(bounds,{padding:[40,40]});
+    else if(bounds.length===1)map.setView(bounds[0],6);
+    else fallback('No geocoded shipments in transit right now.');
+  }catch(e){fallback('🗺️ Map could not be rendered here.');}
+})();</script>`;
+
+// Full-width tracking map: every in-transit (dispatched/shipped) CIF/CRF deal as a pulsing marker.
+// Logged-in companies + admin. Coordinates are geocoded lazily; deal values are never shown.
+app.get('/tracking', requireCompanyOrAdmin, async (req, res) => {
+  let deals = [];
+  try {
+    deals = db.prepare(`SELECT * FROM deals WHERE status IN ('dispatched','shipped') AND COALESCE(incoterm, 'CIF') != 'FOP' ORDER BY id DESC LIMIT 200`).all();
+  } catch (e) { deals = []; }
+  const markers = [];
+  for (const d of deals) {
+    try {
+      const geo = await dealGeo(d);
+      if (!validLatLng(geo.oLat, geo.oLng) || !validLatLng(geo.dLat, geo.dLng)) continue;
+      const t = statusProgress(d);
+      // "Mine" = my company's deal, my contracted purchase, or a deal I'm negotiating to buy
+      // (same insider audience as canViewDealTerms — values are still never shown here).
+      const mine = !req.user.isAdmin && (req.user.id === d.company_id || dealBuyerId(d) === req.user.id
+        || !!db.prepare('SELECT 1 FROM negotiations WHERE deal_id = ? AND buyer_id = ? LIMIT 1').get(d.id, req.user.id));
+      markers.push({
+        id: d.id,
+        num: d.deal_number || ('#' + d.id),
+        type: DEAL_TYPES.includes(d.deal_type) ? d.deal_type : 'sell',
+        origin: d.origin || 'Origin',
+        dest: d.destination || 'Destination',
+        status: d.status || 'open',
+        lat: Math.round((geo.oLat + (geo.dLat - geo.oLat) * t) * 1e5) / 1e5,
+        lng: Math.round((geo.oLng + (geo.dLng - geo.oLng) * t) * 1e5) / 1e5,
+        mine: mine
+      });
+    } catch (e) { /* deals that fail to geocode are skipped from the map (still listed below) */ }
+  }
+  const strip = deals.length ? `<div class="track-strip">${deals.map((d, i) => `
+    <div class="card track-card" data-reveal style="--i:${Math.min(i, 8)}">
+      <h4><a href="/deal/${d.id}">${esc(d.deal_number || '#' + d.id)}</a> ${dealStatusChip(d)}</h4>
+      <div class="muted" style="font-size:12px">${esc(d.title.slice(0, 60))}</div>
+      <div style="font-size:12px;margin-top:4px">📍 ${esc(d.origin || '?')} → ${esc(d.destination || 'destination TBD')}</div>
+    </div>`).join('')}</div>`
+    : '<div class="card" data-reveal><p class="muted">No shipments in transit right now. CIF/CRF deals appear here once they reach <b>dispatched</b> or <b>shipped</b>.</p></div>';
+  const mapHtml = markers.length
+    ? `<div id="tracking-map" class="map-embed map-full" role="img" aria-label="Global shipment tracking map"></div>
+       <script>window.DZ_TRACKING_DEALS=${jsJson(markers)};</script>
+       ${TRACKING_MAP_SCRIPT}`
+    : `<div class="card map-placeholder" data-reveal style="margin-top:14px"><h3>🗺️ Global tracking map</h3>
+       <p class="muted" style="margin-top:8px">${deals.length ? 'Map activates once origin &amp; destination are geocoded for the in-transit deals.' : 'Map activates once CIF/CRF deals are dispatched or shipped.'}</p></div>`;
+  const body = `
+  <div class="card" data-reveal>
+    <div class="kicker">Live logistics</div>
+    <h2>🌍 Shipment tracking</h2>
+    <p class="muted">Every in-transit CIF/CRF deal on the network — <span style="color:var(--mint)">mint</span> markers are your shipments,
+      <span style="color:var(--gold)">gold</span> markers are other companies'. Deal values are never shown.</p>
+  </div>
+  ${strip}
+  ${mapHtml}`;
+  res.send(page('Shipment tracking', body, req.user, req.query.msg, req.query.err, 'globe', markers.length ? LEAFLET_HEAD : ''));
+});
+
 // ============================= ADMIN ROUTES =============================
 /** Verify admin credentials: settings-table password override wins, env var is fallback. */
 function adminPasswordOk(pw) {
@@ -5730,8 +6326,8 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
     ['Total companies', stats.companies, ''], ['Pending', stats.pending, ''], ['Approved', stats.approved, ' mint'],
     ['Flagged ⚠️', stats.flagged, ''], ['Deals', stats.deals, ' gold'], ['Contracts pending', stats.contractsPending, ' gold'],
     ['Follows', stats.follows, '']
-  ].map(([l, n, cls], ti) => `<div class="stat" data-reveal style="--i:${Math.min(ti, 10)}"><div class="num${cls}" data-count="${n}">${n}</div><div class="lbl">${l}</div></div>`).join('')}
-    <div class="stat" data-reveal style="--i:7"><div class="num gold" style="font-size:1.15rem;line-height:1.4">${commissionText}</div><div class="lbl">Platform commission (approved deals) · ${feePct}%</div></div></div>`;
+  ].map(([l, n, cls], ti) => `<div class="stat js-tilt" data-reveal style="--i:${Math.min(ti, 8)}"><div class="num${cls}" data-count="${n}">${n}</div><div class="lbl">${l}</div></div>`).join('')}
+    <div class="stat js-tilt" data-reveal style="--i:7"><div class="num gold" style="font-size:1.15rem;line-height:1.4">${commissionText}</div><div class="lbl">Platform commission (approved deals) · ${feePct}%</div></div></div>`;
 
   // Pending companies queue (with ONBOARDING AGENT flags + KYC documents reviewed inline)
   const pending = db.prepare(`SELECT * FROM companies WHERE status = 'pending' ORDER BY created_at ASC`).all();
@@ -6049,7 +6645,7 @@ app.get('/admin/documents', requireAdmin, (req, res) => {
     LEFT JOIN companies c ON c.id = d.company_id
     ORDER BY d.created_at DESC LIMIT 500`).all();
   const rows = docs.length ? docs.map((d, i) => `
-    <tr data-reveal style="--i:${Math.min(i, 10)}">
+    <tr data-reveal style="--i:${Math.min(i, 8)}">
       <td><b>${esc(d.company_name || '(deleted company)')}</b></td>
       <td>${esc(DOC_TYPE_LABELS[d.doc_type] || d.doc_type)}</td>
       <td><a href="/admin/documents/${d.id}/download">${esc(d.filename || 'document.pdf')}</a><br>
