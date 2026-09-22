@@ -208,9 +208,170 @@ try { db.exec("ALTER TABLE companies ADD COLUMN field TEXT DEFAULT ''"); } catch
 try { db.exec("ALTER TABLE companies ADD COLUMN employees TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
 try { db.exec("ALTER TABLE companies ADD COLUMN research_source TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
 try { db.exec("ALTER TABLE verification_codes ADD COLUMN payload TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+// v5 upgrades (Trust & KYC): compliance-grade registration fields on companies.
+try { db.exec("ALTER TABLE companies ADD COLUMN category TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE companies ADD COLUMN activity TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE companies ADD COLUMN trade_license TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE companies ADD COLUMN signature_name TEXT'); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE companies ADD COLUMN signature_at TEXT'); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE companies ADD COLUMN signature_ip TEXT'); } catch (e) { /* column already exists */ }
+// v6 upgrades (Deals 2.0): structured deal fields, status pipeline, shipment tracking, product proof.
+try { db.exec("ALTER TABLE deals ADD COLUMN deal_type TEXT DEFAULT 'sell'"); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE deals ADD COLUMN deal_number TEXT'); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE deals ADD COLUMN category TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE deals ADD COLUMN origin TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE deals ADD COLUMN incoterm TEXT DEFAULT 'CIF'"); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE deals ADD COLUMN product_proof TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE deals ADD COLUMN product_proof_doc_id INTEGER'); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE deals ADD COLUMN status TEXT DEFAULT 'open'"); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE deals ADD COLUMN status_note TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE deals ADD COLUMN tracking_number TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE deals ADD COLUMN tracking_url TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE deals ADD COLUMN contract_party_id INTEGER'); } catch (e) { /* column already exists */ }
+// Unique deal numbers (DZ-<year>-<seq>); old rows stay NULL until backfilled below.
+try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_deals_deal_number ON deals(deal_number)'); } catch (e) { /* index may already exist */ }
+
+// KYC document vault — registration & compliance PDFs, private to owner company + admin.
+db.exec(`
+CREATE TABLE IF NOT EXISTS documents (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  company_id          INTEGER NOT NULL,
+  doc_type            TEXT NOT NULL,                 -- profile_pdf | moa_authority | bank_statement | signed_terms | activity_proof
+  mime                TEXT NOT NULL,
+  filename            TEXT DEFAULT '',
+  data                BLOB NOT NULL,
+  sha256              TEXT DEFAULT '',
+  authenticity_status TEXT DEFAULT 'pass',           -- pass | flag
+  authenticity_notes  TEXT DEFAULT '',
+  created_at          TEXT NOT NULL
+);
+`);
+
+// Deals 2.0 — per-deal document exchange: buyer document requests (kind='request', data NULL)
+// and owner-uploaded response documents (kind='document', PDF or image).
+db.exec(`
+CREATE TABLE IF NOT EXISTS deal_documents (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  deal_id    INTEGER NOT NULL,
+  company_id INTEGER NOT NULL,
+  kind       TEXT NOT NULL DEFAULT 'document',       -- 'request' | 'document'
+  note       TEXT DEFAULT '',
+  mime       TEXT DEFAULT '',
+  filename   TEXT DEFAULT '',
+  data       BLOB,
+  sha256     TEXT DEFAULT '',
+  created_at TEXT NOT NULL
+);
+`);
+
+// ============================= STAGE C SCHEMA (trade pipeline & platform) =============================
+// Negotiation pipeline: LOI -> offer/counter rounds -> buyer approval -> PO -> signing ->
+// owner approval -> commission-split negotiation -> admin final approval -> DONE / REJECTED.
+db.exec(`
+CREATE TABLE IF NOT EXISTS negotiations (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  deal_id           INTEGER NOT NULL,
+  buyer_id          INTEGER NOT NULL,
+  seller_id         INTEGER NOT NULL,
+  state             TEXT NOT NULL DEFAULT 'LOI_SENT',
+  round             INTEGER NOT NULL DEFAULT 0,
+  loi_text          TEXT DEFAULT '',
+  loi_location      TEXT DEFAULT '',
+  loi_quantity      TEXT DEFAULT '',
+  loi_wishes        TEXT DEFAULT '',
+  offer_value       TEXT DEFAULT '',
+  offer_currency    TEXT DEFAULT 'USD',
+  offer_terms       TEXT DEFAULT '',
+  commission_split  TEXT DEFAULT '50-50',
+  split_proposed_by INTEGER,
+  created_at        TEXT NOT NULL,
+  updated_at        TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS negotiation_events (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  negotiation_id INTEGER NOT NULL,
+  actor_id       INTEGER,
+  kind           TEXT NOT NULL,                    -- loi | offer | counter | approve | decline | po | signing | signed | owner_approved | split | split_accept | admin_approved | admin_rejected
+  value          TEXT DEFAULT '',
+  currency       TEXT DEFAULT '',
+  terms          TEXT DEFAULT '',
+  note           TEXT DEFAULT '',
+  created_at     TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS company_members (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  company_id    INTEGER NOT NULL,
+  name          TEXT NOT NULL,
+  email         TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  salt          TEXT NOT NULL,
+  role          TEXT NOT NULL DEFAULT 'member',    -- member | manager
+  status        TEXT NOT NULL DEFAULT 'active',    -- active | deactivated
+  created_at    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS events (
+  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+  creator_company_id INTEGER NOT NULL,
+  title              TEXT NOT NULL,
+  type               TEXT NOT NULL DEFAULT 'meeting', -- meeting | signing
+  event_date         TEXT NOT NULL,                -- YYYY-MM-DD
+  event_time         TEXT DEFAULT '',              -- HH:MM
+  notes              TEXT DEFAULT '',
+  room               TEXT DEFAULT '',              -- Jitsi room slug
+  deal_id            INTEGER,
+  created_at         TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS event_participants (
+  event_id   INTEGER NOT NULL,
+  company_id INTEGER NOT NULL,
+  UNIQUE(event_id, company_id)
+);
+`);
+// Stage C graceful column upgrades (old databases keep booting).
+try { db.exec('ALTER TABLE sessions ADD COLUMN member_id INTEGER'); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE posts ADD COLUMN author_name TEXT'); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE deals ADD COLUMN author_name TEXT'); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE messages ADD COLUMN author_name TEXT'); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE posts ADD COLUMN is_system INTEGER DEFAULT 0'); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE contracts ADD COLUMN negotiation_id INTEGER'); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE negotiations ADD COLUMN split_proposed_by INTEGER'); } catch (e) { /* column already exists */ }
+
+/** Next unique deal number for the current year: DZ-<year>-<zero-padded seq> (counter in settings). */
+function nextDealNumber(year) {
+  const yr = year || new Date().getFullYear();
+  const key = 'deal_seq_' + yr;
+  const tx = db.transaction(() => {
+    const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
+    const seq = (row ? parseInt(row.value, 10) || 0 : 0) + 1;
+    db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+      .run(key, String(seq));
+    return seq;
+  });
+  return `DZ-${yr}-${String(tx()).padStart(4, '0')}`;
+}
+
+// Backfill deal numbers for rows created before Deals 2.0 (oldest first, per their creation year).
+(function backfillDealNumbers() {
+  try {
+    const missing = db.prepare(`SELECT id, created_at FROM deals WHERE deal_number IS NULL OR deal_number = '' ORDER BY created_at ASC, id ASC`).all();
+    for (const d of missing) {
+      const yr = parseInt(String(d.created_at || '').slice(0, 4), 10) || new Date().getFullYear();
+      db.prepare('UPDATE deals SET deal_number = ? WHERE id = ?').run(nextDealNumber(yr), d.id);
+    }
+  } catch (e) { console.error('[Dealzoin] deal-number backfill failed:', e.message); }
+})();
 
 // ============================= PLATFORM COMMISSION =============================
-const PLATFORM_FEE_PCT = 1; // transparent 1% Dealzoin commission on every deal
+const PLATFORM_FEE_PCT = 1; // default 1% Dealzoin commission — the admin can adjust it (settings key platform_fee_pct)
+/** Current platform commission percentage (admin-adjustable, 0.1–20; default 1). */
+function platformFeePct() {
+  try {
+    const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('platform_fee_pct');
+    const n = parseFloat(row && row.value);
+    if (isFinite(n) && n >= 0.1 && n <= 20) return Math.round(n * 100) / 100;
+  } catch (e) { /* fall through to default */ }
+  return PLATFORM_FEE_PCT;
+}
 /** Parse a numeric amount out of a free-text deal value ("50,000 / year" -> 50000). NaN if none. */
 function parseDealValue(value) {
   const m = String(value || '').replace(/[,\s]/g, '').match(/\d+(\.\d+)?/);
@@ -220,25 +381,27 @@ function fmtAmount(n) {
   const r = Math.round(n * 100) / 100;
   return (r % 1 === 0 ? r.toString() : r.toFixed(2)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 }
-/** "Platform fee: 1% (100 EUR) — transparent Dealzoin commission" line for deal surfaces. */
+/** "Platform fee: X% (…) — transparent Dealzoin commission" line for deal surfaces (private contexts only). */
 function feeLineHtml(deal, style) {
+  const pct = platformFeePct();
   const cur = deal.currency || 'USD';
   const num = parseDealValue(deal.value);
   const amount = isFinite(num) && num > 0
-    ? `${fmtAmount(num * PLATFORM_FEE_PCT / 100)} ${esc(cur)}`
-    : `1% of deal value`;
+    ? `${fmtAmount(num * pct / 100)} ${esc(cur)}`
+    : `${pct}% of deal value`;
   const inner = isFinite(num) && num > 0
-    ? `Platform fee: ${PLATFORM_FEE_PCT}% (${amount}) — transparent Dealzoin commission`
-    : `Platform fee: ${PLATFORM_FEE_PCT}% of deal value — transparent Dealzoin commission`;
+    ? `Platform fee: ${pct}% (${amount}) — transparent Dealzoin commission`
+    : `Platform fee: ${pct}% of deal value — transparent Dealzoin commission`;
   return `<div class="muted" style="font-size:12px;${style || ''}">🏦 ${inner}</div>`;
 }
 /** Plain-text fee line for the downloadable contract document. */
 function feeLineText(deal) {
+  const pct = platformFeePct();
   const cur = deal.currency || 'USD';
   const num = parseDealValue(deal.value);
   return isFinite(num) && num > 0
-    ? `Platform fee: ${PLATFORM_FEE_PCT}% (${fmtAmount(num * PLATFORM_FEE_PCT / 100)} ${cur}) — transparent Dealzoin commission`
-    : `Platform fee: ${PLATFORM_FEE_PCT}% of deal value — transparent Dealzoin commission`;
+    ? `Platform fee: ${pct}% (${fmtAmount(num * pct / 100)} ${cur}) — transparent Dealzoin commission`
+    : `Platform fee: ${pct}% of deal value — transparent Dealzoin commission`;
 }
 
 // ============================= MEDIA UPLOADS (MULTER) =============================
@@ -302,6 +465,252 @@ function saveMedia(companyId, file) {
   const info = db.prepare('INSERT INTO media (company_id, mime, filename, data, created_at) VALUES (?,?,?,?,?)')
     .run(companyId, String(file.mimetype).toLowerCase(), String(file.originalname || '').slice(0, 200), file.buffer, now());
   return info.lastInsertRowid;
+}
+
+// ----- Deal form uploads: "media" (image/video) + "product_proof" (PDF) in one multipart form -----
+const dealFieldsUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: VIDEO_MAX_BYTES, files: 2 },
+  fileFilter: (req, file, cb) => {
+    const ext = String(file.originalname || '').split('.').pop().toLowerCase();
+    const mime = String(file.mimetype || '').toLowerCase();
+    if (file.fieldname === 'product_proof') {
+      if (ext === 'pdf' || mime === 'application/pdf') return cb(null, true);
+      return cb(new Error('Product proof must be a PDF document.'));
+    }
+    const okImage = MEDIA_IMAGE_EXT[ext] && mime.startsWith('image/');
+    const okVideo = MEDIA_VIDEO_EXT[ext] && mime.startsWith('video/');
+    if (okImage || okVideo) return cb(null, true);
+    cb(new Error(MEDIA_RULES_MSG));
+  }
+});
+
+/** True when the buffer looks like a real image (png/jpg/gif/webp magic bytes). */
+function isImageBuffer(buf) {
+  if (!buf || buf.length < 12) return false;
+  return (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47)       // png
+      || (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF)                        // jpg
+      || buf.toString('latin1', 0, 4) === 'GIF8'                                        // gif
+      || (buf.toString('latin1', 0, 4) === 'RIFF' && buf.toString('latin1', 8, 12) === 'WEBP'); // webp
+}
+
+/** Multer middleware for the deal form: media (image/video) + product_proof (PDF), magic-byte checked. */
+function dealUpload(req, res, next) {
+  dealFieldsUpload.fields([{ name: 'media', maxCount: 1 }, { name: 'product_proof', maxCount: 1 }])(req, res, (err) => {
+    const back = (req.get('referer') || '/deals/new').split('?')[0];
+    if (err) {
+      const msg = err.code === 'LIMIT_FILE_SIZE' ? 'File too large — images max 5 MB, videos max 25 MB, PDFs max 25 MB.' : (err.message || MEDIA_RULES_MSG);
+      return res.redirect(back + '?err=' + encodeURIComponent(msg));
+    }
+    const files = req.files || {};
+    const media = files.media && files.media[0];
+    if (media) {
+      const ext = String(media.originalname || '').split('.').pop().toLowerCase();
+      if (!MEDIA_VIDEO_EXT[ext] && media.size > IMAGE_MAX_BYTES) {
+        return res.redirect(back + '?err=' + encodeURIComponent('Images are limited to 5 MB.'));
+      }
+      const b = media.buffer;
+      const realImage = isImageBuffer(b);
+      const realVideo = b.length > 11 && (b.toString('latin1', 4, 8) === 'ftyp' || (b[0] === 0x1A && b[1] === 0x45 && b[2] === 0xDF && b[3] === 0xA3));
+      if (!realImage && !realVideo) {
+        return res.redirect(back + '?err=' + encodeURIComponent('Upload rejected: file content does not look like a real image or video.'));
+      }
+      if (realImage && !MEDIA_IMAGE_EXT[ext]) return res.redirect(back + '?err=' + encodeURIComponent(MEDIA_RULES_MSG));
+      if (realVideo && !MEDIA_VIDEO_EXT[ext]) return res.redirect(back + '?err=' + encodeURIComponent(MEDIA_RULES_MSG));
+    }
+    const proof = files.product_proof && files.product_proof[0];
+    if (proof) {
+      if (proof.size > DOC_MAX_BYTES) return res.redirect(back + '?err=' + encodeURIComponent('Product proof PDFs are limited to 15 MB.'));
+      if (!isPdfBuffer(proof.buffer)) return res.redirect(back + '?err=' + encodeURIComponent('Product proof must be a real PDF file.'));
+    }
+    next();
+  });
+}
+
+/** Multer middleware for deal response documents (PDF or image, magic-byte checked in the route). */
+function dealDocUploadMw(req, res, next) {
+  const dealDocUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: DOC_MAX_BYTES, files: 1 },
+    fileFilter: (req, file, cb) => {
+      const ext = String(file.originalname || '').split('.').pop().toLowerCase();
+      const mime = String(file.mimetype || '').toLowerCase();
+      if (ext === 'pdf' || mime === 'application/pdf' || (MEDIA_IMAGE_EXT[ext] && mime.startsWith('image/'))) return cb(null, true);
+      cb(new Error('Only PDF documents or images (JPG, PNG, GIF, WEBP) are allowed.'));
+    }
+  });
+  dealDocUpload.single('doc')(req, res, (err) => {
+    if (err) {
+      const msg = err.code === 'LIMIT_FILE_SIZE' ? 'Document too large — max 15 MB.' : (err.message || 'Invalid document file.');
+      return res.redirect((req.get('referer') || '/timeline').split('?')[0] + '?err=' + encodeURIComponent(msg));
+    }
+    next();
+  });
+}
+
+// ============================= KYC DOCUMENTS (PDF-ONLY UPLOADS) =============================
+// pdf-parse is a hard dependency; loaded defensively so a broken install degrades to
+// "flag" authenticity results instead of crashing the process.
+let pdfParse = null;
+try { pdfParse = require('pdf-parse'); } catch (e) { console.error('[Dealzoin] pdf-parse unavailable:', e.message); }
+
+const DOC_MAX_BYTES = 15 * 1024 * 1024; // 15 MB
+const DOC_MIN_BYTES = 1024;             // 1 KB
+const DOC_TYPES = ['profile_pdf', 'moa_authority', 'bank_statement', 'signed_terms', 'activity_proof'];
+const DOC_TYPE_LABELS = {
+  profile_pdf: 'Company profile PDF',
+  moa_authority: 'MOA & authority document',
+  bank_statement: 'Bank account statement / proof of funds',
+  signed_terms: 'Signed Terms & Conditions',
+  activity_proof: 'Activity proof',
+  product_proof: 'Product proof'
+};
+const PDF_RULES_MSG = 'Only real PDF documents (max 15 MB) are allowed.';
+
+/** True when the buffer starts with the %PDF magic bytes. */
+function isPdfBuffer(buf) {
+  return !!buf && buf.length > 4 && buf.toString('latin1', 0, 5) === '%PDF-';
+}
+
+const pdfUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: DOC_MAX_BYTES, files: 5 },
+  fileFilter: (req, file, cb) => {
+    const ext = String(file.originalname || '').split('.').pop().toLowerCase();
+    if (ext === 'pdf' || String(file.mimetype || '').toLowerCase() === 'application/pdf') return cb(null, true);
+    cb(new Error(PDF_RULES_MSG));
+  }
+});
+
+/** Multer middleware for the registration document fields, with friendly error redirects. */
+function signupDocsUpload(req, res, next) {
+  pdfUpload.fields([
+    { name: 'profile_pdf', maxCount: 1 },
+    { name: 'moa_authority', maxCount: 1 },
+    { name: 'bank_statement', maxCount: 1 },
+    { name: 'signed_terms', maxCount: 1 },
+    { name: 'activity_proof', maxCount: 1 }
+  ])(req, res, (err) => {
+    if (err) {
+      const msg = err.code === 'LIMIT_FILE_SIZE' ? 'A document is too large — PDFs are limited to 15 MB each.' : (err.message || PDF_RULES_MSG);
+      return res.redirect('/signup?err=' + encodeURIComponent(msg));
+    }
+    next();
+  });
+}
+
+/** Extract text + page count from a PDF buffer. Never throws — corrupt PDFs yield null. */
+async function extractPdfText(buffer) {
+  if (!pdfParse || !isPdfBuffer(buffer)) return null;
+  try {
+    // pdf.js (bundled with pdf-parse) misreads Node Buffers whose underlying
+    // ArrayBuffer is pool-shared (byteOffset != 0). Pass a clean zero-offset copy.
+    const data = await pdfParse(new Uint8Array(buffer));
+    return { text: String((data && data.text) || ''), pages: (data && data.numpages) || 0 };
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * DOCUMENT AUTHENTICITY AGENT — runs on every uploaded KYC document.
+ * Returns { status: 'pass'|'flag', notes: [string], text: string }.
+ */
+async function runDocumentAgent(company, docType, file) {
+  const notes = [];
+  let text = '';
+
+  // (g) size window: 1 KB – 15 MB
+  const size = file.buffer ? file.buffer.length : 0;
+  if (size < DOC_MIN_BYTES) notes.push(`suspiciously small file (${size} bytes)`);
+  if (size > DOC_MAX_BYTES) notes.push(`file too large (${size} bytes)`);
+
+  // (a) %PDF magic bytes
+  if (!isPdfBuffer(file.buffer)) {
+    notes.push('missing %PDF magic bytes — not a real PDF');
+  } else {
+    // (b) pdf-parse succeeds & page count >= 1 ; (c) extracted text >= 50 chars
+    const parsed = await extractPdfText(file.buffer);
+    if (!parsed) {
+      notes.push('PDF could not be parsed (corrupt or malformed)');
+    } else {
+      text = parsed.text;
+      if (parsed.pages < 1) notes.push('PDF reports 0 pages');
+      if (text.trim().length < 50) notes.push('no extractable text (scanned-empty document?)');
+
+      // (d) company name appears in text (fuzzy: all significant words, case-insensitive)
+      if (['moa_authority', 'bank_statement', 'signed_terms'].includes(docType)) {
+        const words = String(company.name || '').toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length > 2);
+        const hay = text.toLowerCase();
+        if (words.length && !words.every(w => hay.includes(w))) {
+          notes.push(`company name "${company.name}" not found in document text`);
+        }
+      }
+      // (e) trade license number appears in moa_authority / profile_pdf
+      if (['moa_authority', 'profile_pdf'].includes(docType) && company.trade_license) {
+        if (!text.toLowerCase().includes(String(company.trade_license).toLowerCase())) {
+          notes.push(`trade license "${company.trade_license}" not found in document text`);
+        }
+      }
+    }
+  }
+
+  // (f) duplicate sha256 across companies
+  const sha256 = crypto.createHash('sha256').update(file.buffer || Buffer.alloc(0)).digest('hex');
+  const dup = db.prepare('SELECT company_id FROM documents WHERE sha256 = ? AND company_id != ? LIMIT 1').get(sha256, company.id);
+  if (dup) notes.push('duplicate document — identical file already uploaded by another company');
+
+  const status = notes.length ? 'flag' : 'pass';
+  audit('DOCUMENT AGENT', `document check (${docType})`, status,
+    `"${file.originalname || 'file'}" for "${company.name}": ${notes.length ? notes.join('; ') : 'all checks passed'}`);
+  return { status, notes, text, sha256 };
+}
+
+/** Persist a KYC document row (after the authenticity agent has run). */
+function saveDocument(companyId, docType, file, agent) {
+  const info = db.prepare(`INSERT INTO documents (company_id, doc_type, mime, filename, data, sha256, authenticity_status, authenticity_notes, created_at)
+    VALUES (?,?,?,?,?,?,?,?,?)`)
+    .run(companyId, docType, 'application/pdf', String(file.originalname || '').slice(0, 200),
+         file.buffer, agent.sha256, agent.status, agent.notes.join('; '), now());
+  return info.lastInsertRowid;
+}
+
+/** Authenticity badge: mint ✓ verified / ⚠️ flagged + notes. */
+function authenticityBadge(status, notes) {
+  if (status === 'flag') {
+    return `<span class="warn-badge" title="${esc(notes || '')}"><i class="warn-ic">⚠️</i> flagged</span>${notes ? `<br><span class="flag-note">${esc(notes)}</span>` : ''}`;
+  }
+  return '<span class="badge badge-pass">✓ verified</span>';
+}
+
+/**
+ * Heuristic guesses from a company-profile PDF text (step-1 auto-fill).
+ * Never throws — always returns a (possibly empty) guess object.
+ */
+function guessesFromProfileText(text) {
+  const g = { name: '', website: '', email: '', activity: '', employees: '' };
+  try {
+    const t = String(text || '');
+    const lines = t.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    // Company name: first prominent line (short-ish, mostly letters, not a URL/email/boilerplate).
+    for (const line of lines.slice(0, 15)) {
+      if (line.length < 3 || line.length > 80) continue;
+      if (/https?:|www\.|@|\d{3,}|page\s+\d|confidential/i.test(line)) continue;
+      if (!/[a-zA-Z]/.test(line)) continue;
+      g.name = line;
+      break;
+    }
+    const wm = t.match(/https?:\/\/[^\s<>"')\]]+/i);
+    if (wm) g.website = wm[0].replace(/[.,;:]+$/, '');
+    const em = t.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/);
+    if (em) g.email = em[0].toLowerCase();
+    for (const line of lines) {
+      if (/industry|field|sector|specializ/i.test(line) && line.length >= 8 && line.length <= 300) { g.activity = line; break; }
+    }
+    const empl = t.match(/([~≈]?[\d][\d,. ]{0,12})\s*(?:\+\s*)?employees/i) || t.match(/employees[:\s]+([~≈]?[\d][\d,.]{0,12})/i);
+    if (empl) g.employees = ('~' + empl[1].trim().replace(/\s+/g, '').replace(/^~+/, '')).replace(/^~(?=~)/, '');
+  } catch (e) { /* guesses are best-effort */ }
+  return g;
 }
 
 /** Render an attached image/video inside a feed or deal card. */
@@ -401,6 +810,27 @@ function unreadPrivateContracts(companyId) {
   return db.prepare(`SELECT COUNT(*) AS n FROM private_contracts WHERE recipient_company_id = ? AND status = 'pending_recipient'`).get(companyId).n;
 }
 
+// ============================= SYSTEM ANNOUNCEMENT POSTS =============================
+/**
+ * Congratulations auto-post: inserted when a deal negotiation (or private contract) is finalized.
+ * company_id = 0 (system sender — no FK on posts.company_id), is_system = 1 so every timeline
+ * shows it regardless of follow filters. Deal values are NEVER included — only the title,
+ * deal number and the two company names.
+ */
+function postCongrats(dealTitle, dealNumber, companyAName, companyBName) {
+  const title = `🎉 Deal closed: ${dealTitle}${dealNumber ? ` №${dealNumber}` : ''}`;
+  const body = `${title}\n\nDear ${companyAName} and ${companyBName},\n\n` +
+    `Congratulations on closing this deal on Dealzoin! Your contract has passed final approval and the deal is now officially closed.\n\n` +
+    `We wish both companies a smooth execution — may this be the first of many ledger entries together.\n\n` +
+    `— The Dealzoin team 🪙`;
+  try {
+    db.prepare('INSERT INTO posts (company_id, body, created_at, is_system) VALUES (0, ?, ?, 1)').run(body.slice(0, 2000), now());
+    audit('ANNOUNCEMENT AGENT', 'congratulations post', 'pass', `System post published: "${dealTitle}"${dealNumber ? ' №' + dealNumber : ''} (${companyAName} ⇄ ${companyBName})`);
+  } catch (e) {
+    audit('ANNOUNCEMENT AGENT', 'congratulations post', 'fail', `Could not publish system post for "${dealTitle}": ${e.message}`);
+  }
+}
+
 // ============================= REPUTATION STARS =============================
 /** Gold star rating for a reputation score (1–5); 0/NULL renders muted "Unrated". */
 function starsHtml(rep, small) {
@@ -436,9 +866,10 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 
 /**
  * ONBOARDING AGENT — runs on every company signup.
+ * opts: { website: string, tradeLicense: string } (Trust & KYC upgrade).
  * Returns { hardReject: bool, error: string, flags: [string] }.
  */
-function runOnboardingAgent(name, email) {
+function runOnboardingAgent(name, email, opts) {
   const flags = [];
   const domain = String(email).split('@')[1]?.toLowerCase() || '';
 
@@ -478,6 +909,31 @@ function runOnboardingAgent(name, email) {
     audit('ONBOARDING AGENT', 'name screening', 'flag', `Keyboard-mash name: "${n}"`);
   } else {
     audit('ONBOARDING AGENT', 'name screening', 'pass', `Name OK: "${n}"`);
+  }
+
+  // (e) Trust & KYC: trade license must be present and plausible (flag, not hard reject —
+  // the route already enforces presence; the agent records compliance quality).
+  const tl = String((opts && opts.tradeLicense) || '').trim();
+  if (!tl || tl.length < 4) {
+    flags.push('Trade license number missing or too short');
+    audit('ONBOARDING AGENT', 'trade license check', 'flag', `Trade license missing/too short for "${n}"`);
+  } else {
+    audit('ONBOARDING AGENT', 'trade license check', 'pass', `Trade license recorded: ${tl}`);
+  }
+
+  // (f) Trust & KYC: website domain should roughly match the email domain (warn only).
+  const site = String((opts && opts.website) || '').trim();
+  if (site) {
+    const siteHost = (site.match(/^https?:\/\/([^/\s]+)/i) || [])[1] || '';
+    const siteDomain = siteHost.toLowerCase().replace(/^www\./, '');
+    const roughMatch = siteDomain && domain && (siteDomain === domain || siteDomain.endsWith('.' + domain) || domain.endsWith('.' + siteDomain)
+      || siteDomain.split('.').slice(-2).join('.') === domain.split('.').slice(-2).join('.'));
+    if (!roughMatch) {
+      flags.push(`Website domain (${siteDomain || site}) does not match email domain (${domain})`);
+      audit('ONBOARDING AGENT', 'website/email domain check', 'flag', `Domain mismatch for "${n}": website ${siteDomain || site} vs email ${domain}`);
+    } else {
+      audit('ONBOARDING AGENT', 'website/email domain check', 'pass', `Website domain matches email domain: ${domain}`);
+    }
   }
 
   return { hardReject: false, error: '', flags };
@@ -907,6 +1363,43 @@ const CSS = `
   .discover-row:last-of-type { border-bottom: none; }
   .discover-row .grow { flex: 1; min-width: 0; }
 
+  /* ============ Deals 2.0 — deal numbers, type/status chips, shipment stepper ============ */
+  .deal-num { font-family: var(--font-display); font-weight: 700; font-size: 0.8125rem; color: var(--gold); letter-spacing: 0.04em; white-space: nowrap; }
+  .chip { display: inline-block; border-radius: 999px; padding: 0.15rem 0.6rem; font: 600 0.7rem var(--font-body); text-transform: uppercase; letter-spacing: 0.08em; border: 1px solid var(--border-soft); color: var(--ink-muted); }
+  .chip-sell { color: var(--gold); border-color: var(--border-gold); background: var(--gold-glow); }
+  .chip-buy { color: var(--mint); border-color: var(--ok-border); background: var(--ok-badge-bg); }
+  .chip-category { color: var(--ink-muted); }
+  .status-chip { display: inline-block; border-radius: 999px; padding: 0.15rem 0.6rem; font: 600 0.7rem var(--font-body); text-transform: uppercase; letter-spacing: 0.08em; border: 1px solid var(--ok-border); color: var(--mint); background: var(--ok-badge-bg); }
+  .status-chip.st-open { color: var(--gold); border-color: var(--border-gold); background: var(--gold-glow); }
+  .status-chip.st-production, .status-chip.st-dispatched, .status-chip.st-shipped { color: var(--warning); border-color: var(--warn-border); background: var(--warn-bg); }
+  .status-chip.st-closed { color: var(--ink-muted); border-color: var(--border-soft); background: var(--bg-elevated); }
+  .private-value-note { font-size: 12px; color: var(--ink-muted); white-space: nowrap; }
+  .hint-chips { display: flex; gap: 6px; flex-wrap: wrap; margin: -6px 0 8px; }
+  .hint-chip { display: inline-block; border-radius: 999px; padding: 0.12rem 0.6rem; font: 500 0.72rem var(--font-body); border: 1px dashed var(--border-gold); color: var(--gold); background: transparent; }
+  /* Shipment status stepper — gold progress rail, motion-revealed nodes */
+  .stepper { display: flex; align-items: flex-start; margin: 16px 0 6px; }
+  .stepper .step-node { flex: 1; text-align: center; position: relative; }
+  .stepper .step-node::before { /* rail */
+    content: ""; position: absolute; top: 11px; left: -50%; right: 50%; height: 3px;
+    background: var(--border-soft); z-index: 0;
+  }
+  .stepper .step-node:first-child::before { display: none; }
+  .stepper .step-node.done::before { background: var(--gradient-coin); }
+  .stepper .step-dot {
+    position: relative; z-index: 1; display: inline-flex; align-items: center; justify-content: center;
+    width: 24px; height: 24px; border-radius: 50%; font-size: 12px; font-weight: 700;
+    background: var(--bg-spotlight); border: 2px solid var(--border-soft); color: var(--ink-faint);
+  }
+  .stepper .step-node.done .step-dot { background: var(--gradient-coin); border-color: var(--gold); color: var(--on-gold); box-shadow: var(--gold-shadow-sm); }
+  .stepper .step-node.current .step-dot { border-color: var(--gold); color: var(--gold); box-shadow: 0 0 0 4px var(--gold-glow); }
+  .stepper .step-lbl { display: block; margin-top: 6px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-faint); }
+  .stepper .step-node.done .step-lbl, .stepper .step-node.current .step-lbl { color: var(--gold); }
+  @media (prefers-reduced-motion: no-preference) {
+    html.dz-js .stepper .step-node { opacity: 0; animation: dz-rise .45s cubic-bezier(.2,.7,.25,1) forwards; animation-delay: calc(var(--i, 0) * 90ms); }
+    .stepper .step-node.current .step-dot { animation: dz-steppulse 2.2s ease-in-out infinite; }
+    @keyframes dz-steppulse { 0%, 100% { box-shadow: 0 0 0 3px var(--gold-glow); } 50% { box-shadow: 0 0 0 7px var(--gold-glow); } }
+  }
+
   /* ==================== MOTION DESIGN LAYER ====================
      Living trading-floor feel: drifting atmosphere, choreographed entrances,
      micro-interactions. All motion is gated behind prefers-reduced-motion. */
@@ -1037,6 +1530,40 @@ const CSS = `
     input[name="q"]:focus { box-shadow: 0 0 0 4px var(--gold-glow), 0 0 26px var(--gold-glow); transform: scale(1.01); }
   }
 
+  /* --- Stage C: negotiation timeline (rounds) --- */
+  .tl { position: relative; margin: 6px 0 18px; padding-left: 26px; }
+  .tl::before { content: ""; position: absolute; left: 8px; top: 6px; bottom: 6px; width: 2px;
+    background: linear-gradient(180deg, var(--gold), var(--mint)); opacity: .35; border-radius: 2px; }
+  .tl-item { position: relative; padding: 10px 0 10px 8px; }
+  .tl-dot { position: absolute; left: -24px; top: 16px; width: 14px; height: 14px; border-radius: 50%;
+    background: var(--surface-card); border: 2px solid var(--gold); box-shadow: 0 0 10px var(--gold-glow); }
+  .tl-body { background: var(--bg-elevated); border: 1px solid var(--border-soft); border-radius: 12px; padding: 10px 14px;
+    transition: transform .25s ease, border-color .25s ease; }
+  .tl-body:hover { transform: translateX(3px); border-color: var(--border-gold); }
+
+  /* --- Stage C: congratulations announcement card --- */
+  .card-announce { border: 1px solid var(--border-gold);
+    background: linear-gradient(150deg, rgba(245,185,66,.12), rgba(63,224,176,.06) 60%, transparent),
+      var(--surface-card); box-shadow: 0 0 34px var(--gold-glow); }
+
+  /* --- Stage C: calendar grid --- */
+  .cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; }
+  .cal-dow { text-align: center; font-size: 11px; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--ink-muted); padding: 4px 0; }
+  .cal-cell { min-height: 74px; border: 1px solid var(--border-soft); border-radius: 10px; padding: 5px 6px;
+    background: var(--bg-elevated); transition: border-color .2s ease, box-shadow .2s ease; }
+  .cal-cell:hover { border-color: var(--border-gold); box-shadow: 0 0 14px var(--gold-glow); }
+  .cal-empty { background: transparent; border-style: dashed; opacity: .4; }
+  .cal-today { border-color: var(--gold); box-shadow: inset 0 0 0 1px var(--gold); }
+  .cal-day { font-size: 12px; font-weight: 600; color: var(--ink-muted); margin-bottom: 3px; }
+  .cal-today .cal-day { color: var(--gold); }
+  .cal-event { display: block; font-size: 11px; line-height: 1.3; padding: 2px 6px; margin-bottom: 2px;
+    border-radius: 6px; background: var(--gold-glow); color: var(--gold); text-decoration: none;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transition: transform .2s ease; }
+  .cal-event:hover { transform: translateX(2px); }
+  .cal-event.cal-signing { background: rgba(63,224,176,.14); color: var(--mint); }
+  @media (max-width: 700px) { .cal-cell { min-height: 52px; } .cal-event { font-size: 10px; } }
+
   /* Reduced motion: kill every animation/transition globally, show content instantly. */
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after {
@@ -1057,7 +1584,8 @@ const NAV_ICONS = {
   dashboard: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 21h18"/><path d="M6 21v-7M11 21V9M16 21v-11M21 21V5"/></svg>',
   plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
   bell: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8.5a6 6 0 0 0-12 0c0 6.5-2.5 7.5-2.5 7.5h17S18 15 18 8.5z"/><path d="M10 20a2.2 2.2 0 0 0 4 0"/></svg>',
-  contracts: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7.5 9 6 9-6"/></svg>'
+  contracts: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7.5 9 6 9-6"/></svg>',
+  calendar: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 9.5h18M8 3v4M16 3v4"/><path d="M7.5 14h3M13.5 14h3M7.5 17.5h3"/></svg>'
 };
 function navIcon(key, href, label, active, badge) {
   const badgeHtml = badge > 0 ? `<span class="nav-badge" aria-label="${badge} unread">${badge > 99 ? '99+' : badge}</span>` : '';
@@ -1090,6 +1618,7 @@ function page(title, body, user, msg, err, active, headExtra) {
          ${navIcon('home', '/timeline', 'Home', active)}
          ${navIcon('chats', '/chats', 'Chats', active, unread)}
          ${navIcon('contracts', '/contracts', 'Contracts', active, contractsUnread)}
+         ${navIcon('calendar', '/calendar', 'Calendar', active)}
          ${navIcon('bell', '/notifications', 'Notifications', active, notifUnread)}
          ${navIcon('search', '/search', 'Search', active)}
          ${navIcon('profile', '/profile', 'Profile', active)}
@@ -1210,6 +1739,107 @@ function optionsHtml(list, selected) {
   return list.map(v => `<option value="${esc(v)}"${v === selected ? ' selected' : ''}>${esc(v)}</option>`).join('');
 }
 
+// ----- Deals 2.0: types, incoterms, status pipeline -----
+const DEAL_TYPES = ['sell', 'buy'];
+const DEAL_INCOTERMS = ['FOP', 'CIF', 'CRF'];
+const INCOTERM_EXPLAINERS = {
+  FOP: 'FOP — Free on Plane/Point: the buyer arranges & pays main carriage. Shipment tracking is not available on the platform.',
+  CIF: 'CIF — Cost, Insurance & Freight: the seller pays shipping and insurance to the destination port. Platform tracking enabled.',
+  CRF: 'CRF — Cost & Freight: the seller pays freight to the destination port; insurance is on the buyer. Platform tracking enabled.'
+};
+const DEAL_STATUSES = ['open', 'production', 'dispatched', 'shipped', 'delivered'];
+/** Small status chip for feed cards and lists. */
+function dealStatusChip(deal) {
+  const st = deal.contract_state === 'approved' ? 'closed' : (deal.status || 'open');
+  return `<span class="status-chip st-${esc(st)}">${st === 'closed' ? 'closed · contracted' : esc(st)}</span>`;
+}
+/** Sell/buy + category chips row for deal cards. */
+function dealTypeChips(deal) {
+  const t = DEAL_TYPES.includes(deal.deal_type) ? deal.deal_type : 'sell';
+  return `<span class="chip chip-${t}">${t === 'sell' ? 'Selling' : 'Buying'}</span>`
+    + (deal.category ? ` <span class="chip chip-category">${esc(deal.category)}</span>` : '');
+}
+/** The contracted buyer company id for a deal: finalized contract_party_id, else the signer on a live contract (legacy name fallback last). */
+function dealBuyerId(deal) {
+  if (!deal) return null;
+  if (deal.contract_party_id) return deal.contract_party_id;
+  const live = db.prepare(`SELECT signer_company_id FROM contracts WHERE deal_id = ? AND status IN ('pending','pending_owner','pending_admin') ORDER BY id DESC LIMIT 1`).get(deal.id);
+  if (live) return live.signer_company_id;
+  if (deal.contract_state === 'approved' && deal.contract_party) {
+    const row = db.prepare('SELECT id FROM companies WHERE name = ?').get(deal.contract_party);
+    if (row) return row.id;
+  }
+  return null;
+}
+/** Themed gold shipment stepper (open → production → dispatched → shipped → delivered). */
+function stepperHtml(deal) {
+  const closed = deal.contract_state === 'approved' || deal.status === 'closed';
+  const curIdx = DEAL_STATUSES.indexOf(deal.status);
+  const doneThrough = closed ? DEAL_STATUSES.length - 1 : (curIdx < 0 ? 0 : curIdx);
+  const nodes = DEAL_STATUSES.map((s, i) => {
+    const cls = closed || i < doneThrough ? 'done' : (i === doneThrough ? (closed ? 'done' : 'current done') : '');
+    return `<div class="step-node ${cls}" style="--i:${i}"><span class="step-dot">${closed || i <= doneThrough ? '✓' : (i + 1)}</span><span class="step-lbl">${esc(s)}</span></div>`;
+  }).join('');
+  return `<div class="stepper" role="list" aria-label="Deal status">${nodes}</div>`
+    + (closed ? '<p style="margin-top:8px"><span class="badge badge-contract">Deal closed — contract finalized ✓</span></p>' : '');
+}
+/** Shared deal composer fields (used by /deals/new and /new). */
+function dealFormFieldsHtml() {
+  return `
+      <label>I want to…</label>
+      <div style="display:flex;gap:16px;margin-bottom:12px">
+        <label style="display:flex;gap:8px;align-items:center;margin:0;font-weight:600;color:var(--ink-primary)">
+          <input type="radio" name="deal_type" value="sell" style="width:auto;margin:0" checked> 💰 SELL</label>
+        <label style="display:flex;gap:8px;align-items:center;margin:0;font-weight:600;color:var(--ink-primary)">
+          <input type="radio" name="deal_type" value="buy" style="width:auto;margin:0"> 🛒 BUY</label>
+      </div>
+      <label>Deal title</label><input type="text" name="title" required maxlength="160">
+      <div class="grid2" style="gap:10px">
+        <div><label>Category (required)</label><select name="category" required><option value="">— choose —</option>${optionsHtml(COMPANY_CATEGORIES, '')}</select></div>
+        <div><label>Origin location (required)</label><input type="text" name="origin" required maxlength="160" placeholder="e.g. Rotterdam, NL"></div>
+      </div>
+      <label>Incoterm</label>
+      <select name="incoterm" id="incoterm-select">${optionsHtml(DEAL_INCOTERMS, 'CIF')}</select>
+      <p class="muted" style="margin:-6px 0 12px">${esc(INCOTERM_EXPLAINERS.FOP)}<br>${esc(INCOTERM_EXPLAINERS.CIF)}<br>${esc(INCOTERM_EXPLAINERS.CRF)}</p>
+      <label>Deal value (e.g. 50,000 / year) — shared privately, never shown on feeds</label><input type="text" name="value" maxlength="80">
+      <div class="grid2" style="gap:10px">
+        <div><label>Currency</label><select name="currency">${optionsHtml(DEAL_CURRENCIES, 'USD')}</select></div>
+        <div><label>Time period</label><select name="time_period">${optionsHtml(DEAL_TIME_PERIODS, '30 days')}</select></div>
+      </div>
+      <label>Description</label><textarea name="description" rows="6" required maxlength="4000"></textarea>
+      <div id="proof-section">
+        <hr class="sep">
+        <label>Product proof (selling)</label>
+        <div style="display:flex;gap:16px;margin-bottom:10px">
+          <label style="display:flex;gap:8px;align-items:center;margin:0;font-weight:500;color:var(--ink-primary)">
+            <input type="radio" name="proof_mode" value="pdf" style="width:auto;margin:0" checked> Upload proof PDF</label>
+          <label style="display:flex;gap:8px;align-items:center;margin:0;font-weight:500;color:var(--ink-primary)">
+            <input type="radio" name="proof_mode" value="manual" style="width:auto;margin:0"> Describe manually</label>
+        </div>
+        <div id="proof-pdf-block">
+          <label class="file-btn"><span class="file-btn-text" data-default="📎 Upload product proof (PDF, max 15 MB)">📎 Upload product proof (PDF, max 15 MB)</span>
+            <input type="file" class="file-input" name="product_proof" accept="application/pdf,.pdf"></label>
+          <p class="muted" style="margin:-4px 0 10px">Screened by the Document Authenticity Agent.</p>
+        </div>
+        <div id="proof-manual-block" style="display:none">
+          <label>Product proof — manual description</label>
+          <textarea name="product_proof_text" rows="3" maxlength="2000" placeholder="e.g. Warehouse stock of 12,000 units, batch certificates available on request…"></textarea>
+        </div>
+      </div>
+      <script>(function(){
+        function sync(){
+          var selling=(document.querySelector('input[name=deal_type]:checked')||{}).value!=='buy';
+          var sec=document.getElementById('proof-section'); if(sec)sec.style.display=selling?'':'none';
+          var mode=(document.querySelector('input[name=proof_mode]:checked')||{}).value||'pdf';
+          var pb=document.getElementById('proof-pdf-block'), mb=document.getElementById('proof-manual-block');
+          if(pb)pb.style.display=(selling&&mode==='pdf')?'':'none';
+          if(mb)mb.style.display=(selling&&mode==='manual')?'':'none';
+        }
+        document.querySelectorAll('input[name=deal_type],input[name=proof_mode]').forEach(function(r){r.addEventListener('change',sync);});
+        sync();
+      })();</script>`;
+}
+
 // ----- Styled upload button (hides the native file input) -----
 const MEDIA_ACCEPT = 'image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm';
 function fileButtonHtml(labelText) {
@@ -1222,11 +1852,11 @@ function fileButtonHtml(labelText) {
 function isSecureReq(req) {
   return req && (req.secure || req.headers['x-forwarded-proto'] === 'https');
 }
-function createSession(req, res, companyId, isAdmin) {
+function createSession(req, res, companyId, isAdmin, memberId) {
   const token = randomToken();
   const expires = new Date(Date.now() + SESSION_TTL_MS).toISOString();
-  db.prepare('INSERT INTO sessions (token, company_id, is_admin, created_at, expires_at) VALUES (?,?,?,?,?)')
-    .run(token, companyId, isAdmin ? 1 : 0, now(), expires);
+  db.prepare('INSERT INTO sessions (token, company_id, is_admin, member_id, created_at, expires_at) VALUES (?,?,?,?,?,?)')
+    .run(token, companyId, isAdmin ? 1 : 0, memberId || null, now(), expires);
   res.setHeader('Set-Cookie',
     `dz_session=${signedCookieValue(token)}; HttpOnly; Path=/; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}; SameSite=Lax${isSecureReq(req) ? '; Secure' : ''}`);
 }
@@ -1244,6 +1874,12 @@ function currentUser(req) {
   if (sess.is_admin) return { id: 0, name: 'Admin', isAdmin: true };
   const c = db.prepare('SELECT id, name, status FROM companies WHERE id = ?').get(sess.company_id);
   if (!c || c.status !== 'approved') return null;
+  // Sub-account session: resolve the member (must still be active) and attach attribution info.
+  if (sess.member_id) {
+    const m = db.prepare(`SELECT id, name, role, status FROM company_members WHERE id = ? AND company_id = ?`).get(sess.member_id, c.id);
+    if (!m || m.status !== 'active') return null;
+    return { id: c.id, name: c.name, isAdmin: false, memberId: m.id, memberName: m.name, memberRole: m.role };
+  }
   return { id: c.id, name: c.name, isAdmin: false };
 }
 /** Guard: approved company session required. */
@@ -1294,63 +1930,237 @@ app.get('/', (req, res) => {
   res.send(page('Welcome', body, user, req.query.msg, req.query.err));
 });
 
-// ----- Company signup (ONBOARDING AGENT runs here) -----
-app.get('/signup', (req, res) => {
+// ============================= TERMS & CONDITIONS (REGISTRATION) =============================
+// The commission percentage in clauses 4 is live — it reflects the admin-adjustable platform_fee_pct setting.
+function termsClauses() {
+  const pct = platformFeePct();
+  return [
+  '1. LAWFUL CONDUCT. The registering company shall not use the Dealzoin platform for any illegal activity, and shall not offer, negotiate, or conclude any trade with countries, entities or individuals subject to international sanctions or bans.',
+  '2. TRANSPARENCY PLEDGE. The company pledges to submit truthful, accurate and current documents and information upon request by the platform, and to promptly correct any submission found to be inaccurate.',
+  `3. ANTI-MONEY-LAUNDERING PLEDGE. The company pledges that it will not use the platform for money fraud, money laundering, or the concealment of the origin or ownership of funds, and will cooperate with lawful compliance inquiries.`,
+  `4. PLATFORM COMMISSION. The platform commission (currently ${pct}% of deal value) becomes due after the required approvals have been granted but BEFORE deal processing begins. The commission is transparent, disclosed before signing, and separate from the deal value exchanged between the parties.`,
+  '5. SIGNING RESPONSIBILITY. The individual registering and signing on behalf of the company is fully responsible for every contract they sign on the platform, and warrants they hold the signing authority of the company.',
+  '6. PLATFORM LIABILITY LIMITS. Dealzoin provides the network, signing rooms and security agents as a venue only. To the maximum extent permitted by law, the platform is not liable for the performance of contracts between member companies, nor for indirect or consequential damages.',
+  '7. DOCUMENT AUTHENTICITY. All documents uploaded to the platform must be authentic and unaltered. Forged, duplicated or misleading documents are grounds for immediate rejection, suspension and reporting to the competent authorities.'
+  ];
+}
+function signupPledges() {
+  return [
+  ['pledge_legal', 'We pledge not to engage in illegal activity or trade with sanctioned/banned countries.'],
+  ['pledge_transparency', 'We pledge to submit truthful documents and information whenever the platform requests them.'],
+  ['pledge_aml', 'We pledge not to engage in money fraud or money laundering of any kind.'],
+  ['pledge_commission', `We accept the platform commission (currently ${platformFeePct()}%), due after approvals but before deal processing.`],
+  ['pledge_responsibility', 'The signer is fully responsible for the contracts they sign, and all uploaded documents are authentic.']
+  ];
+}
+const COMPANY_CATEGORIES = ['Trading', 'Manufacturing', 'Logistics', 'Technology', 'Agriculture', 'Energy', 'Construction', 'Healthcare', 'Finance', 'Other'];
+
+/** Full registration Terms & Conditions page (public). */
+app.get('/legal/terms', (req, res) => {
   const body = `
-  <div class="card" style="max-width:520px;margin:0 auto">
-    <h2>Register your company</h2>
-    <p class="muted" style="margin-bottom:14px">Companies only — no individual accounts. New companies are reviewed by an admin.</p>
-    <form method="POST" action="/signup">
-      <label>Company name</label><input type="text" name="name" required maxlength="120">
-      <label>Business email</label><input type="email" name="email" required maxlength="160">
-      <label>Password (min 8 characters)</label><input type="password" name="password" required minlength="8" maxlength="200">
-      <label>Website</label><input type="url" name="website" placeholder="https://example.com" maxlength="200">
+  <div class="card vault">
+    <div class="kicker">Legal · Registration agreement</div>
+    <h2 style="margin:6px 0 10px">📜 Dealzoin Terms &amp; Conditions</h2>
+    <p class="muted" style="margin-bottom:12px">These terms govern company registration on the Dealzoin B2B network. Every registering company must read, sign and upload a signed copy during registration.</p>
+    ${termsClauses().map(c => `<p style="margin-bottom:10px">${esc(c)}</p>`).join('')}
+    <hr class="sep">
+    <p class="muted">Download this document, print it, sign it, and upload the signed copy during registration.</p>
+    <div class="feed-actions" style="margin-top:12px">
+      <a class="btn" href="/legal/terms/download">Download Terms &amp; Conditions (.doc)</a>
+      <a class="btn btn-outline" href="/signup">Back to registration</a>
+    </div>
+  </div>`;
+  res.send(page('Terms & Conditions', body, currentUser(req), req.query.msg, req.query.err));
+});
+
+/** Download the Terms & Conditions as a Word-compatible .doc (same pattern as contracts). */
+app.get('/legal/terms/download', (req, res) => {
+  const doc = `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word">
+<head><meta charset="utf-8"><title>Dealzoin Terms &amp; Conditions</title></head>
+<body style="font-family:Calibri,Arial,sans-serif">
+  <h1>Dealzoin — Registration Terms &amp; Conditions</h1>
+  <p><b>Generated:</b> ${esc(now())}</p>
+  ${termsClauses().map(c => `<p>${esc(c)}</p>`).join('')}
+  <p>__________________________<br>Authorized signatory — full legal name, signature &amp; date</p>
+</body></html>`;
+  res.setHeader('Content-Type', 'application/msword');
+  res.setHeader('Content-Disposition', 'attachment; filename="dealzoin-terms-and-conditions.doc"');
+  res.send(doc);
+});
+
+// ----- Company signup (compliance-grade: ONBOARDING + DOCUMENT AUTHENTICITY agents run here) -----
+app.get('/signup', (req, res) => {
+  const pledgeBoxes = signupPledges().map(([key, text]) => `
+      <label style="display:flex;gap:8px;align-items:flex-start;margin:8px 0;font-weight:500;color:var(--ink-primary)">
+        <input type="checkbox" name="${key}" value="yes" style="width:auto;margin:3px 0 0" required>
+        <span>${esc(text)}</span></label>`).join('');
+  const docInput = (name, label, required) => `
+      <label>${esc(label)}${required ? ' (required, PDF)' : ' (optional, PDF)'}</label>
+      <label class="file-btn"><span class="file-btn-text" data-default="📎 ${esc(label)}">📎 ${esc(label)}</span>
+        <input type="file" class="file-input" name="${name}" accept="application/pdf,.pdf"${required ? ' required' : ''}></label>`;
+  const body = `
+  <div class="card" style="max-width:620px;margin:0 auto" data-reveal>
+    <div class="kicker">Compliance-grade registration</div>
+    <h2 style="margin:6px 0 8px">Register your company</h2>
+    <p class="muted" style="margin-bottom:14px">Companies only — no individual accounts. New companies are reviewed by an admin before they can trade.</p>
+
+    <div class="card" style="background:var(--bg-elevated)">
+      <h3 style="margin-bottom:6px">Step 1 — Company profile PDF <span class="muted">(optional, encouraged)</span></h3>
+      <p class="muted" style="margin-bottom:10px">Upload your company profile and our agent will auto-fill the form below for you to review.</p>
+      <label class="file-btn"><span class="file-btn-text" id="profile-label" data-default="📎 Upload your company profile (PDF)">📎 Upload your company profile (PDF)</span>
+        <input type="file" class="file-input" id="profile-pdf" name="profile_pdf" accept="application/pdf,.pdf" form="signup-form"></label>
+      <div id="parse-note"></div>
+    </div>
+
+    <h3 style="margin:16px 0 6px">Step 2 — Company details &amp; KYC documents</h3>
+    <form method="POST" action="/signup/complete" enctype="multipart/form-data" id="signup-form">
+      <label>Company name</label><input type="text" name="name" id="f-name" required maxlength="120">
+      <div class="grid2">
+        <div><label>Business email</label><input type="email" name="email" id="f-email" required maxlength="160"></div>
+        <div><label>Password (min 8 characters)</label><input type="password" name="password" required minlength="8" maxlength="200"></div>
+      </div>
+      <label>Website (required)</label><input type="url" name="website" id="f-website" required placeholder="https://example.com" maxlength="200">
       <label>Description</label><textarea name="description" rows="4" maxlength="2000"></textarea>
+      <label>Field of activity (required)</label><input type="text" name="activity" id="f-activity" required maxlength="300" placeholder="e.g. Wholesale electronics trading">
+      <div class="grid2">
+        <div><label>Category (required)</label><select name="category" required><option value="">— choose —</option>${optionsHtml(COMPANY_CATEGORIES, '')}</select></div>
+        <div><label>Trade license number (required)</label><input type="text" name="trade_license" required minlength="4" maxlength="80" placeholder="e.g. TL-9988"></div>
+      </div>
+
+      <hr class="sep">
+      ${docInput('moa_authority', 'MOA & authority document — Memorandum of Association / authorization proving you may register this company', true)}
+      ${docInput('bank_statement', 'Bank account statement / proof of funds', true)}
+      <label>Signed Terms &amp; Conditions (required, PDF)</label>
+      <p class="muted" style="margin-bottom:8px"><a href="/legal/terms">Read the Terms &amp; Conditions</a> — download, print, sign, and upload the signed copy below.
+        <a href="/legal/terms/download">Download the Terms &amp; Conditions (.doc)</a></p>
+      <label class="file-btn"><span class="file-btn-text" data-default="📎 Upload signed Terms &amp; Conditions">📎 Upload signed Terms &amp; Conditions</span>
+        <input type="file" class="file-input" name="signed_terms" accept="application/pdf,.pdf" required></label>
+      ${docInput('activity_proof', 'Activity proof (e.g. portfolio, catalog, past invoices)', false)}
+
+      <hr class="sep">
+      <h3 style="margin-bottom:6px">Pledges &amp; signature</h3>
+      ${pledgeBoxes}
+      <label>Typed legal signature — type your full legal name; this acts as your signature</label>
+      <input type="text" name="signature_name" required maxlength="120" placeholder="Full legal name of the authorized signatory">
+      <p class="muted" style="margin-bottom:12px">Your signature timestamp and IP address are recorded with this registration.</p>
       <button class="btn" type="submit">Create company account</button>
     </form>
     <p class="muted" style="margin-top:12px">Already approved? <a href="/login">Sign in</a></p>
-  </div>`;
+    <p class="shield-note">🛡️ Screened by the Onboarding &amp; Document Authenticity agents</p>
+  </div>
+  <script>(function(){
+    var inp=document.getElementById('profile-pdf');
+    if(!inp)return;
+    inp.addEventListener('change',function(){
+      var note=document.getElementById('parse-note');
+      if(!inp.files||!inp.files.length)return;
+      var fd=new FormData();
+      fd.append('profile',inp.files[0]);
+      if(note)note.innerHTML='<p class="muted" style="margin-top:8px">⏳ Reading your company profile…</p>';
+      fetch('/signup/parse-profile',{method:'POST',body:fd}).then(function(r){return r.json();}).then(function(g){
+        if(g&&g.ok){
+          var set=function(id,v){var el=document.getElementById(id);if(el&&v&&!el.value)el.value=v;};
+          set('f-name',g.name);set('f-website',g.website);set('f-email',g.email);set('f-activity',g.activity);
+          if(note)note.innerHTML='<div class="flash-ok" style="margin-top:8px">✓ Auto-filled from your company profile — please review.</div>';
+        }else{
+          if(note)note.innerHTML='<div class="flash-err" style="margin-top:8px">⚠ '+(g&&g.error?g.error:'Could not read that PDF — please fill the form manually.')+'</div>';
+        }
+      }).catch(function(){
+        if(note)note.innerHTML='<div class="flash-err" style="margin-top:8px">⚠ Could not read that PDF — please fill the form manually.</div>';
+      });
+    });
+  })();</script>`;
   res.send(page('Sign up', body, null, req.query.msg, req.query.err));
 });
 
-app.post('/signup', (req, res) => {
-  const { name, email, password, website, description } = req.body;
-  const nm = String(name || '').trim();
-  const em = String(email || '').trim().toLowerCase();
+/** AJAX helper: parse an uploaded company-profile PDF and return auto-fill guesses as JSON. */
+app.post('/signup/parse-profile', (req, res) => {
+  pdfUpload.single('profile')(req, res, async (err) => {
+    if (err) return res.json({ ok: false, error: err.code === 'LIMIT_FILE_SIZE' ? 'PDF too large (max 15 MB).' : PDF_RULES_MSG });
+    if (!req.file) return res.json({ ok: false, error: 'No PDF received.' });
+    if (!isPdfBuffer(req.file.buffer)) return res.json({ ok: false, error: 'That file is not a real PDF.' });
+    const parsed = await extractPdfText(req.file.buffer);
+    if (!parsed) return res.json({ ok: false, error: 'Could not parse that PDF — it may be corrupt or password-protected.' });
+    const g = guessesFromProfileText(parsed.text);
+    res.json({ ok: true, ...g });
+  });
+});
+
+/** Step 2: full registration — fields, KYC documents, pledges, typed signature. */
+async function signupCompleteHandler(req, res) {
+  const fail = (m) => res.redirect('/signup?err=' + encodeURIComponent(m));
+  const b = req.body || {};
+  const nm = String(b.name || '').trim();
+  const em = String(b.email || '').trim().toLowerCase();
   // Sanitize website: only allow http(s) URLs (blocks javascript: etc.); prepend https:// if missing.
-  let site = String(website || '').trim().slice(0, 200);
+  let site = String(b.website || '').trim().slice(0, 200);
   if (site && !/^https?:\/\//i.test(site)) site = 'https://' + site.replace(/^[a-z][a-z0-9+.-]*:/i, '');
   if (site && !/^https:\/\/[^\s]+$/i.test(site)) site = '';
+  const activity = String(b.activity || '').trim().slice(0, 300);
+  const category = COMPANY_CATEGORIES.includes(b.category) ? b.category : '';
+  const tradeLicense = String(b.trade_license || '').trim().slice(0, 80);
+  const signatureName = String(b.signature_name || '').trim().slice(0, 120);
 
-  if (!nm || !em || !password) {
-    return res.redirect('/signup?err=' + encodeURIComponent('Company name, email and password are required.'));
+  if (!nm || !em || !b.password) return fail('Company name, email and password are required.');
+  if (String(b.password).length < 8) return fail('Password must be at least 8 characters.');
+  if (!site) return fail('A valid company website is required (https://…).');
+  if (!activity) return fail('Field of activity is required.');
+  if (!category) return fail('Please choose a company category.');
+  if (tradeLicense.length < 4) return fail('A valid trade license number (min 4 characters) is required.');
+  const missingPledge = signupPledges().find(([key]) => b[key] !== 'yes');
+  if (missingPledge) return fail('All five pledges must be accepted to register.');
+  if (!signatureName) return fail('Please type your full legal name as your signature.');
+
+  // Required KYC documents (PDF-only, magic-byte checked).
+  const files = req.files || {};
+  for (const docType of ['moa_authority', 'bank_statement', 'signed_terms']) {
+    const f = files[docType] && files[docType][0];
+    if (!f) return fail(`Missing required document: ${DOC_TYPE_LABELS[docType]}.`);
+    if (!isPdfBuffer(f.buffer)) return fail(`${DOC_TYPE_LABELS[docType]} must be a real PDF file.`);
   }
-  if (String(password).length < 8) {
-    return res.redirect('/signup?err=' + encodeURIComponent('Password must be at least 8 characters.'));
+  for (const docType of ['profile_pdf', 'activity_proof']) {
+    const f = files[docType] && files[docType][0];
+    if (f && !isPdfBuffer(f.buffer)) return fail(`${DOC_TYPE_LABELS[docType]} must be a real PDF file.`);
   }
 
   // --- ONBOARDING AGENT automated checks ---
-  const check = runOnboardingAgent(nm, em);
-  if (check.hardReject) {
-    return res.redirect('/signup?err=' + encodeURIComponent(check.error));
-  }
+  const check = runOnboardingAgent(nm, em, { website: site, tradeLicense });
+  if (check.hardReject) return fail(check.error);
 
   const existing = db.prepare('SELECT id FROM companies WHERE email = ?').get(em);
-  if (existing) {
-    return res.redirect('/signup?err=' + encodeURIComponent('A company with this email is already registered.'));
-  }
+  if (existing) return fail('A company with this email is already registered.');
 
   const salt = newSalt();
-  db.prepare(`INSERT INTO companies (name, email, password_hash, salt, website, description, status, flagged, flag_reasons, created_at)
-              VALUES (?,?,?,?,?,?, 'pending', ?, ?, ?)`)
-    .run(nm, em, hashPassword(password, salt), salt,
-         site, String(description || '').trim().slice(0, 2000),
-         check.flags.length ? 1 : 0, check.flags.join('; '), now());
+  const signatureIp = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim().slice(0, 80);
+  const info = db.prepare(`INSERT INTO companies (name, email, password_hash, salt, website, description, status, flagged, flag_reasons, created_at,
+              category, activity, trade_license, signature_name, signature_at, signature_ip)
+              VALUES (?,?,?,?,?,?, 'pending', ?, ?, ?, ?,?,?,?,?,?)`)
+    .run(nm, em, hashPassword(b.password, salt), salt,
+         site, String(b.description || '').trim().slice(0, 2000),
+         check.flags.length ? 1 : 0, check.flags.join('; '), now(),
+         category, activity, tradeLicense, signatureName, now(), signatureIp);
+  const companyId = info.lastInsertRowid;
   audit('ONBOARDING AGENT', 'signup decision', check.flags.length ? 'flag' : 'pass',
-        `Company "${nm}" registered as pending${check.flags.length ? ' with warnings: ' + check.flags.join('; ') : ''}`);
+        `Company "${nm}" registered as pending (category: ${category}, trade license: ${tradeLicense})${check.flags.length ? ' with warnings: ' + check.flags.join('; ') : ''}`);
 
-  res.redirect('/login?msg=' + encodeURIComponent('Registration received! Your company is pending admin approval.'));
-});
+  // Store every uploaded KYC document; the DOCUMENT AUTHENTICITY AGENT checks each one.
+  const company = db.prepare('SELECT * FROM companies WHERE id = ?').get(companyId);
+  for (const docType of DOC_TYPES) {
+    const f = files[docType] && files[docType][0];
+    if (!f) continue;
+    try {
+      const agent = await runDocumentAgent(company, docType, f);
+      saveDocument(companyId, docType, f, agent);
+    } catch (e) {
+      audit('DOCUMENT AGENT', `document check (${docType})`, 'fail', `"${f.originalname || 'file'}" for "${nm}": agent error: ${e.message}`);
+    }
+  }
+
+  res.redirect('/login?msg=' + encodeURIComponent('Registration received! Your company and documents are pending admin approval.'));
+}
+app.post('/signup/complete', signupDocsUpload, signupCompleteHandler);
+// Legacy entry point: the old simple POST /signup now routes through the same compliance-grade handler.
+app.post('/signup', signupDocsUpload, signupCompleteHandler);
 
 // ============================= AUTH ROUTES (login + 2FA + logout) =============================
 app.get('/login', (req, res) => {
@@ -1363,6 +2173,7 @@ app.get('/login', (req, res) => {
       <button class="btn" type="submit">Continue</button>
     </form>
     <p class="muted" style="margin-top:12px">No account yet? <a href="/signup">Register your company</a></p>
+    <p class="muted">Team member? Sign in with your own member email &amp; password.</p>
     <p class="shield-note">🛡️ Protected by Dealzoin security agents</p>
   </div>`;
   res.send(page('Sign in', body, null, req.query.msg, req.query.err));
@@ -1373,7 +2184,30 @@ app.post('/login', (req, res) => {
   const pw = String(req.body.password || '');
   const company = db.prepare('SELECT * FROM companies WHERE email = ?').get(em);
 
-  if (!company || !verifyPassword(pw, company.salt, company.password_hash)) {
+  // Sub-account login: team members sign in with their own email + password and act AS the company.
+  if (!company) {
+    const member = db.prepare(`SELECT * FROM company_members WHERE email = ? AND status = 'active'`).get(em);
+    const parent = member ? db.prepare('SELECT * FROM companies WHERE id = ?').get(member.company_id) : null;
+    if (!member || !parent || !verifyPassword(pw, member.salt, member.password_hash)) {
+      audit('AUTHENTICATION AGENT', 'login password check', 'fail', `Failed login for ${em}`);
+      return res.redirect('/login?err=' + encodeURIComponent('Invalid email or password.'));
+    }
+    if (parent.status !== 'approved') {
+      return res.redirect('/login?err=' + encodeURIComponent('This company account is not currently approved. Contact support.'));
+    }
+    audit('AUTHENTICATION AGENT', 'login password check', 'pass', `Password OK for member ${em} (${member.name} @ ${parent.name})`);
+    const code = String(crypto.randomInt(100000, 1000000)); // 6-digit
+    const token = randomToken();
+    db.prepare('DELETE FROM verification_codes WHERE company_id = ? AND purpose = ?').run(parent.id, 'login');
+    db.prepare('INSERT INTO verification_codes (token, company_id, code, purpose, payload, expires_at, created_at) VALUES (?,?,?,?,?,?,?)')
+      .run(token, parent.id, code, 'login', JSON.stringify({ member_id: member.id }), new Date(Date.now() + CODE_TTL_MS).toISOString(), now());
+    sendVerificationCode(member.email, code);
+    audit('AUTHENTICATION AGENT', '2FA code issued', 'pass', `Login code issued for member ${em} (10-min expiry)`);
+    res.setHeader('Set-Cookie', `dz_verify=${signedCookieValue(token)}; HttpOnly; Path=/; Max-Age=600; SameSite=Lax${isSecureReq(req) ? '; Secure' : ''}`);
+    return res.redirect('/verify-login');
+  }
+
+  if (!verifyPassword(pw, company.salt, company.password_hash)) {
     audit('AUTHENTICATION AGENT', 'login password check', 'fail', `Failed login for ${em}`);
     return res.redirect('/login?err=' + encodeURIComponent('Invalid email or password.'));
   }
@@ -1450,10 +2284,18 @@ app.post('/verify-login', (req, res) => {
   }
 
   db.prepare('DELETE FROM verification_codes WHERE id = ?').run(row.id);
-  audit('AUTHENTICATION AGENT', '2FA verify', 'pass', `2FA passed for ${company.email} — session created`);
+  // Sub-account session when the login was initiated by a team member.
+  let memberId = null, memberRow = null;
+  try { memberId = (JSON.parse(row.payload || '{}') || {}).member_id || null; } catch (e) { memberId = null; }
+  if (memberId) {
+    memberRow = db.prepare(`SELECT * FROM company_members WHERE id = ? AND company_id = ? AND status = 'active'`).get(memberId, company.id);
+    if (!memberRow) return res.redirect('/login?err=' + encodeURIComponent('This team member account is no longer active.'));
+  }
+  audit('AUTHENTICATION AGENT', '2FA verify', 'pass', `2FA passed for ${company.email}${memberRow ? ` (member ${memberRow.name} <${memberRow.email}>)` : ''} — session created`);
+  if (memberRow) audit('AUTHENTICATION AGENT', 'member login', 'pass', `Team member ${memberRow.name} <${memberRow.email}> signed in as ${company.name} (role: ${memberRow.role})`);
   res.setHeader('Set-Cookie', 'dz_verify=; HttpOnly; Path=/; Max-Age=0');
-  createSession(req, res, company.id, false);
-  res.redirect('/timeline?msg=' + encodeURIComponent('Welcome back, ' + company.name + '!'));
+  createSession(req, res, company.id, false, memberRow ? memberRow.id : null);
+  res.redirect('/timeline?msg=' + encodeURIComponent('Welcome back, ' + (memberRow ? memberRow.name + ' — ' : '') + company.name + '!'));
 });
 
 app.post('/logout', (req, res) => {
@@ -1488,25 +2330,45 @@ function dealFeedItem(d) {
   return { kind: 'deal', ref_id: d.id, company_id: d.company_id, title: d.title, body: d.description,
            value: d.value, currency: d.currency || 'USD', time_period: d.time_period || '',
            contract_state: d.contract_state || null, contract_party: d.contract_party || '',
-           created_at: d.created_at, media_id: d.media_id };
+           deal_number: d.deal_number || '', deal_type: d.deal_type || 'sell', category: d.category || '',
+           origin: d.origin || '', incoterm: d.incoterm || 'CIF', status: d.status || 'open',
+           created_at: d.created_at, media_id: d.media_id, author_name: d.author_name || '' };
 }
 /** Render one feed card. kind: 'deal' | 'post' | 'repost'. idx = loop index (entrance stagger). */
 function feedCard(item, user, names, idx) {
   const stagger = Math.min(Number.isInteger(idx) ? idx : 0, 10);
   const ownerName = names.get(item.company_id) || 'Unknown';
   const isOwn = user && !user.isAdmin && user.id === item.company_id;
+  // Member attribution: "— by {member name}" when a sub-account authored the item.
+  const byLine = item.author_name ? ` <span class="muted">— by ${esc(item.author_name)}</span>` : '';
 
   // For reposts the social target is the ORIGINAL deal; otherwise the item itself.
   const targetType = item.kind === 'post' ? 'post' : 'deal';
   const targetId = item.kind === 'repost' ? item.repost_of : item.ref_id;
   const soc = cardSocial(targetType, targetId, user && !user.isAdmin ? user.id : null);
 
+  // System announcement posts (deal-closed congratulations): gold announcement card, shown to everyone.
+  if (item.kind === 'post' && item.is_system) {
+    const timeStamp = esc(item.created_at.slice(0, 16).replace('T', ' '));
+    return `<div class="card card-announce" data-reveal style="--i:${stagger}">
+    <div class="feed-head"><div><span class="coin" aria-hidden="true">Dz</span> <b>Dealzoin</b> <span class="muted">official announcement</span></div>
+      <span class="muted">${timeStamp}</span></div>
+    <p style="margin-top:8px;white-space:pre-wrap">${esc(item.body)}</p>
+    ${user && !user.isAdmin ? `
+    <div class="feed-actions">
+      <form method="POST" action="/like/post/${item.ref_id}">
+        <button class="btn btn-sm ${soc.liked ? 'liked' : 'btn-outline'}" type="submit" title="Celebrate">${soc.liked ? 'Liked' : 'Like'} (${soc.likeCount})</button>
+      </form>
+    </div>` : `<p class="muted" style="margin-top:10px">${soc.likeCount} likes</p>`}
+  </div>`;
+  }
+
   let head, bodyHtml;
   if (item.kind === 'post') {
-    head = `${avatarHtml(ownerName, companyAvatarMediaId(item.company_id))} <a href="/company/${item.company_id}"><b>${esc(ownerName)}</b></a> <span class="muted">posted</span>`;
+    head = `${avatarHtml(ownerName, companyAvatarMediaId(item.company_id))} <a href="/company/${item.company_id}"><b>${esc(ownerName)}</b></a> <span class="muted">posted</span>${byLine}`;
     bodyHtml = `<p style="margin-top:8px;white-space:pre-wrap">${esc(item.body)}</p>`;
   } else if (item.kind === 'deal') {
-    head = `${avatarHtml(ownerName, companyAvatarMediaId(item.company_id))} <a href="/company/${item.company_id}"><b>${esc(ownerName)}</b></a> ${starsHtml(companyReputation(item.company_id), true)} <span class="muted">posted a deal</span>`;
+    head = `${avatarHtml(ownerName, companyAvatarMediaId(item.company_id))} <a href="/company/${item.company_id}"><b>${esc(ownerName)}</b></a> ${starsHtml(companyReputation(item.company_id), true)} <span class="muted">posted a deal</span>${byLine}`;
     bodyHtml = `<h3 style="margin-top:8px"><a href="/deal/${item.ref_id}">${esc(item.title)}</a></h3>
       <p style="margin-top:6px;white-space:pre-wrap">${esc(item.body)}</p>`;
   } else { // repost
@@ -1516,14 +2378,16 @@ function feedCard(item, user, names, idx) {
     bodyHtml = `<h3 style="margin-top:8px"><a href="/deal/${item.repost_of}">${esc(item.title)}</a></h3>
       <p style="margin-top:6px;white-space:pre-wrap">${esc(item.body)}</p>`;
   }
-  // Deal value sits top-right in display gold (with currency); time period + timestamp stay muted.
+  // Deal values are PRIVATE: feeds never show value/currency/fee — only a "shared privately" note,
+  // the prominent deal number, type/category chips, a small status chip, and the time period + timestamp.
   const timeStamp = esc(item.created_at.slice(0, 16).replace('T', ' '));
   let headRight;
   if (item.kind !== 'post') {
-    const valLine = item.value ? `<div class="deal-value">💰 ${esc(item.value)} ${esc(item.currency || 'USD')}</div>` : '';
-    const feeLine = item.value ? feeLineHtml(item) : '';
+    const numLine = item.deal_number ? `<div class="deal-num">Deal № ${esc(item.deal_number)}</div>` : '';
+    const chipsLine = `<div style="margin:2px 0">${dealTypeChips(item)} ${dealStatusChip(item)}</div>`;
+    const valLine = `<div class="private-value-note">💰 Value shared privately</div>`;
     const tpLine = item.time_period ? `<span class="muted">⏳ ${esc(item.time_period)}</span>` : '';
-    headRight = `<div style="text-align:right">${valLine}${feeLine}${tpLine}${tpLine ? '<br>' : ''}<span class="muted">${timeStamp}</span></div>`;
+    headRight = `<div style="text-align:right">${numLine}${chipsLine}${valLine}${tpLine}${tpLine ? '<br>' : ''}<span class="muted">${timeStamp}</span></div>`;
   } else {
     headRight = `<span class="muted">${timeStamp}</span>`;
   }
@@ -1531,8 +2395,8 @@ function feedCard(item, user, names, idx) {
   const contractBadge = (item.kind !== 'post' && item.contract_state === 'approved')
     ? `<div style="margin-top:10px"><span class="badge badge-contract">Contract approved ✓${item.contract_party ? ' (with ' + esc(item.contract_party) + ')' : ''}</span></div>` : '';
 
-  const signBtn = (item.kind !== 'post' && user && !user.isAdmin && !isOwn && item.company_id !== user.id)
-    ? `<a class="btn btn-sm btn-green" href="/deal/${targetId}/contract">Sign contract</a>` : '';
+  const signBtn = (item.kind !== 'post' && user && !user.isAdmin && !isOwn && item.company_id !== user.id && item.contract_state !== 'approved')
+    ? `<a class="btn btn-sm btn-green" href="/deal/${targetId}/loi">Express interest (LOI)</a>` : '';
   const repostBtn = (item.kind !== 'post' && user && !user.isAdmin && item.orig_company !== user.id && item.company_id !== user.id)
     ? `<form method="POST" action="/repost/${targetId}"><button class="btn btn-sm btn-outline" type="submit">Repost</button></form>` : '';
   const interact = user && !user.isAdmin ? `
@@ -1562,21 +2426,28 @@ function feedCard(item, user, names, idx) {
 }
 
 // ============================= COMPANY ROUTES (timeline, posts, deals) =============================
-/** Unified feed query (deals + posts + reposts). Optional filter SQL is injected into each branch. */
+/** Unified feed query (deals + posts + reposts). Optional filter SQL is injected into each branch.
+ *  System announcement posts (is_system = 1) bypass the follow filter — they are shown to EVERYONE. */
 function feedQuery(filterSql, ...args) {
+  const postFilter = filterSql ? `(${filterSql.replace(/^WHERE\s+/i, '')}) OR p.is_system = 1` : '';
   return db.prepare(`
     SELECT * FROM (
       SELECT 'deal' AS kind, d.id AS ref_id, d.company_id, d.title, d.description AS body,
              d.value, d.created_at, NULL AS repost_of, NULL AS orig_company, d.media_id,
-             d.currency, d.time_period, d.contract_state, d.contract_party
+             d.currency, d.time_period, d.contract_state, d.contract_party,
+             d.deal_number, d.deal_type, d.category, d.origin, d.incoterm, d.status,
+             d.author_name, 0 AS is_system
       FROM deals d ${filterSql}
       UNION ALL
       SELECT 'post', p.id, p.company_id, NULL, p.body, NULL, p.created_at, NULL, NULL, p.media_id,
-             NULL, NULL, NULL, NULL
-      FROM posts p ${filterSql}
+             NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+             p.author_name, COALESCE(p.is_system, 0)
+      FROM posts p ${postFilter ? 'WHERE ' + postFilter : ''}
       UNION ALL
       SELECT 'repost', r.id, r.company_id, d.title, d.description, d.value, r.created_at, d.id, d.company_id, d.media_id,
-             d.currency, d.time_period, d.contract_state, d.contract_party
+             d.currency, d.time_period, d.contract_state, d.contract_party,
+             d.deal_number, d.deal_type, d.category, d.origin, d.incoterm, d.status,
+             d.author_name, 0
       FROM reposts r JOIN deals d ON d.id = r.deal_id ${filterSql ? filterSql.replace(/company_id/g, 'r.company_id') : ''}
     ) ORDER BY created_at DESC LIMIT 100`).all(...args, ...args, ...args);
 }
@@ -1609,19 +2480,23 @@ app.get('/timeline', requireCompany, (req, res) => {
     <div class="card" style="text-align:center">
       <h3>Your exchange is quiet — follow companies to fill it</h3>
       <p class="muted" style="margin:8px 0 14px">Your timeline shows deals, posts and reposts only from companies you follow (plus your own). Find the players in your industry and hit Follow.</p>
-      <a class="btn" href="/search">Find companies to follow</a>
+      <a class="btn" href="/companies">Browse the companies directory</a>
+      <a class="btn btn-outline" href="/explore" style="margin-left:8px">Explore open deals</a>
+      <a class="btn btn-outline" href="/search" style="margin-left:8px">Search</a>
     </div>
     ${discoverHtml}
     ${feed.length ? feed.map((i, idx) => feedCard(i, req.user, names, idx)).join('') : ''}`;
   } else {
     feedHtml = feed.length
       ? feed.map((i, idx) => feedCard(i, req.user, names, idx)).join('')
-      : '<div class="card"><p class="muted">Nothing yet from the companies you follow. <a href="/search">Discover more companies →</a></p></div>';
+      : '<div class="card"><p class="muted">Nothing yet from the companies you follow. <a href="/companies">Browse the companies directory</a> · <a href="/explore">Explore open deals →</a></p></div>';
   }
 
   const body = `
   <div class="card">
-    <h2>Your exchange — following</h2>
+    <div class="feed-head"><h2>Your exchange — following</h2>
+      <div><a class="btn btn-sm btn-outline" href="/explore">🧭 Explorer</a>
+      <a class="btn btn-sm btn-outline" href="/companies" style="margin-left:6px">🏢 Companies</a></div></div>
     <form method="POST" action="/posts" enctype="multipart/form-data">
       <textarea name="body" rows="3" maxlength="2000" placeholder="Share an update with the network…" required style="margin-bottom:8px"></textarea>
       ${fileButtonHtml()}
@@ -1637,7 +2512,8 @@ app.post('/posts', requireCompany, mediaUpload, (req, res) => {
   const txt = String(req.body.body || '').trim();
   if (!txt) return res.redirect('/timeline?err=' + encodeURIComponent('Post cannot be empty.'));
   const mediaId = req.file ? saveMedia(req.user.id, req.file) : null;
-  db.prepare('INSERT INTO posts (company_id, body, created_at, media_id) VALUES (?,?,?,?)').run(req.user.id, txt.slice(0, 2000), now(), mediaId);
+  db.prepare('INSERT INTO posts (company_id, body, created_at, media_id, author_name) VALUES (?,?,?,?,?)')
+    .run(req.user.id, txt.slice(0, 2000), now(), mediaId, req.user.memberName || null);
   res.redirect((req.get('referer') || '/timeline').split('?')[0] + '?msg=' + encodeURIComponent('Posted!'));
 });
 
@@ -1645,15 +2521,9 @@ app.get('/deals/new', requireCompany, (req, res) => {
   const body = `
   <div class="card" style="max-width:560px;margin:0 auto">
     <h2>📦 Post a new deal</h2>
-    <p class="muted" style="margin-bottom:12px">Deals go live on every company's timeline immediately.</p>
+    <p class="muted" style="margin-bottom:12px">Deals go live on every company's timeline immediately. Deal values stay private — only counterparties see them.</p>
     <form method="POST" action="/deals" enctype="multipart/form-data">
-      <label>Deal title</label><input type="text" name="title" required maxlength="160">
-      <label>Deal value (e.g. 50,000 / year)</label><input type="text" name="value" maxlength="80">
-      <div class="grid2">
-        <div><label>Currency</label><select name="currency">${optionsHtml(DEAL_CURRENCIES, 'USD')}</select></div>
-        <div><label>Time period</label><select name="time_period">${optionsHtml(DEAL_TIME_PERIODS, '30 days')}</select></div>
-      </div>
-      <label>Description</label><textarea name="description" rows="6" required maxlength="4000"></textarea>
+      ${dealFormFieldsHtml()}
       <label>Photo or video (optional — image ≤ 5 MB, video ≤ 25 MB)</label>
       ${fileButtonHtml()}
       <button class="btn" type="submit">Publish deal</button>
@@ -1662,17 +2532,55 @@ app.get('/deals/new', requireCompany, (req, res) => {
   res.send(page('New deal', body, req.user, req.query.msg, req.query.err, 'new'));
 });
 
-app.post('/deals', requireCompany, mediaUpload, (req, res) => {
+app.post('/deals', requireCompany, dealUpload, async (req, res) => {
   const title = String(req.body.title || '').trim();
   const desc = String(req.body.description || '').trim();
   const value = String(req.body.value || '').trim().slice(0, 80);
   const currency = DEAL_CURRENCIES.includes(req.body.currency) ? req.body.currency : 'USD';
   const timePeriod = DEAL_TIME_PERIODS.includes(req.body.time_period) ? req.body.time_period : '30 days';
+  const dealType = DEAL_TYPES.includes(req.body.deal_type) ? req.body.deal_type : 'sell';
+  const category = COMPANY_CATEGORIES.includes(req.body.category) ? req.body.category : '';
+  const origin = String(req.body.origin || '').trim().slice(0, 160);
+  const incoterm = DEAL_INCOTERMS.includes(req.body.incoterm) ? req.body.incoterm : 'CIF';
+  const proofMode = req.body.proof_mode === 'manual' ? 'manual' : 'pdf';
+  const proofText = String(req.body.product_proof_text || '').trim().slice(0, 2000);
+
   if (!title || !desc) return res.redirect('/deals/new?err=' + encodeURIComponent('Title and description are required.'));
-  const mediaId = req.file ? saveMedia(req.user.id, req.file) : null;
-  db.prepare('INSERT INTO deals (company_id, title, description, value, created_at, media_id, currency, time_period) VALUES (?,?,?,?,?,?,?,?)')
-    .run(req.user.id, title.slice(0, 160), desc.slice(0, 4000), value, now(), mediaId, currency, timePeriod);
-  res.redirect('/timeline?msg=' + encodeURIComponent('Deal published to all timelines!'));
+  if (!category) return res.redirect('/deals/new?err=' + encodeURIComponent('Please choose a deal category.'));
+  if (!origin) return res.redirect('/deals/new?err=' + encodeURIComponent('Origin location is required.'));
+
+  const files = req.files || {};
+  const mediaFile = files.media && files.media[0];
+  const proofFile = files.product_proof && files.product_proof[0];
+  // Selling requires product proof: either an uploaded PDF or a manual description.
+  if (dealType === 'sell') {
+    if (proofMode === 'pdf' && !proofFile) return res.redirect('/deals/new?err=' + encodeURIComponent('Please upload your product proof PDF (or switch to a manual description).'));
+    if (proofMode === 'manual' && !proofText) return res.redirect('/deals/new?err=' + encodeURIComponent('Please describe your product proof (or upload a proof PDF).'));
+  }
+
+  const mediaId = mediaFile ? saveMedia(req.user.id, mediaFile) : null;
+
+  // Product-proof PDF → documents vault (doc_type 'product_proof'), screened by the authenticity agent.
+  let proofDocId = null;
+  if (dealType === 'sell' && proofMode === 'pdf' && proofFile) {
+    try {
+      const me = db.prepare('SELECT * FROM companies WHERE id = ?').get(req.user.id);
+      const agent = await runDocumentAgent(me, 'product_proof', proofFile);
+      proofDocId = saveDocument(req.user.id, 'product_proof', proofFile, agent);
+    } catch (e) {
+      audit('DOCUMENT AGENT', 'document check (product_proof)', 'fail', `Product proof for "${title}": agent error: ${e.message}`);
+    }
+  }
+
+  const number = nextDealNumber();
+  db.prepare(`INSERT INTO deals (company_id, title, description, value, created_at, media_id, currency, time_period,
+              deal_type, deal_number, category, origin, incoterm, product_proof, product_proof_doc_id, status, author_name)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?)`)
+    .run(req.user.id, title.slice(0, 160), desc.slice(0, 4000), value, now(), mediaId, currency, timePeriod,
+         dealType, number, category, origin, incoterm,
+         dealType === 'sell' && proofMode === 'manual' ? proofText : '', proofDocId, req.user.memberName || null);
+  audit('DEAL AGENT', 'deal published', 'pass', `${req.user.name} posted ${dealType.toUpperCase()} deal ${number} "${title.slice(0, 60)}" (${category}, ${incoterm}, origin ${origin})`);
+  res.redirect('/timeline?msg=' + encodeURIComponent(`Deal ${number} published to all timelines!`));
 });
 
 // ============================= SOCIAL ROUTES (likes, comments, reposts, follows) =============================
@@ -1747,11 +2655,26 @@ function followCounts(companyId) {
 
 app.get('/search', requireCompany, (req, res) => {
   const q = String(req.query.q || '').trim();
+  const category = COMPANY_CATEGORIES.includes(req.query.category) ? req.query.category : '';
+  const activity = String(req.query.activity || '').trim();
+  const hasFilters = !!(q || category || activity);
   let dealsHtml = '', companiesHtml = '';
-  if (q) {
+  if (hasFilters) {
     const like = '%' + q.replace(/[%_]/g, '') + '%';
-    const deals = db.prepare(`SELECT * FROM deals WHERE title LIKE ? OR description LIKE ? ORDER BY created_at DESC LIMIT 30`).all(like, like);
-    const companies = db.prepare(`SELECT * FROM companies WHERE status = 'approved' AND (name LIKE ? OR description LIKE ?) ORDER BY name LIMIT 30`).all(like, like);
+    const actLike = '%' + activity.replace(/[%_]/g, '') + '%';
+    let dealSql = `SELECT * FROM deals WHERE 1=1`;
+    const dealArgs = [];
+    if (q) { dealSql += ' AND (title LIKE ? OR description LIKE ?)'; dealArgs.push(like, like); }
+    if (category) { dealSql += ' AND category = ?'; dealArgs.push(category); }
+    dealSql += ' ORDER BY created_at DESC LIMIT 30';
+    const deals = db.prepare(dealSql).all(...dealArgs);
+    let compSql = `SELECT * FROM companies WHERE status = 'approved'`;
+    const compArgs = [];
+    if (q) { compSql += ' AND (name LIKE ? OR description LIKE ?)'; compArgs.push(like, like); }
+    if (category) { compSql += ' AND category = ?'; compArgs.push(category); }
+    if (activity) { compSql += ' AND activity LIKE ?'; compArgs.push(actLike); }
+    compSql += ' ORDER BY name LIMIT 30';
+    const companies = db.prepare(compSql).all(...compArgs);
     const names = companyNameMap();
     dealsHtml = deals.length
       ? deals.map((d, idx) => feedCard(dealFeedItem(d), req.user, names, idx)).join('')
@@ -1761,23 +2684,143 @@ app.get('/search', requireCompany, (req, res) => {
           const fc = followCounts(c.id);
           return `<div class="card" data-reveal style="--i:${Math.min(idx, 10)}">
             <div class="feed-head"><h3>${avatarHtml(c.name, c.avatar_media_id)}<a href="/company/${c.id}">${esc(c.name)}</a></h3>${followButton(req.user, c.id)}</div>
-            <p class="muted">${fc.followers} followers · ${fc.following} following</p>
+            <p class="muted">${c.category ? `<span class="chip chip-category">${esc(c.category)}</span> · ` : ''}${fc.followers} followers · ${fc.following} following</p>
+            ${c.activity ? `<p class="muted" style="margin-top:4px">⚙️ ${esc(c.activity)}</p>` : ''}
             <p style="margin-top:6px">${esc(c.description || '')}</p>
           </div>`;
         }).join('')
-      : '<p class="muted">No companies match that — yet. Try an industry, a deal value, or a company name.</p>';
+      : '<p class="muted">No companies match that — yet. Try an industry, a category, or a company name.</p>';
   }
   const body = `
   <div class="card">
-    <h2>🔍 Search Dealzoin</h2>
-    <form method="GET" action="/search" style="display:flex;gap:8px;margin-top:10px">
-      <input type="text" name="q" value="${esc(q)}" placeholder="Search deals and companies…" style="margin-bottom:0">
-      <button class="btn" type="submit">Search</button>
+    <div class="feed-head"><h2>🔍 Search Dealzoin</h2>
+      <a class="btn btn-sm btn-outline" href="/companies">🏢 Companies directory</a></div>
+    <form method="GET" action="/search" style="margin-top:10px">
+      <div style="display:flex;gap:8px">
+        <input type="text" name="q" value="${esc(q)}" placeholder="Search deals and companies…" style="margin-bottom:0">
+        <button class="btn" type="submit">Search</button>
+      </div>
+      <div class="grid2" style="gap:10px;margin-top:10px">
+        <div><label>Category</label><select name="category"><option value="">All categories</option>${optionsHtml(COMPANY_CATEGORIES, category)}</select></div>
+        <div><label>Activity keyword</label><input type="text" name="activity" value="${esc(activity)}" placeholder="e.g. wholesale, logistics…" style="margin-bottom:0"></div>
+      </div>
     </form>
   </div>
-  ${q ? `<h2 class="sec-h">Deals matching “${esc(q)}”</h2>${dealsHtml}
-         <h2 class="sec-h">Companies matching “${esc(q)}”</h2>${companiesHtml}` : ''}`;
+  ${hasFilters ? `<h2 class="sec-h">Deals matching your search</h2>${dealsHtml}
+         <h2 class="sec-h">Companies matching your search</h2>${companiesHtml}` : ''}`;
   res.send(page('Search', body, req.user, req.query.msg, req.query.err));
+});
+
+// ============================= COMPANIES DIRECTORY (/companies) =============================
+app.get('/companies', requireCompany, (req, res) => {
+  const category = COMPANY_CATEGORIES.includes(req.query.category) ? req.query.category : '';
+  const activity = String(req.query.activity || '').trim();
+  const q = String(req.query.q || '').trim();
+  let sql = `SELECT * FROM companies WHERE status = 'approved'`;
+  const args = [];
+  if (category) { sql += ' AND category = ?'; args.push(category); }
+  if (activity) { sql += ' AND activity LIKE ?'; args.push('%' + activity.replace(/[%_]/g, '') + '%'); }
+  if (q) { sql += ' AND (name LIKE ? OR description LIKE ? OR activity LIKE ?)'; const like = '%' + q.replace(/[%_]/g, '') + '%'; args.push(like, like, like); }
+  sql += ' ORDER BY reputation DESC, name ASC LIMIT 100';
+  const companies = db.prepare(sql).all(...args);
+
+  const cards = companies.length ? companies.map((c, idx) => {
+    const fc = followCounts(c.id);
+    return `<div class="card" data-reveal style="--i:${Math.min(idx, 10)}">
+      <div class="feed-head">
+        <h3>${avatarHtml(c.name, c.avatar_media_id)}<a href="/company/${c.id}">${esc(c.name)}</a></h3>
+        ${followButton(req.user, c.id)}
+      </div>
+      <p class="muted" style="margin-top:4px">${c.category ? `<span class="chip chip-category">${esc(c.category)}</span> ` : ''}${starsHtml(c.reputation, true)} · ${fc.followers} followers</p>
+      ${c.activity ? `<p style="margin-top:6px">⚙️ ${esc(c.activity)}</p>` : ''}
+      ${c.bio || c.description ? `<p class="muted" style="margin-top:6px">${esc((c.bio || c.description || '').slice(0, 160))}</p>` : ''}
+    </div>`;
+  }).join('') : `<div class="card"><p class="muted">No approved companies match those filters. <a href="/companies">Clear filters</a></p></div>`;
+
+  const body = `
+  <div class="feed-head" style="margin-bottom:4px">
+    <div>
+      <div class="kicker">Companies directory</div>
+      <h1 style="font-size:1.75rem;margin-top:4px">🏢 The register</h1>
+    </div>
+    <a class="btn btn-sm btn-outline" href="/explore">🧭 Explorer</a>
+  </div>
+  <div class="card">
+    <form method="GET" action="/companies">
+      <div class="grid2" style="gap:10px">
+        <div><label>Category</label><select name="category"><option value="">All categories</option>${optionsHtml(COMPANY_CATEGORIES, category)}</select></div>
+        <div><label>Activity keyword</label><input type="text" name="activity" value="${esc(activity)}" placeholder="e.g. wholesale, logistics…"></div>
+      </div>
+      <div style="display:flex;gap:8px">
+        <input type="text" name="q" value="${esc(q)}" placeholder="Search by name or description…" style="margin-bottom:0">
+        <button class="btn" type="submit">Filter</button>
+      </div>
+    </form>
+  </div>
+  ${cards}`;
+  res.send(page('Companies', body, req.user, req.query.msg, req.query.err, 'search'));
+});
+
+// ============================= DEALS EXPLORER (/explore) — algorithmic ranking =============================
+app.get('/explore', requireCompany, (req, res) => {
+  const myId = req.user.id;
+  const names = companyNameMap();
+
+  // Signals for the interest algorithm.
+  const followCats = new Set(db.prepare(`
+    SELECT c.category FROM follows f JOIN companies c ON c.id = f.followed_id
+    WHERE f.follower_id = ? AND c.category != ''`).all(myId).map(r => r.category));
+  const engageCats = new Set([
+    ...db.prepare(`SELECT DISTINCT d.category FROM likes l JOIN deals d ON d.id = l.target_id
+                   WHERE l.company_id = ? AND l.target_type = 'deal' AND d.category != ''`).all(myId),
+    ...db.prepare(`SELECT DISTINCT d.category FROM comments cm JOIN deals d ON d.id = cm.target_id
+                   WHERE cm.company_id = ? AND cm.target_type = 'deal' AND d.category != ''`).all(myId)
+  ].map(r => r.category));
+  const followedIds = new Set(db.prepare('SELECT followed_id FROM follows WHERE follower_id = ?').all(myId).map(r => r.followed_id));
+
+  const openDeals = db.prepare(`SELECT * FROM deals WHERE status = 'open' ORDER BY created_at DESC LIMIT 200`).all();
+  const nowMs = Date.now();
+  const scored = openDeals.map(d => {
+    const likes = db.prepare(`SELECT COUNT(*) AS n FROM likes WHERE target_type = 'deal' AND target_id = ?`).get(d.id).n;
+    const comments = db.prepare(`SELECT COUNT(*) AS n FROM comments WHERE target_type = 'deal' AND target_id = ?`).get(d.id).n;
+    const rep = companyReputation(d.company_id);
+    const ageDays = Math.max(0, (nowMs - Date.parse(d.created_at || '')) / 86400000);
+    let score = 0;
+    const hints = [];
+    if (d.category && followCats.has(d.category)) { score += 3; hints.push(`Because you follow ${d.category} companies`); }
+    if (d.category && engageCats.has(d.category)) { score += 3; hints.push(`Because you engaged with ${d.category} deals`); }
+    score += 2 * Math.log(1 + likes + comments);
+    if (likes + comments >= 3) hints.push('Trending on the network');
+    score += 1.5 * rep;
+    if (rep >= 4) hints.push('High-reputation issuer');
+    score += 3 * Math.exp(-ageDays / 7); // recency decay — newer ranks higher
+    if (ageDays < 1) hints.push('Fresh on the wire');
+    if (followedIds.has(d.company_id)) { score += 1; hints.push(`You follow ${names.get(d.company_id) || 'the issuer'}`); }
+    return { deal: d, score, hints: hints.slice(0, 3) };
+  }).sort((a, b) => b.score - a.score).slice(0, 50);
+
+  const list = scored.length ? scored.map((s, idx) => {
+    const hintsHtml = s.hints.length
+      ? `<div class="hint-chips">${s.hints.map(h => `<span class="hint-chip">💡 ${esc(h)}</span>`).join('')}</div>` : '';
+    return hintsHtml + feedCard(dealFeedItem(s.deal), req.user, names, idx);
+  }).join('') : `<div class="card" style="text-align:center">
+      <h3>No open deals right now</h3>
+      <p class="muted" style="margin:8px 0 14px">Be the first to put an offer on the wire — or browse the register to find counterparties.</p>
+      <a class="btn" href="/deals/new">Post a deal</a>
+      <a class="btn btn-outline" href="/companies" style="margin-left:8px">Companies directory</a>
+    </div>`;
+
+  const body = `
+  <div class="feed-head" style="margin-bottom:4px">
+    <div>
+      <div class="kicker">Deals explorer</div>
+      <h1 style="font-size:1.75rem;margin-top:4px">🧭 Open deals, ranked for you</h1>
+    </div>
+    <a class="btn btn-sm btn-outline" href="/companies">🏢 Companies</a>
+  </div>
+  <p class="muted" style="margin-bottom:14px">Ranked by your interests — categories you follow and engage with, network traction, issuer reputation and freshness. Deal values stay private.</p>
+  ${list}`;
+  res.send(page('Explorer', body, req.user, req.query.msg, req.query.err, 'home'));
 });
 
 app.get('/company/:id', requireCompany, (req, res) => {
@@ -1794,7 +2837,7 @@ app.get('/company/:id', requireCompany, (req, res) => {
     : '<div class="card"><p class="muted">No deals yet.</p></div>';
 
   // Research Agent intelligence card — shown only when at least one intel field is set.
-  const hasIntel = !!(c.market_value || c.field || c.employees);
+  const hasIntel = !!(c.market_value || c.field || c.employees || c.trade_license);
   const intelCard = hasIntel ? `
   <div class="card intel-card">
     <div class="kicker">Researched by Dealzoin Research Agent</div>
@@ -1802,6 +2845,7 @@ app.get('/company/:id', requireCompany, (req, res) => {
     ${c.market_value ? `<div class="intel-row"><span class="k">Market value</span><span>${esc(c.market_value)}</span></div>` : ''}
     ${c.field ? `<div class="intel-row"><span class="k">Field</span><span style="text-align:right">${esc(c.field)}</span></div>` : ''}
     ${c.employees ? `<div class="intel-row"><span class="k">Employees</span><span>${esc(c.employees)}</span></div>` : ''}
+    ${c.trade_license ? `<div class="intel-row"><span class="k">Trade license</span><span>🪪 ${esc(c.trade_license)}</span></div>` : ''}
     ${c.research_source ? `<div class="muted intel-src">Source: <a href="${esc(c.research_source)}" rel="noopener noreferrer nofollow">${esc(c.research_source)}</a></div>` : ''}
     <div class="muted intel-src">Data provided by platform admin &amp; public sources.</div>
   </div>` : '';
@@ -1824,8 +2868,9 @@ app.get('/company/:id', requireCompany, (req, res) => {
 });
 
 // ============================= CONTRACT ROUTES =============================
-/** Standard B2B terms clauses shown on every contract. */
-const CONTRACT_CLAUSES = [
+/** Standard B2B terms clauses shown on every contract. Clause 10 reflects the live platform commission. */
+function contractClauses() {
+  return [
   '1. PARTIES. This agreement is entered into between the deal-owning company ("Provider") and the signing company ("Counterparty"), both registered members of the Dealzoin B2B network.',
   '2. SCOPE. The Provider agrees to deliver the products/services described in the deal terms, and the Counterparty agrees to the stated deal value and conditions.',
   '3. PAYMENT. Payment terms are net-30 from invoice date unless otherwise agreed in writing between the parties.',
@@ -1835,8 +2880,9 @@ const CONTRACT_CLAUSES = [
   '7. TERMINATION. Either party may terminate this agreement with thirty (30) days written notice, subject to settlement of outstanding obligations.',
   '8. GOVERNING LAW. This agreement shall be governed by the laws of the jurisdiction in which the Provider is registered.',
   '9. ENTIRE AGREEMENT. This document constitutes the entire agreement between the parties and supersedes all prior discussions.',
-  '10. PLATFORM FEE. A transparent platform commission of 1% of the stated deal value is payable to Dealzoin. This fee is disclosed to both parties — including the deal issuer — before signing and is separate from the deal value exchanged between the parties.'
-];
+  `10. PLATFORM FEE. A transparent platform commission of ${platformFeePct()}% of the stated deal value is payable to Dealzoin. This fee is disclosed to both parties — including the deal issuer — before signing and is separate from the deal value exchanged between the parties.`
+  ];
+}
 
 function getDealOr404(req, res) {
   const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
@@ -1851,16 +2897,55 @@ function latestContract(dealId) {
   return db.prepare('SELECT * FROM contracts WHERE deal_id = ? ORDER BY id DESC LIMIT 1').get(dealId);
 }
 
-// ----- Deal detail page: shows deal + contract status (visible to both parties) -----
-app.get('/deal/:id', requireCompany, (req, res) => {
+// ----- Deal detail page: shows deal + contract status (visible to both parties and the admin) -----
+function requireCompanyOrAdmin(req, res, next) {
+  const user = currentUser(req);
+  if (!user) return res.redirect('/login?err=' + encodeURIComponent('Please sign in.'));
+  req.user = user;
+  next();
+}
+/** True when the user may view deal_documents for this deal: owner, a requesting company, the contracted buyer, or admin. */
+function canViewDealDocs(user, deal) {
+  if (!user || !deal) return false;
+  if (user.isAdmin) return true;
+  if (user.id === deal.company_id) return true;
+  if (dealBuyerId(deal) === user.id) return true;
+  return !!db.prepare(`SELECT 1 FROM deal_documents WHERE deal_id = ? AND company_id = ? AND kind = 'request' LIMIT 1`).get(deal.id, user.id);
+}
+/** True when the user may see the deal's value, amounts and contract terms: the deal owner, any company
+ *  with a negotiation row on the deal (any state), the contracted party, or the admin. Everyone else
+ *  sees "value shared privately" — values are only exchanged inside the negotiation. */
+function canViewDealTerms(user, deal) {
+  if (!user || !deal) return false;
+  if (user.isAdmin) return true;
+  if (user.id === deal.company_id) return true;
+  if (dealBuyerId(deal) === user.id) return true;
+  return !!db.prepare('SELECT 1 FROM negotiations WHERE deal_id = ? AND (buyer_id = ? OR seller_id = ?) LIMIT 1').get(deal.id, user.id, user.id);
+}
+/** The contract counterparty name: the finalized party once approved, else the signer on a live contract,
+ *  else the buyer of the latest negotiation — never the viewer. "To be determined" pre-negotiation. */
+function dealCounterpartyName(deal, names) {
+  if (deal.contract_state === 'approved' && deal.contract_party) return deal.contract_party;
+  const contract = latestContract(deal.id);
+  if (isLiveContract(contract)) return names.get(contract.signer_company_id) || 'Unknown';
+  const neg = db.prepare('SELECT buyer_id FROM negotiations WHERE deal_id = ? ORDER BY id DESC LIMIT 1').get(deal.id);
+  if (neg) return names.get(neg.buyer_id) || 'Unknown';
+  return 'To be determined via negotiation';
+}
+
+app.get('/deal/:id', requireCompanyOrAdmin, (req, res) => {
   const deal = getDealOr404(req, res);
   if (!deal) return;
   const owner = db.prepare('SELECT id, name, avatar_media_id FROM companies WHERE id = ?').get(deal.company_id);
   const contract = latestContract(deal.id);
   const names = companyNameMap();
+  const isOwner = !req.user.isAdmin && req.user.id === deal.company_id;
+  const buyerId = dealBuyerId(deal);
+  const isBuyer = !req.user.isAdmin && buyerId === req.user.id;
+  const isParty = isOwner || isBuyer || req.user.isAdmin;
 
   let contractHtml = '';
-  if (contract && (req.user.id === contract.owner_company_id || req.user.id === contract.signer_company_id)) {
+  if (contract && (req.user.id === contract.owner_company_id || req.user.id === contract.signer_company_id || req.user.isAdmin)) {
     const signerName = names.get(contract.signer_company_id) || 'Unknown';
     contractHtml = `<div class="card vault">
       <h3>Contract status: ${statusBadge(contract.status)}</h3>
@@ -1875,55 +2960,317 @@ app.get('/deal/:id', requireCompany, (req, res) => {
     </div>`;
   }
 
+  // Deal value, currency amount and platform fee amounts are PRIVATE: only the owner, companies with a
+  // negotiation on this deal, the contracted party and the admin see them. Everyone else gets a note.
+  const canSeeValue = canViewDealTerms(req.user, deal);
+  const dateLine = `${deal.time_period ? `<span class="muted">⏳ ${esc(deal.time_period)}</span><br>` : ''}<span class="muted">${esc(deal.created_at.slice(0, 16).replace('T', ' '))}</span>`;
   const dealValueHtml = deal.value
-    ? `<div style="text-align:right"><div class="deal-value">💰 ${esc(deal.value)} ${esc(deal.currency || 'USD')}</div>${feeLineHtml(deal)}${deal.time_period ? `<span class="muted">⏳ ${esc(deal.time_period)}</span><br>` : ''}<span class="muted">${esc(deal.created_at.slice(0, 16).replace('T', ' '))}</span></div>`
-    : `<div style="text-align:right">${deal.time_period ? `<span class="muted">⏳ ${esc(deal.time_period)}</span><br>` : ''}<span class="muted">${esc(deal.created_at.slice(0, 16).replace('T', ' '))}</span></div>`;
+    ? (canSeeValue
+      ? `<div style="text-align:right"><div class="deal-value">💰 ${esc(deal.value)} ${esc(deal.currency || 'USD')}</div>${feeLineHtml(deal)}${dateLine}</div>`
+      : `<div style="text-align:right"><div class="private-value-note" style="white-space:normal">💰 Value shared privately — values are exchanged inside the negotiation</div>${dateLine}</div>`)
+    : `<div style="text-align:right">${dateLine}</div>`;
 
-  const signBtn = req.user.id !== deal.company_id && deal.contract_state !== 'approved'
-    ? `<a class="btn btn-green" href="/deal/${deal.id}/contract">View contract &amp; sign</a>` : '';
+  // Stage C entry point: non-owners express interest with an LOI (the negotiation pipeline leads to signing).
+  const myDealNeg = (!req.user.isAdmin && req.user.id !== deal.company_id) ? activeNegotiationFor(deal.id, req.user.id) : null;
+  const signBtn = !req.user.isAdmin && req.user.id !== deal.company_id && deal.contract_state !== 'approved'
+    ? (myDealNeg
+      ? `<a class="btn btn-green" href="/negotiation/${myDealNeg.id}">View negotiation ${statusBadge(myDealNeg.state)}</a>`
+      : `<a class="btn btn-green" href="/deal/${deal.id}/loi">Express interest (LOI)</a>`) : '';
+
+  // ---- Status & shipment tracking (CIF/CRF only; FOP has no platform tracking) ----
+  const isFop = (deal.incoterm || 'CIF') === 'FOP';
+  let statusHtml;
+  if (isFop) {
+    statusHtml = `<div class="card" data-reveal>
+      <h3>📦 Deal status</h3>
+      <p style="margin-top:8px">${dealStatusChip(deal)}</p>
+      <p class="muted" style="margin-top:10px">FOP terms — shipment tracking is not available on the platform. The buyer arranges main carriage directly with the seller.</p>
+    </div>`;
+  } else {
+    const tracking = (deal.tracking_number || deal.tracking_url) ? `
+      <p style="margin-top:10px">🚚 <b>Tracking:</b> ${deal.tracking_number ? `<span class="deal-num">${esc(deal.tracking_number)}</span>` : ''}
+        ${deal.tracking_url ? ` · <a href="${esc(deal.tracking_url)}" rel="noopener noreferrer nofollow">Track shipment →</a>` : ''}</p>` : '';
+    const note = deal.status_note ? `<p class="muted" style="margin-top:8px">📝 ${esc(deal.status_note)}</p>` : '';
+    const canUpdate = (isOwner || isBuyer || req.user.isAdmin) && deal.contract_state !== 'approved' && deal.status !== 'closed';
+    const updateForm = canUpdate ? `
+      <hr class="sep">
+      <h4 style="margin-bottom:8px">Advance status</h4>
+      <form method="POST" action="/deal/${deal.id}/status">
+        <label>New status</label>
+        <select name="status">${optionsHtml(DEAL_STATUSES, DEAL_STATUSES.includes(deal.status) ? deal.status : 'open')}</select>
+        <div class="grid2" style="gap:10px">
+          <div><label>Tracking number (optional)</label><input type="text" name="tracking_number" maxlength="120" value="${esc(deal.tracking_number || '')}"></div>
+          <div><label>Tracking URL (optional, https://)</label><input type="url" name="tracking_url" maxlength="300" value="${esc(deal.tracking_url || '')}" placeholder="https://carrier.example/track/…"></div>
+        </div>
+        <label>Note (optional)</label><input type="text" name="status_note" maxlength="300" placeholder="e.g. Loaded on vessel, ETA 12 days">
+        <button class="btn btn-sm" type="submit">Update status</button>
+        <p class="muted" style="margin-top:6px">The other party is notified and the update is audit-logged.</p>
+      </form>` : '';
+    statusHtml = `<div class="card" data-reveal>
+      <h3>📦 Deal status <span class="muted" style="font-weight:400">· ${esc(deal.incoterm || 'CIF')} terms</span></h3>
+      ${stepperHtml(deal)}
+      ${tracking}${note}
+      ${updateForm}
+    </div>`;
+  }
+
+  // ---- Product proof (sell deals) ----
+  let proofHtml = '';
+  if ((deal.deal_type || 'sell') === 'sell' && (deal.product_proof || deal.product_proof_doc_id)) {
+    let inner = '';
+    if (deal.product_proof_doc_id) {
+      const doc = db.prepare('SELECT id, filename, authenticity_status, authenticity_notes FROM documents WHERE id = ?').get(deal.product_proof_doc_id);
+      if (doc) {
+        const dl = (isOwner || req.user.isAdmin) ? ` <a href="/documents/${doc.id}">Download</a>` : '';
+        inner += `<p style="margin-top:8px">📄 Product proof on file (${esc(doc.filename || 'proof.pdf')}) ${authenticityBadge(doc.authenticity_status, (isOwner || req.user.isAdmin) ? doc.authenticity_notes : '')}${dl}</p>`;
+      }
+    }
+    if (deal.product_proof) inner += `<p class="muted" style="margin-top:8px;white-space:pre-wrap">🧾 ${esc(deal.product_proof)}</p>`;
+    if (inner) proofHtml = `<div class="card" data-reveal><h3>🔍 Product proof</h3>${inner}</div>`;
+  }
+
+  // ---- Request more documents (buyer → seller) + deal document exchange ----
+  const docRequests = db.prepare(`SELECT * FROM deal_documents WHERE deal_id = ? AND kind = 'request' ORDER BY id DESC LIMIT 50`).all(deal.id);
+  const docUploads = db.prepare(`SELECT * FROM deal_documents WHERE deal_id = ? AND kind = 'document' ORDER BY id DESC LIMIT 50`).all(deal.id);
+  let docsHtml = '';
+  if (isOwner) {
+    const reqList = docRequests.length ? docRequests.map(r => `
+      <div style="padding:8px 0;border-top:1px dashed var(--border-soft)">
+        📩 <a href="/company/${r.company_id}"><b>${esc(names.get(r.company_id) || 'Unknown')}</b></a> requested:
+        <span style="white-space:pre-wrap">${esc(r.note)}</span><br>
+        <span class="muted">${esc(r.created_at.slice(0, 16).replace('T', ' '))} UTC</span>
+      </div>`).join('') : '<p class="muted">No document requests yet.</p>';
+    docsHtml += `<div class="card" data-reveal>
+      <h3>📩 Document requests</h3>
+      ${reqList}
+      <hr class="sep">
+      <h4 style="margin-bottom:8px">Upload a response document</h4>
+      <form method="POST" action="/deal/${deal.id}/documents" enctype="multipart/form-data">
+        <label>Document (PDF or image, max 15 MB)</label>
+        <label class="file-btn"><span class="file-btn-text" data-default="📎 Attach PDF or image">📎 Attach PDF or image</span>
+          <input type="file" class="file-input" name="doc" accept="application/pdf,.pdf,image/jpeg,image/png,image/gif,image/webp" required></label>
+        <label>Note for the requester (optional)</label><input type="text" name="note" maxlength="300" placeholder="e.g. Certificate of origin for the full batch">
+        <button class="btn btn-sm" type="submit">Upload &amp; share with requesters</button>
+        <p class="muted" style="margin-top:6px">Visible to you, requesting/contracted parties and the admin. Screened by the Document Authenticity Agent.</p>
+      </form>
+    </div>`;
+  } else if (!req.user.isAdmin) {
+    docsHtml += `<div class="card" data-reveal>
+      <h3>📩 Request documents</h3>
+      <p class="muted" style="margin-bottom:10px">Need certificates, licenses or proof from the ${(deal.deal_type || 'sell') === 'sell' ? 'seller' : 'buyer'}? Send a request — they are notified instantly.</p>
+      <form method="POST" action="/deal/${deal.id}/request-docs">
+        <label>What do you need?</label>
+        <textarea name="request" rows="3" required maxlength="500" placeholder="e.g. Certificate of origin, lab analysis, export license…"></textarea>
+        <button class="btn btn-sm" type="submit">Send document request</button>
+      </form>
+    </div>`;
+  }
+  if (canViewDealDocs(req.user, deal) && (docUploads.length || (docRequests.length && !isOwner))) {
+    const myReqs = isOwner ? '' : docRequests.filter(r => r.company_id === req.user.id).map(r => `
+      <div style="padding:6px 0;border-top:1px dashed var(--border-soft)">📩 You requested: <span style="white-space:pre-wrap">${esc(r.note)}</span>
+        <span class="muted">· ${esc(r.created_at.slice(0, 16).replace('T', ' '))} UTC</span></div>`).join('');
+    const upList = docUploads.map(d => `
+      <div style="padding:6px 0;border-top:1px dashed var(--border-soft)">📄 <a href="/deal-docs/${d.id}/download"><b>${esc(d.filename || 'document')}</b></a>
+        ${d.note ? `<br><span class="muted">${esc(d.note)}</span>` : ''}
+        <br><span class="muted">${(d.data.length / 1024).toFixed(1)} KB · ${esc(d.created_at.slice(0, 16).replace('T', ' '))} UTC</span></div>`).join('');
+    docsHtml += `<div class="card" data-reveal>
+      <h3>🗂️ Deal documents</h3>
+      ${myReqs}
+      ${upList || '<p class="muted">No response documents shared yet.</p>'}
+    </div>`;
+  }
+
   const body = `
   <div class="card card-deal">
     <div class="feed-head"><h2>${esc(deal.title)}</h2>
       ${dealValueHtml}</div>
+    <div style="margin:8px 0 4px">
+      ${deal.deal_number ? `<span class="deal-num" style="font-size:1rem">Deal № ${esc(deal.deal_number)}</span> · ` : ''}
+      ${dealTypeChips(deal)}
+      <span class="chip" title="${esc(INCOTERM_EXPLAINERS[deal.incoterm] || INCOTERM_EXPLAINERS.CIF)}">⚓ ${esc(deal.incoterm || 'CIF')}</span>
+      ${deal.origin ? ` <span class="chip">📍 ${esc(deal.origin)}</span>` : ''}
+    </div>
     <p class="muted">by ${avatarHtml(owner ? owner.name : '?', owner ? owner.avatar_media_id : null)}<a href="/company/${deal.company_id}"><b>${esc(owner ? owner.name : 'Unknown')}</b></a> ${starsHtml(companyReputation(deal.company_id), true)}</p>
     <p style="margin-top:12px;white-space:pre-wrap">${esc(deal.description)}</p>
     ${deal.contract_state === 'approved' ? `<div style="margin-top:12px"><span class="badge badge-contract">Contract approved ✓${deal.contract_party ? ' (with ' + esc(deal.contract_party) + ')' : ''}</span></div>` : ''}
     ${mediaHtml(deal.media_id)}
     <div class="feed-actions">${signBtn}</div>
   </div>
-  ${contractHtml}`;
+  ${statusHtml}
+  ${proofHtml}
+  ${contractHtml}
+  ${docsHtml}`;
   res.send(page(deal.title, body, req.user, req.query.msg, req.query.err));
 });
 
-// ----- Contract terms page -----
-app.get('/deal/:id/contract', requireCompany, (req, res) => {
+// ----- POST /deal/:id/status — owner, contracted buyer or admin advances the pipeline (CIF/CRF only) -----
+app.post('/deal/:id/status', (req, res) => {
+  const user = currentUser(req);
+  if (!user) return res.redirect('/login?err=' + encodeURIComponent('Please sign in.'));
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!deal) return res.redirect(user.isAdmin ? '/admin/dashboard' : '/timeline?err=' + encodeURIComponent('Deal not found.'));
+  const back = user.isAdmin ? '/admin/dashboard' : `/deal/${deal.id}`;
+  const isOwner = !user.isAdmin && user.id === deal.company_id;
+  const buyerId = dealBuyerId(deal);
+  const isBuyer = !user.isAdmin && buyerId === user.id;
+  if (!user.isAdmin && !isOwner && !isBuyer) {
+    audit('DEAL AGENT', 'status update guard', 'fail', `${user.name} attempted to update status on deal #${deal.id} without being a party`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Parties only</h2><p class="muted">Only the deal owner, the contracted buyer and the admin can advance the deal status.</p></div>', user));
+  }
+  if ((deal.incoterm || 'CIF') === 'FOP') {
+    return res.redirect(back + '?err=' + encodeURIComponent('FOP terms — shipment tracking is not available on the platform.'));
+  }
+  if (deal.contract_state === 'approved' || deal.status === 'closed') {
+    return res.redirect(back + '?err=' + encodeURIComponent('This deal is closed — the contract is finalized.'));
+  }
+  const newStatus = String(req.body.status || '');
+  if (!DEAL_STATUSES.includes(newStatus)) {
+    return res.redirect(back + '?err=' + encodeURIComponent('Invalid status. Choose one of: ' + DEAL_STATUSES.join(', ') + '.'));
+  }
+  const note = String(req.body.status_note || '').trim().slice(0, 300);
+  let trackingNumber = String(req.body.tracking_number || '').trim().slice(0, 120);
+  let trackingUrl = String(req.body.tracking_url || '').trim().slice(0, 300);
+  if (trackingUrl && !/^https:\/\//i.test(trackingUrl)) {
+    return res.redirect(back + '?err=' + encodeURIComponent('Tracking URL must start with https://'));
+  }
+  if (!trackingNumber) trackingNumber = deal.tracking_number || '';
+  if (!trackingUrl) trackingUrl = deal.tracking_url || '';
+  db.prepare('UPDATE deals SET status = ?, status_note = ?, tracking_number = ?, tracking_url = ? WHERE id = ?')
+    .run(newStatus, note, trackingNumber, trackingUrl, deal.id);
+  audit('DEAL AGENT', 'status update', 'pass', `${user.isAdmin ? 'Admin' : user.name} advanced deal ${deal.deal_number || '#' + deal.id} to "${newStatus}"${note ? ` — note: ${note}` : ''}${trackingNumber ? ` — tracking ${trackingNumber}` : ''}`);
+  // Notify the other party (admin updates notify both parties).
+  const label = `${user.isAdmin ? 'The platform' : user.name} updated deal ${deal.deal_number || '#' + deal.id} ("${deal.title}") to "${newStatus.toUpperCase()}"${note ? ` — ${note}` : ''}`;
+  if (user.isAdmin || isBuyer) notify(deal.company_id, 'deal_status', label, `/deal/${deal.id}`);
+  if (user.isAdmin || isOwner) { if (buyerId) notify(buyerId, 'deal_status', label, `/deal/${deal.id}`); }
+  res.redirect(back + '?msg=' + encodeURIComponent(`Deal status updated to "${newStatus}".`));
+});
+
+// ----- POST /deal/:id/request-docs — a non-owner company asks the owner for more documents -----
+app.post('/deal/:id/request-docs', requireCompany, (req, res) => {
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!deal) return res.redirect('/timeline?err=' + encodeURIComponent('Deal not found.'));
+  if (deal.company_id === req.user.id) {
+    return res.redirect(`/deal/${deal.id}?err=` + encodeURIComponent('This is your own deal — document requests come from counterparties.'));
+  }
+  const text = String(req.body.request || '').trim().slice(0, 500);
+  if (!text) return res.redirect(`/deal/${deal.id}?err=` + encodeURIComponent('Please describe which documents you need.'));
+  db.prepare(`INSERT INTO deal_documents (deal_id, company_id, kind, note, created_at) VALUES (?,?, 'request', ?, ?)`)
+    .run(deal.id, req.user.id, text, now());
+  audit('DEAL AGENT', 'document request', 'pass', `${req.user.name} requested documents on deal ${deal.deal_number || '#' + deal.id}: "${text.slice(0, 80)}"`);
+  notify(deal.company_id, 'doc_request', `${req.user.name} requested documents on your deal "${deal.title}": "${text.slice(0, 120)}". Respond on the deal page.`, `/deal/${deal.id}`);
+  res.redirect(`/deal/${deal.id}?msg=` + encodeURIComponent('Document request sent to the deal owner.'));
+});
+
+// ----- POST /deal/:id/documents — the owner uploads a response document (PDF or image) -----
+app.post('/deal/:id/documents', requireCompany, dealDocUploadMw, async (req, res) => {
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!deal) return res.redirect('/timeline?err=' + encodeURIComponent('Deal not found.'));
+  if (deal.company_id !== req.user.id) {
+    audit('DEAL AGENT', 'document upload guard', 'fail', `${req.user.name} attempted to upload a response document to deal #${deal.id} without owning it`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Only the deal owner can upload response documents.</h2></div>', req.user));
+  }
+  const f = req.file;
+  if (!f) return res.redirect(`/deal/${deal.id}?err=` + encodeURIComponent('Choose a PDF or image to upload.'));
+  const isPdf = isPdfBuffer(f.buffer);
+  if (!isPdf && !isImageBuffer(f.buffer)) {
+    return res.redirect(`/deal/${deal.id}?err=` + encodeURIComponent('Upload rejected: the file content is not a real PDF or image.'));
+  }
+  // Document Authenticity Agent — light pass (magic bytes, size window, PDF parseability, sha256).
+  const notes = [];
+  const size = f.buffer.length;
+  if (size < 200) notes.push(`suspiciously small file (${size} bytes)`);
+  if (size > DOC_MAX_BYTES) notes.push(`file too large (${size} bytes)`);
+  if (isPdf) {
+    const parsed = await extractPdfText(f.buffer);
+    if (!parsed) notes.push('PDF could not be parsed (corrupt or malformed)');
+  }
+  const sha256 = crypto.createHash('sha256').update(f.buffer).digest('hex');
+  const dup = db.prepare(`SELECT id FROM deal_documents WHERE sha256 = ? AND kind = 'document' LIMIT 1`).get(sha256);
+  if (dup) notes.push('identical file already shared on the platform');
+  audit('DOCUMENT AGENT', 'deal document check', notes.length ? 'flag' : 'pass',
+    `"${f.originalname || 'file'}" on deal ${deal.deal_number || '#' + deal.id} by ${req.user.name}: ${notes.length ? notes.join('; ') : 'light pass OK'}`);
+
+  const note = String(req.body.note || '').trim().slice(0, 300);
+  const mime = isPdf ? 'application/pdf' : String(f.mimetype || 'image/jpeg').toLowerCase();
+  db.prepare(`INSERT INTO deal_documents (deal_id, company_id, kind, note, mime, filename, data, sha256, created_at)
+              VALUES (?,?, 'document', ?,?,?,?,?,?)`)
+    .run(deal.id, req.user.id, note, mime, String(f.originalname || 'document').slice(0, 200), f.buffer, sha256, now());
+  // Notify every requesting party + the contracted buyer.
+  const recipients = new Set(db.prepare(`SELECT DISTINCT company_id FROM deal_documents WHERE deal_id = ? AND kind = 'request'`).all(deal.id).map(r => r.company_id));
+  const buyerId = dealBuyerId(deal);
+  if (buyerId) recipients.add(buyerId);
+  recipients.delete(req.user.id);
+  for (const cid of recipients) {
+    notify(cid, 'deal_document', `${req.user.name} shared a document on deal "${deal.title}"${note ? `: "${note.slice(0, 100)}"` : ''}. Open the deal page to download it.`, `/deal/${deal.id}`);
+  }
+  res.redirect(`/deal/${deal.id}?msg=` + encodeURIComponent('Document shared with the requesting parties.'));
+});
+
+// ----- GET /deal-docs/:id/download — owner, requesting/contracted parties, admin only -----
+app.get('/deal-docs/:id/download', (req, res) => {
+  const user = currentUser(req);
+  if (!user) return res.redirect('/login?err=' + encodeURIComponent('Please sign in.'));
+  const doc = db.prepare(`SELECT * FROM deal_documents WHERE id = ? AND kind = 'document'`).get(parseInt(req.params.id, 10));
+  if (!doc) return res.status(404).send(page('Not found', '<div class="card"><h2>Document not found</h2></div>', user));
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(doc.deal_id);
+  if (!deal || !canViewDealDocs(user, deal)) {
+    audit('DEAL AGENT', 'deal document access', 'fail', `Unauthorized download attempt on deal document #${doc.id} by ${user.isAdmin ? 'admin?' : user.name}`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Private deal document</h2><p class="muted">Only the deal owner, requesting/contracted parties and the admin can download this document.</p></div>', user));
+  }
+  audit('DEAL AGENT', 'deal document access', 'pass', `Deal document #${doc.id} (deal ${deal.deal_number || '#' + deal.id}) downloaded by ${user.isAdmin ? 'admin' : user.name}`);
+  res.setHeader('Content-Type', doc.mime || 'application/octet-stream');
+  res.setHeader('Content-Length', doc.data.length);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.setHeader('Content-Disposition', `attachment; filename="${String(doc.filename || 'document').replace(/[^A-Za-z0-9._-]/g, '_')}"`);
+  res.send(doc.data);
+});
+
+// ----- Contract terms page (party-guarded: values & terms stay inside the negotiation circle) -----
+app.get('/deal/:id/contract', requireCompanyOrAdmin, (req, res) => {
   const deal = getDealOr404(req, res);
   if (!deal) return;
+  if (!canViewDealTerms(req.user, deal)) {
+    audit('CONTRACT AGENT', 'contract page access', 'fail', `Unauthorized contract view attempt on deal ${deal.deal_number || '#' + deal.id} by ${req.user.name}`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Private</h2><p class="muted">Private — values and terms are shared only inside a negotiation.</p></div>', req.user));
+  }
   const owner = db.prepare('SELECT id, name FROM companies WHERE id = ?').get(deal.company_id);
-  const me = db.prepare('SELECT id, name FROM companies WHERE id = ?').get(req.user.id);
-  const isOwn = deal.company_id === req.user.id;
+  const isOwn = !req.user.isAdmin && deal.company_id === req.user.id;
   const contract = latestContract(deal.id);
+  const names = companyNameMap();
+  const dealNum = deal.deal_number || String(deal.id);
+  const counterpartyName = dealCounterpartyName(deal, names);
 
-  const clauses = CONTRACT_CLAUSES.map(c => `<p style="margin-bottom:10px">${esc(c)}</p>`).join('');
+  const clauses = contractClauses().map(c => `<p style="margin-bottom:10px">${esc(c)}</p>`).join('');
   const existing = isLiveContract(contract)
     ? `<p class="muted" style="margin-top:10px">A contract for this deal is currently <b>${esc(contract.status.replace(/_/g, ' '))}</b>.</p>` : '';
   const finalizedNote = deal.contract_state === 'approved'
     ? `<p style="margin-top:10px"><span class="badge badge-contract">Contract approved ✓${deal.contract_party ? ' (with ' + esc(deal.contract_party) + ')' : ''}</span></p>` : '';
 
-  const actions = isOwn
+  const actions = req.user.isAdmin
+    ? `<p class="muted" style="margin-top:16px">Admin view — contract actions are performed by the parties.</p>`
+    : isOwn
     ? `<p class="muted" style="margin-top:16px">This is your own deal — you cannot sign a contract with yourself.</p>`
-    : `<div class="feed-actions" style="margin-top:18px">
+    : (() => {
+        const myNeg2 = activeNegotiationFor(deal.id, req.user.id);
+        const signStep = myNeg2 && ['PO_SENT', 'SIGNING'].includes(myNeg2.state)
+          ? `<a class="btn btn-green" href="/deal/${deal.id}/sign">Proceed with signing →</a>`
+          : myNeg2
+            ? `<a class="btn btn-green" href="/negotiation/${myNeg2.id}">View negotiation ${statusBadge(myNeg2.state)}</a>`
+            : `<a class="btn btn-green" href="/deal/${deal.id}/loi">Express interest (LOI) →</a>`;
+        return `<div class="feed-actions" style="margin-top:18px">
          <a class="btn btn-outline" href="/deal/${deal.id}/contract/download">Download contract document</a>
-         <a class="btn btn-green" href="/deal/${deal.id}/sign">Proceed with signing →</a>
+         ${signStep}
        </div>`;
+      })();
 
   const body = `
   <div class="card">
     <h2>B2B Contract — ${esc(deal.title)}</h2>
-    <p class="muted">Generated ${esc(now().slice(0, 10))} · Deal #${deal.id}</p>
+    <p class="muted">Generated ${esc(now().slice(0, 10))} · Deal № ${esc(dealNum)}</p>
     <hr class="sep">
     <p><b>Provider:</b> ${esc(owner ? owner.name : 'Unknown')}</p>
-    <p><b>Counterparty:</b> ${esc(me.name)}</p>
+    <p><b>Counterparty:</b> ${esc(counterpartyName)}</p>
     ${deal.value ? `<p><b>Deal value:</b> <span class="deal-value" style="font-size:1.05rem">${esc(deal.value)} ${esc(deal.currency || 'USD')}</span>${deal.time_period ? ` <span class="muted">· ⏳ ${esc(deal.time_period)}</span>` : ''}</p>` : ''}
     ${feeLineHtml(deal, 'margin-top:6px')}
     <h3 style="margin:14px 0 6px">Deal terms</h3>
@@ -1937,20 +3284,26 @@ app.get('/deal/:id/contract', requireCompany, (req, res) => {
   res.send(page('Contract — ' + deal.title, body, req.user, req.query.msg, req.query.err));
 });
 
-// ----- Download contract as a Word-compatible document -----
-app.get('/deal/:id/contract/download', requireCompany, (req, res) => {
+// ----- Download contract as a Word-compatible document (same party guard as the contract page) -----
+app.get('/deal/:id/contract/download', requireCompanyOrAdmin, (req, res) => {
   const deal = getDealOr404(req, res);
   if (!deal) return;
+  if (!canViewDealTerms(req.user, deal)) {
+    audit('CONTRACT AGENT', 'contract download access', 'fail', `Unauthorized contract download attempt on deal ${deal.deal_number || '#' + deal.id} by ${req.user.name}`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Private</h2><p class="muted">Private — values and terms are shared only inside a negotiation.</p></div>', req.user));
+  }
   const owner = db.prepare('SELECT id, name FROM companies WHERE id = ?').get(deal.company_id);
-  const me = db.prepare('SELECT id, name FROM companies WHERE id = ?').get(req.user.id);
-  const clauses = CONTRACT_CLAUSES.map(c => `<p>${esc(c)}</p>`).join('');
+  const names = companyNameMap();
+  const dealNum = deal.deal_number || String(deal.id);
+  const counterpartyName = dealCounterpartyName(deal, names);
+  const clauses = contractClauses().map(c => `<p>${esc(c)}</p>`).join('');
   const doc = `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word">
-<head><meta charset="utf-8"><title>Contract #${deal.id}</title></head>
+<head><meta charset="utf-8"><title>Contract — Deal № ${esc(dealNum)}</title></head>
 <body style="font-family:Calibri,Arial,sans-serif">
-  <h1>B2B Contract — Deal #${deal.id}</h1>
+  <h1>B2B Contract — Deal № ${esc(dealNum)}</h1>
   <h2>${esc(deal.title)}</h2>
   <p><b>Provider:</b> ${esc(owner ? owner.name : 'Unknown')}<br>
-     <b>Counterparty:</b> ${esc(me.name)}<br>
+     <b>Counterparty:</b> ${esc(counterpartyName)}<br>
      ${deal.value ? `<b>Deal value:</b> ${esc(deal.value)} ${esc(deal.currency || 'USD')}<br>` : ''}
      <b>${esc(feeLineText(deal))}</b><br>
      <b>Generated:</b> ${esc(now())}</p>
@@ -1959,8 +3312,9 @@ app.get('/deal/:id/contract/download', requireCompany, (req, res) => {
   <p>__________________________&nbsp;&nbsp;&nbsp;__________________________<br>
   Provider signature&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Counterparty signature</p>
 </body></html>`;
+  audit('CONTRACT AGENT', 'contract download access', 'pass', `Contract for deal ${dealNum} downloaded by ${req.user.isAdmin ? 'admin' : req.user.name}`);
   res.setHeader('Content-Type', 'application/msword');
-  res.setHeader('Content-Disposition', `attachment; filename="contract-${deal.id}.doc"`);
+  res.setHeader('Content-Disposition', `attachment; filename="contract-${String(dealNum).replace(/[^A-Za-z0-9._-]/g, '_')}.doc"`);
   res.send(doc);
 });
 
@@ -1995,6 +3349,11 @@ app.get('/deal/:id/sign', (req, res) => {
   const myCounter = (!user.isAdmin && user.id)
     ? db.prepare(`SELECT * FROM counter_offers WHERE deal_id = ? AND from_company_id = ? AND status = 'pending'`).get(deal.id, user.id)
     : null;
+  // Stage C: signing is only reachable through the negotiation pipeline (buyer, after the PO is issued).
+  const myNeg = (!user.isAdmin && user.id && user.id !== deal.company_id)
+    ? db.prepare(`SELECT * FROM negotiations WHERE deal_id = ? AND buyer_id = ? AND state IN ('PO_SENT','SIGNING') ORDER BY id DESC LIMIT 1`).get(deal.id, user.id)
+    : null;
+  const canSign = !user.isAdmin && !isOwn && !finalized && !!myNeg;
   const canAct = !user.isAdmin && !isOwn && !finalized;
   const tab = req.query.tab === 'counter' ? 'counter' : 'sign';
 
@@ -2009,8 +3368,15 @@ app.get('/deal/:id/sign', (req, res) => {
     signPanel = '<p class="muted" style="margin-top:14px">This is your own deal — the counterparty signs here.</p>';
   } else if (live) {
     signPanel = `<p class="muted" style="margin-top:14px">A contract for this deal is currently <b>${esc(contract.status.replace(/_/g, ' '))}</b> — no new signature can be started.</p>`;
+  } else if (!canSign) {
+    signPanel = `<p class="muted" style="margin-top:14px">Deal contracts on Dealzoin start with a <b>Letter of Intent</b> and a negotiation with the seller.
+      Once the seller issues a Purchase Order, you sign right here.</p>
+      <div class="feed-actions"><a class="btn btn-green" href="/deal/${deal.id}/loi">Express interest (LOI) →</a></div>`;
   } else {
     signPanel = `
+    <p class="muted" style="margin-top:10px">Negotiation #${myNeg.id} — agreed value
+      <span class="deal-value" style="font-size:1rem">${esc(myNeg.offer_value)} ${esc(myNeg.offer_currency || 'USD')}</span>
+      · <a href="/negotiation/${myNeg.id}/po.doc">Download PO (.doc)</a> · <a href="/negotiation/${myNeg.id}">back to negotiation</a></p>
     <form method="POST" action="/deal/${deal.id}/sign">
       <label>Re-enter your account password (signing authority check)</label>
       <input type="password" name="password" required>
@@ -2097,6 +3463,12 @@ app.post('/deal/:id/sign', requireCompany, (req, res) => {
   if (myCounter) {
     return res.redirect(`/deal/${deal.id}/sign?tab=counter&err=` + encodeURIComponent('You already have a pending counter offer on this deal.'));
   }
+  // Stage C: a signature requires an active negotiation at the PO stage (buyer only).
+  const neg = db.prepare(`SELECT * FROM negotiations WHERE deal_id = ? AND buyer_id = ? AND state IN ('PO_SENT','SIGNING') ORDER BY id DESC LIMIT 1`).get(deal.id, req.user.id);
+  if (!neg) {
+    audit('AUTHENTICATION AGENT', 'signing pipeline guard', 'fail', `${req.user.name} attempted to sign deal #${deal.id} without a Purchase Order (no active negotiation)`);
+    return res.redirect(`/deal/${deal.id}?err=` + encodeURIComponent('Contracts start with a Letter of Intent — complete the negotiation until the seller issues the Purchase Order.'));
+  }
 
   // (a) signer must re-enter their account password (signing authority check)
   const me = db.prepare('SELECT * FROM companies WHERE id = ?').get(req.user.id);
@@ -2128,6 +3500,11 @@ app.post('/deal/:id/sign', requireCompany, (req, res) => {
     .run(token, me.id, code, 'sign', JSON.stringify({ deal_id: deal.id }), new Date(Date.now() + CODE_TTL_MS).toISOString(), now());
   sendVerificationCode(me.email, code);
   audit('AUTHENTICATION AGENT', 'signing OTP issued', 'pass', `Signing code issued for ${me.email} (deal #${deal.id}, 10-min expiry)`);
+  // Pipeline: PO_SENT → SIGNING once the buyer starts the signing ritual.
+  if (neg.state === 'PO_SENT') {
+    negSetState(neg.id, 'SIGNING');
+    negEvent(neg.id, req.user.id, 'signing');
+  }
 
   res.setHeader('Set-Cookie', `dz_sign=${signedCookieValue(token)}; HttpOnly; Path=/; Max-Age=600; SameSite=Lax${isSecureReq(req) ? '; Secure' : ''}`);
   res.redirect(`/deal/${deal.id}/sign/verify`);
@@ -2199,19 +3576,28 @@ app.post('/deal/:id/sign/verify', requireCompany, (req, res) => {
     db.prepare('DELETE FROM verification_codes WHERE id = ?').run(ctx.row.id);
     return res.redirect(`/deal/${deal.id}/sign?err=` + encodeURIComponent('A contract for this deal is already ' + existing.status.replace(/_/g, ' ') + '.'));
   }
+  // Stage C: re-check the negotiation pipeline at commit time.
+  const neg = db.prepare(`SELECT * FROM negotiations WHERE deal_id = ? AND buyer_id = ? AND state IN ('PO_SENT','SIGNING') ORDER BY id DESC LIMIT 1`).get(deal.id, req.user.id);
+  if (!neg) {
+    db.prepare('DELETE FROM verification_codes WHERE id = ?').run(ctx.row.id);
+    return res.redirect(`/deal/${deal.id}?err=` + encodeURIComponent('No active negotiation at the signing stage. Start with a Letter of Intent.'));
+  }
 
   db.prepare('DELETE FROM verification_codes WHERE id = ?').run(ctx.row.id);
   const ts = now();
   // State machine stage 1: the contract first awaits the DEAL OWNER's approval.
-  db.prepare(`INSERT INTO contracts (deal_id, signer_company_id, owner_company_id, status, signed_at, created_at)
-              VALUES (?,?,?, 'pending_owner', ?, ?)`)
-    .run(deal.id, req.user.id, deal.company_id, ts, ts);
+  db.prepare(`INSERT INTO contracts (deal_id, signer_company_id, owner_company_id, status, signed_at, created_at, negotiation_id)
+              VALUES (?,?,?, 'pending_owner', ?, ?, ?)`)
+    .run(deal.id, req.user.id, deal.company_id, ts, ts, neg.id);
+  // Pipeline: SIGNING → SIGNED — the seller (owner) approves next, inside the negotiation thread.
+  negSetState(neg.id, 'SIGNED');
+  negEvent(neg.id, req.user.id, 'signed', { note: 'Signed in the vault signing room (password + OTP verified)' });
   res.setHeader('Set-Cookie', 'dz_sign=; HttpOnly; Path=/; Max-Age=0');
   audit('AUTHENTICATION AGENT', 'signing OTP verify', 'pass', `Signing code verified for ${req.user.name} (deal #${deal.id})`);
-  audit('AUTHENTICATION AGENT', 'contract signed', 'pass', `${req.user.name} signed deal #${deal.id} at ${ts} — pending owner approval`);
-  notify(deal.company_id, 'contract_signed', `${req.user.name} signed the contract for your deal "${deal.title}". Review it in your deal inbox.`, '/deals/inbox');
+  audit('AUTHENTICATION AGENT', 'contract signed', 'pass', `${req.user.name} signed deal #${deal.id} at ${ts} (negotiation #${neg.id}) — pending seller approval`);
+  notify(deal.company_id, 'contract_signed', `${req.user.name} signed the contract for your deal "${deal.title}" (negotiation #${neg.id}). Review and approve it.`, `/negotiation/${neg.id}`);
 
-  res.redirect(`/deal/${deal.id}?msg=` + encodeURIComponent("Contract signed! It now awaits the deal owner's approval."));
+  res.redirect(`/negotiation/${neg.id}?msg=` + encodeURIComponent("Contract signed! It now awaits the seller's approval."));
 });
 
 // ----- Counter offer step 1: validate proposal + password, then issue a confirmation OTP -----
@@ -2372,7 +3758,7 @@ app.get('/deals/inbox', requireCompany, (req, res) => {
   const pendingContracts = db.prepare(`
     SELECT ct.*, d.title AS deal_title FROM contracts ct
     JOIN deals d ON d.id = ct.deal_id
-    WHERE ct.owner_company_id = ? AND ct.status = 'pending_owner'
+    WHERE ct.owner_company_id = ? AND ct.status = 'pending_owner' AND ct.negotiation_id IS NULL
     ORDER BY ct.signed_at ASC`).all(myId);
   const contractsHtml = pendingContracts.length ? pendingContracts.map(ct => {
     const signer = db.prepare('SELECT * FROM companies WHERE id = ?').get(ct.signer_company_id);
@@ -2431,8 +3817,43 @@ app.get('/deals/inbox', requireCompany, (req, res) => {
     </div>`;
   }).join('') : '<div class="card"><p class="muted">No pending counter offers on your deals.</p></div>';
 
+  // ---- Stage C: negotiations hub — all my negotiations as buyer or seller, newest first ----
+  const myNegs = db.prepare(`
+    SELECT n.*, d.title AS deal_title, d.deal_number
+    FROM negotiations n LEFT JOIN deals d ON d.id = n.deal_id
+    WHERE n.buyer_id = ? OR n.seller_id = ?
+    ORDER BY n.updated_at DESC LIMIT 100`).all(myId, myId);
+  const negAction = (n) => {
+    const open = `/negotiation/${n.id}`;
+    if (n.state === 'LOI_SENT') return n.seller_id === myId ? `<a class="btn btn-sm" href="${open}">Send offer</a>` : `<a class="btn btn-sm btn-outline" href="${open}">Open</a>`;
+    if (n.state === 'OFFER_SENT') return n.buyer_id === myId ? `<a class="btn btn-sm btn-green" href="${open}">Approve / counter</a>` : `<a class="btn btn-sm btn-outline" href="${open}">Open</a>`;
+    if (n.state === 'COUNTER_SENT') return n.seller_id === myId ? `<a class="btn btn-sm" href="${open}">Re-offer / decline</a>` : `<a class="btn btn-sm btn-outline" href="${open}">Open</a>`;
+    if (n.state === 'BUYER_APPROVED') return n.seller_id === myId ? `<a class="btn btn-sm btn-green" href="${open}">Approve &amp; send PO</a>` : `<a class="btn btn-sm btn-outline" href="${open}">Open</a>`;
+    if (n.state === 'PO_SENT' || n.state === 'SIGNING') return n.buyer_id === myId ? `<a class="btn btn-sm btn-green" href="${open}">Proceed to signing</a>` : `<a class="btn btn-sm btn-outline" href="${open}">Open</a>`;
+    if (n.state === 'SIGNED') return n.seller_id === myId ? `<a class="btn btn-sm btn-green" href="${open}">Approve signature</a>` : `<a class="btn btn-sm btn-outline" href="${open}">Open</a>`;
+    if (n.state === 'OWNER_APPROVED' || n.state === 'SPLIT_NEGO') return `<a class="btn btn-sm" href="${open}">Commission split</a>`;
+    return `<a class="btn btn-sm btn-outline" href="${open}">Open</a>`;
+  };
+  const negsHtml = myNegs.length ? myNegs.map((n, i) => {
+    const role = n.buyer_id === myId ? 'buyer' : 'seller';
+    const otherName = names.get(role === 'buyer' ? n.seller_id : n.buyer_id) || 'Unknown';
+    return `<div class="card" data-reveal style="--i:${Math.min(i, 10)}">
+      <div class="feed-head">
+        <h3>🤝 <a href="/negotiation/${n.id}">${esc(n.deal_title || 'Deal #' + n.deal_id)}</a></h3>
+        ${statusBadge(n.state)}
+      </div>
+      <p class="muted" style="margin-top:6px">You are the <b>${role}</b> · with <a href="/company/${role === 'buyer' ? n.seller_id : n.buyer_id}"><b>${esc(otherName)}</b></a>
+        · Deal № ${esc(n.deal_number || String(n.deal_id))} · round ${n.round}
+        ${n.offer_value ? ` · offer <b>${esc(n.offer_value)} ${esc(n.offer_currency || 'USD')}</b>` : ''}
+        · updated ${esc(n.updated_at.slice(0, 16).replace('T', ' '))} UTC</p>
+      <div class="feed-actions">${negAction(n)}</div>
+    </div>`;
+  }).join('') : '<div class="card"><p class="muted">No negotiations yet — express interest with an LOI from any deal page.</p></div>';
+
   const body = `
   <h2 class="sec-h" style="margin-top:0;margin-bottom:14px">📥 Deal inbox — your decisions</h2>
+  <h3 class="sec-h">🤝 Negotiations</h3>
+  ${negsHtml}
   <h3 class="sec-h">Contracts awaiting your approval</h3>
   ${contractsHtml}
   <h3 class="sec-h">Pending counter offers</h3>
@@ -2446,6 +3867,8 @@ app.post('/contracts/:id/owner-approve', requireCompany, (req, res) => {
   if (!ct || ct.owner_company_id !== req.user.id) {
     return res.redirect('/deals/inbox?err=' + encodeURIComponent('Contract not found.'));
   }
+  // Negotiation-linked contracts are decided inside the negotiation thread.
+  if (ct.negotiation_id) return res.redirect(`/negotiation/${ct.negotiation_id}`);
   if (ct.status !== 'pending_owner') {
     return res.redirect('/deals/inbox?err=' + encodeURIComponent('This contract is not awaiting your approval.'));
   }
@@ -2462,6 +3885,7 @@ app.post('/contracts/:id/owner-reject', requireCompany, (req, res) => {
   if (!ct || ct.owner_company_id !== req.user.id) {
     return res.redirect('/deals/inbox?err=' + encodeURIComponent('Contract not found.'));
   }
+  if (ct.negotiation_id) return res.redirect(`/negotiation/${ct.negotiation_id}`);
   if (ct.status !== 'pending_owner') {
     return res.redirect('/deals/inbox?err=' + encodeURIComponent('This contract is not awaiting your approval.'));
   }
@@ -2513,6 +3937,496 @@ app.post('/counter/:id/refuse', requireCompany, (req, res) => {
   res.redirect('/deals/inbox?msg=' + encodeURIComponent('Counter offer refused. The counterparty has been notified.'));
 });
 
+// ============================= NEGOTIATION PIPELINE (Stage C) =============================
+// State machine: LOI_SENT → OFFER_SENT ⇄ COUNTER_SENT (unlimited rounds) → BUYER_APPROVED
+//   → PO_SENT → SIGNING → SIGNED → OWNER_APPROVED → SPLIT_NEGO → PENDING_ADMIN → DONE / REJECTED.
+const NEG_STATES = ['LOI_SENT', 'OFFER_SENT', 'COUNTER_SENT', 'BUYER_APPROVED', 'PO_SENT', 'SIGNING',
+  'SIGNED', 'OWNER_APPROVED', 'SPLIT_NEGO', 'PENDING_ADMIN', 'DONE', 'REJECTED'];
+const NEG_OPEN_STATES = NEG_STATES.filter(s => s !== 'DONE' && s !== 'REJECTED');
+const NEG_SPLITS = { '50-50': '50 / 50 shared', 'buyer-pays': 'Buyer pays 100%', 'seller-pays': 'Seller pays 100%' };
+
+/** Load a negotiation row by id. */
+function getNegotiation(id) {
+  return db.prepare('SELECT * FROM negotiations WHERE id = ?').get(parseInt(id, 10));
+}
+/** True when the user is the buyer, the seller, or an admin. */
+function isNegParty(user, neg) {
+  if (!user || !neg) return false;
+  return user.isAdmin || user.id === neg.buyer_id || user.id === neg.seller_id;
+}
+/** Append an event to the negotiation timeline (drives the rounds view). */
+function negEvent(negId, actorId, kind, fields) {
+  const f = fields || {};
+  db.prepare(`INSERT INTO negotiation_events (negotiation_id, actor_id, kind, value, currency, terms, note, created_at)
+              VALUES (?,?,?,?,?,?,?,?)`)
+    .run(negId, actorId || null, kind, f.value || '', f.currency || '', String(f.terms || '').slice(0, 2000), String(f.note || '').slice(0, 500), now());
+}
+/** Move a negotiation to a new state (updated_at bumped). */
+function negSetState(negId, state) {
+  db.prepare('UPDATE negotiations SET state = ?, updated_at = ? WHERE id = ?').run(state, now(), negId);
+}
+/** The buyer's currently active negotiation on a deal (any non-terminal state), if any. */
+function activeNegotiationFor(dealId, buyerId) {
+  return db.prepare(`SELECT * FROM negotiations WHERE deal_id = ? AND buyer_id = ?
+                     AND state NOT IN ('DONE','REJECTED') ORDER BY id DESC LIMIT 1`).get(dealId, buyerId);
+}
+/** Commission math for a negotiation: total platform fee + per-party share per the agreed split. */
+function negFeeBreakdown(neg) {
+  const pct = platformFeePct();
+  const num = parseDealValue(neg.offer_value);
+  const cur = neg.offer_currency || 'USD';
+  if (!isFinite(num) || num <= 0) return { pct, cur, fee: NaN, buyer: NaN, seller: NaN };
+  const fee = num * pct / 100;
+  const split = NEG_SPLITS[neg.commission_split] ? neg.commission_split : '50-50';
+  const buyer = split === 'buyer-pays' ? fee : (split === 'seller-pays' ? 0 : fee / 2);
+  return { pct, cur, fee, buyer, seller: fee - buyer, split };
+}
+/** Human + HTML row describing the split amounts (values stay between parties + admin). */
+function negFeeHtml(neg) {
+  const f = negFeeBreakdown(neg);
+  const label = NEG_SPLITS[neg.commission_split] || NEG_SPLITS['50-50'];
+  if (!isFinite(f.fee)) {
+    return `<p class="muted">Platform commission: ${f.pct}% of the agreed value — split: <b>${esc(label)}</b></p>`;
+  }
+  return `<p>Platform commission: <b>${f.pct}%</b> = <span class="deal-value" style="font-size:1rem">${fmtAmount(f.fee)} ${esc(f.cur)}</span>
+    — split: <b>${esc(label)}</b><br>
+    <span class="muted">Buyer owes ${fmtAmount(f.buyer)} ${esc(f.cur)} · Seller owes ${fmtAmount(f.seller)} ${esc(f.cur)}</span></p>`;
+}
+/** Label for a negotiation timeline event. */
+function negEventLabel(kind) {
+  return {
+    loi: '📨 Letter of Intent', offer: '📤 Offer', counter: '💱 Counter offer',
+    approve: '✅ Offer approved', decline: '⛔ Negotiation declined', po: '📄 Purchase Order issued',
+    signing: '✍️ Signing started', signed: '🖊️ Contract signed', owner_approved: '✅ Signature approved by seller',
+    split: '⚖️ Commission split proposed', split_accept: '🤝 Commission split accepted',
+    admin_approved: '🏛️ Final admin approval', admin_rejected: '🏛️ Admin rejected'
+  }[kind] || kind;
+}
+/** Timeline-style rounds list (staggered reveal). */
+function negTimelineHtml(negId, names) {
+  const events = db.prepare('SELECT * FROM negotiation_events WHERE negotiation_id = ? ORDER BY id ASC LIMIT 200').all(negId);
+  if (!events.length) return '<p class="muted">No events yet.</p>';
+  return `<div class="tl">${events.map((e, i) => {
+    const actor = e.actor_id ? (names.get(e.actor_id) || 'Unknown') : 'Dealzoin';
+    const valLine = e.value ? `<div class="deal-value" style="font-size:1rem;margin:4px 0">${esc(e.value)} ${esc(e.currency || '')}</div>` : '';
+    const termsLine = e.terms ? `<p class="muted" style="white-space:pre-wrap;margin-top:4px">${esc(e.terms.slice(0, 600))}</p>` : '';
+    const noteLine = e.note ? `<p class="muted" style="margin-top:4px">${esc(e.note)}</p>` : '';
+    return `<div class="tl-item" data-reveal style="--i:${Math.min(i, 10)}">
+      <div class="tl-dot"></div>
+      <div class="tl-body">
+        <div class="feed-head" style="margin:0"><b>${negEventLabel(e.kind)}</b>
+          <span class="muted">${esc(actor)} · ${esc(e.created_at.slice(0, 16).replace('T', ' '))} UTC</span></div>
+        ${valLine}${termsLine}${noteLine}
+      </div>
+    </div>`;
+  }).join('')}</div>`;
+}
+
+// ----- LOI (Letter of Intent): the buyer's entry point into the pipeline -----
+app.get('/deal/:id/loi', requireCompany, (req, res) => {
+  const deal = getDealOr404(req, res);
+  if (!deal) return;
+  if (deal.company_id === req.user.id) {
+    return res.redirect(`/deal/${deal.id}?err=` + encodeURIComponent('This is your own deal — LOIs come from interested counterparties.'));
+  }
+  if (deal.contract_state === 'approved' || deal.status === 'closed') {
+    return res.redirect(`/deal/${deal.id}?err=` + encodeURIComponent('This deal is closed — the contract is finalized.'));
+  }
+  const existing = activeNegotiationFor(deal.id, req.user.id);
+  if (existing) return res.redirect(`/negotiation/${existing.id}`);
+  const owner = db.prepare('SELECT id, name FROM companies WHERE id = ?').get(deal.company_id);
+  const body = `
+  <div class="card" data-reveal style="max-width:640px;margin:0 auto">
+    <div class="kicker">Step 1 — express interest</div>
+    <h2>📨 Letter of Intent — ${esc(deal.title)}</h2>
+    <p class="muted">To <b>${esc(owner ? owner.name : 'the deal owner')}</b> · Deal № ${esc(deal.deal_number || String(deal.id))}.
+      The seller is notified and can answer with a private offer. Deal values are only shared inside the negotiation.</p>
+    <hr class="sep">
+    <form method="POST" action="/deal/${deal.id}/loi">
+      <label>Your intent *</label>
+      <textarea name="loi_text" rows="4" required maxlength="2000" placeholder="We are interested in purchasing …"></textarea>
+      <div class="grid2" style="gap:10px">
+        <div><label>Quantity</label><input type="text" name="loi_quantity" maxlength="120" placeholder="e.g. 500 units / month"></div>
+        <div><label>Your location (country / city) *</label><input type="text" name="loi_location" required maxlength="160" placeholder="e.g. Dubai, UAE"></div>
+      </div>
+      <label>Wishes / conditions (optional)</label>
+      <textarea name="loi_wishes" rows="3" maxlength="2000" placeholder="Delivery windows, inspection, certificates…"></textarea>
+      <button class="btn btn-green" type="submit">Send Letter of Intent →</button>
+      <p class="muted" style="margin-top:8px">Logged by the Deal Agent. The seller sees your company profile and this letter.</p>
+    </form>
+  </div>`;
+  res.send(page('Letter of Intent', body, req.user, req.query.msg, req.query.err));
+});
+
+app.post('/deal/:id/loi', requireCompany, (req, res) => {
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!deal) return res.redirect('/timeline?err=' + encodeURIComponent('Deal not found.'));
+  if (deal.company_id === req.user.id) {
+    audit('DEAL AGENT', 'LOI self-deal guard', 'fail', `${req.user.name} attempted an LOI on own deal #${deal.id}`);
+    return res.redirect(`/deal/${deal.id}?err=` + encodeURIComponent('You cannot send an LOI on your own deal.'));
+  }
+  if (deal.contract_state === 'approved' || deal.status === 'closed') {
+    return res.redirect(`/deal/${deal.id}?err=` + encodeURIComponent('This deal is closed — the contract is finalized.'));
+  }
+  const existing = activeNegotiationFor(deal.id, req.user.id);
+  if (existing) return res.redirect(`/negotiation/${existing.id}?err=` + encodeURIComponent('You already have an active negotiation on this deal.'));
+  const loiText = String(req.body.loi_text || '').trim().slice(0, 2000);
+  const loiQty = String(req.body.loi_quantity || '').trim().slice(0, 120);
+  const loiLoc = String(req.body.loi_location || '').trim().slice(0, 160);
+  const loiWishes = String(req.body.loi_wishes || '').trim().slice(0, 2000);
+  if (!loiText) return res.redirect(`/deal/${deal.id}/loi?err=` + encodeURIComponent('Please describe your intent.'));
+  if (!loiLoc) return res.redirect(`/deal/${deal.id}/loi?err=` + encodeURIComponent('Your location is required.'));
+  const ts = now();
+  const negId = db.prepare(`INSERT INTO negotiations (deal_id, buyer_id, seller_id, state, round, loi_text, loi_location, loi_quantity, loi_wishes, commission_split, created_at, updated_at)
+    VALUES (?,?,?, 'LOI_SENT', 0, ?,?,?,?, '50-50', ?, ?)`)
+    .run(deal.id, req.user.id, deal.company_id, loiText, loiLoc, loiQty, loiWishes, ts, ts).lastInsertRowid;
+  negEvent(negId, req.user.id, 'loi', { note: `Location: ${loiLoc}${loiQty ? ` · Quantity: ${loiQty}` : ''}`, terms: loiText + (loiWishes ? `\nWishes: ${loiWishes}` : '') });
+  audit('DEAL AGENT', 'LOI sent', 'pass', `${req.user.name} sent an LOI on deal ${deal.deal_number || '#' + deal.id} (negotiation #${negId}, location: ${loiLoc})`);
+  notify(deal.company_id, 'loi', `${req.user.name} expressed interest in your deal "${deal.title}" (LOI, from ${loiLoc}). Review and send a private offer.`, `/negotiation/${negId}`);
+  res.redirect(`/negotiation/${negId}?msg=` + encodeURIComponent('Letter of Intent sent — the seller has been notified.'));
+});
+
+// ----- Unified negotiation thread (role-aware actions for buyer / seller; admin read-only) -----
+app.get('/negotiation/:id', requireCompanyOrAdmin, (req, res) => {
+  const neg = getNegotiation(req.params.id);
+  if (!neg) return res.status(404).send(page('Not found', '<div class="card"><h2>Negotiation not found</h2></div>', req.user));
+  if (!isNegParty(req.user, neg)) {
+    audit('DEAL AGENT', 'negotiation access', 'fail', `Unauthorized negotiation #${neg.id} view attempt by ${req.user.isAdmin ? 'admin?' : req.user.name}`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Private negotiation</h2><p class="muted">Only the two negotiating parties and the admin can view this page.</p></div>', req.user));
+  }
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(neg.deal_id);
+  const names = companyNameMap();
+  const isBuyer = !req.user.isAdmin && req.user.id === neg.buyer_id;
+  const isSeller = !req.user.isAdmin && req.user.id === neg.seller_id;
+  const buyerName = names.get(neg.buyer_id) || 'Unknown';
+  const sellerName = names.get(neg.seller_id) || 'Unknown';
+  const st = neg.state;
+
+  // ---- Role-aware action panel ----
+  let actionHtml = '';
+  const waiting = (who) => `<div class="card" data-reveal><h3>⏳ Waiting for ${esc(who)}</h3><p class="muted">You'll be notified when the other party acts. Current state: ${statusBadge(st)}</p></div>`;
+  if (req.user.isAdmin) {
+    actionHtml = `<div class="card" data-reveal><h3>Admin view</h3><p class="muted">Negotiations are finalized from the admin dashboard once they reach final approval.</p></div>`;
+  } else if (st === 'LOI_SENT' && isSeller) {
+    actionHtml = `<div class="card" data-reveal>
+      <h3>📤 Send a private offer</h3>
+      <form method="POST" action="/negotiation/${neg.id}/offer">
+        <div class="grid2" style="gap:10px">
+          <div><label>Offer value *</label><input type="number" name="offer_value" min="0.01" step="any" required></div>
+          <div><label>Currency</label><select name="offer_currency">${optionsHtml(DEAL_CURRENCIES, deal ? (deal.currency || 'USD') : 'USD')}</select></div>
+        </div>
+        <label>Terms *</label><textarea name="offer_terms" rows="4" required maxlength="2000" placeholder="Payment terms, delivery, inspection…"></textarea>
+        <label style="display:flex;gap:8px;align-items:center;margin:10px 0">
+          <input type="checkbox" name="incoterm_ok" value="yes" style="width:auto;margin:0" required>
+          I confirm the deal incoterm (${esc(deal ? (deal.incoterm || 'CIF') : 'CIF')})</label>
+        <button class="btn" type="submit">Send offer →</button>
+      </form>
+      <form method="POST" action="/negotiation/${neg.id}/decline" style="margin-top:8px">
+        <button class="btn btn-sm btn-danger" type="submit">Decline this LOI</button>
+      </form>
+    </div>`;
+  } else if (st === 'OFFER_SENT' && isBuyer) {
+    actionHtml = `<div class="card" data-reveal>
+      <h3>💱 Answer the offer</h3>
+      <div class="feed-actions" style="margin-top:0">
+        <form method="POST" action="/negotiation/${neg.id}/approve-offer"><button class="btn btn-green" type="submit">Approve offer</button></form>
+      </div>
+      <hr class="sep">
+      <h4 style="margin-bottom:8px">…or send a counter offer</h4>
+      <form method="POST" action="/negotiation/${neg.id}/counter">
+        <div class="grid2" style="gap:10px">
+          <div><label>Counter value *</label><input type="number" name="offer_value" min="0.01" step="any" required value="${esc(neg.offer_value)}"></div>
+          <div><label>Currency</label><select name="offer_currency">${optionsHtml(DEAL_CURRENCIES, neg.offer_currency || 'USD')}</select></div>
+        </div>
+        <label>Counter terms *</label><textarea name="offer_terms" rows="4" required maxlength="2000">${esc(neg.offer_terms)}</textarea>
+        <button class="btn" type="submit">Send counter →</button>
+      </form>
+    </div>`;
+  } else if (st === 'COUNTER_SENT' && isSeller) {
+    actionHtml = `<div class="card" data-reveal>
+      <h3>📤 Re-offer (round ${neg.round + 1})</h3>
+      <form method="POST" action="/negotiation/${neg.id}/offer">
+        <div class="grid2" style="gap:10px">
+          <div><label>New offer value *</label><input type="number" name="offer_value" min="0.01" step="any" required value="${esc(neg.offer_value)}"></div>
+          <div><label>Currency</label><select name="offer_currency">${optionsHtml(DEAL_CURRENCIES, neg.offer_currency || 'USD')}</select></div>
+        </div>
+        <label>New terms *</label><textarea name="offer_terms" rows="4" required maxlength="2000">${esc(neg.offer_terms)}</textarea>
+        <label style="display:flex;gap:8px;align-items:center;margin:10px 0">
+          <input type="checkbox" name="incoterm_ok" value="yes" style="width:auto;margin:0" required>
+          I confirm the deal incoterm (${esc(deal ? (deal.incoterm || 'CIF') : 'CIF')})</label>
+        <button class="btn" type="submit">Send new offer →</button>
+      </form>
+      <form method="POST" action="/negotiation/${neg.id}/decline" style="margin-top:8px">
+        <button class="btn btn-sm btn-danger" type="submit">Decline — end negotiation</button>
+      </form>
+    </div>`;
+  } else if (st === 'BUYER_APPROVED' && isSeller) {
+    actionHtml = `<div class="card" data-reveal>
+      <h3>📄 Approve &amp; send Purchase Order</h3>
+      <p class="muted">The buyer approved your offer of <b>${esc(neg.offer_value)} ${esc(neg.offer_currency)}</b>. Generate the Purchase Order — the buyer signs next in the vault signing room.</p>
+      <form method="POST" action="/negotiation/${neg.id}/send-po"><button class="btn btn-green" type="submit">Approve &amp; send PO →</button></form>
+    </div>`;
+  } else if ((st === 'PO_SENT' || st === 'SIGNING') && isBuyer) {
+    actionHtml = `<div class="card" data-reveal>
+      <h3>✍️ Sign the contract</h3>
+      <p class="muted">The Purchase Order is in. Review it, then sign in the vault signing room (password + signing code).</p>
+      <div class="feed-actions">
+        <a class="btn btn-outline" href="/negotiation/${neg.id}/po.doc">Download PO (.doc)</a>
+        <a class="btn btn-green" href="/deal/${neg.deal_id}/sign">Proceed to signing →</a>
+      </div>
+    </div>`;
+  } else if (st === 'SIGNED' && isSeller) {
+    actionHtml = `<div class="card" data-reveal>
+      <h3>✅ Buyer signed — your approval</h3>
+      <p class="muted">${esc(buyerName)} signed the contract. Approve to move on to the commission-split step.</p>
+      <form method="POST" action="/negotiation/${neg.id}/owner-approve"><button class="btn btn-green" type="submit">Approve signature →</button></form>
+    </div>`;
+  } else if ((st === 'OWNER_APPROVED' || st === 'SPLIT_NEGO') && (isBuyer || isSeller)) {
+    const iProposed = st === 'SPLIT_NEGO' && neg.split_proposed_by === req.user.id;
+    const current = NEG_SPLITS[neg.commission_split] || NEG_SPLITS['50-50'];
+    const proposeForm = `
+      <form method="POST" action="/negotiation/${neg.id}/split">
+        <label>Commission split</label>
+        <select name="split">${optionsHtml(Object.keys(NEG_SPLITS), NEG_SPLITS[neg.commission_split] ? neg.commission_split : '50-50')}</select>
+        <p class="muted" style="margin:4px 0 10px">${Object.entries(NEG_SPLITS).map(([k, v]) => `<b>${esc(k)}</b> = ${esc(v)}`).join(' · ')}</p>
+        <button class="btn" type="submit">${st === 'SPLIT_NEGO' ? 'Counter-propose split' : 'Propose split'} →</button>
+      </form>`;
+    const acceptForm = (st === 'SPLIT_NEGO' && !iProposed) ? `
+      <form method="POST" action="/negotiation/${neg.id}/split-accept" style="margin-bottom:10px">
+        <button class="btn btn-green" type="submit">Accept "${esc(current)}" — send to admin for final approval</button>
+      </form>` : '';
+    actionHtml = `<div class="card" data-reveal>
+      <h3>⚖️ Commission split negotiation</h3>
+      ${negFeeHtml(neg)}
+      ${st === 'SPLIT_NEGO'
+        ? `<p class="muted">Proposed by <b>${esc(names.get(neg.split_proposed_by) || 'the other party')}</b>: <b>${esc(current)}</b>. ${iProposed ? 'Waiting for the other party to accept or counter.' : 'Accept it or counter-propose below.'}</p>`
+        : '<p class="muted">Default split is <b>50-50</b>. Either party may propose how the platform commission is shared before final admin approval.</p>'}
+      ${acceptForm}
+      ${iProposed ? '' : proposeForm}
+    </div>`;
+  } else if (st === 'PENDING_ADMIN') {
+    actionHtml = `<div class="card" data-reveal><h3>🏛️ Awaiting admin final approval</h3>${negFeeHtml(neg)}<p class="muted">The admin sees the agreed split and amounts in the final-approval queue.</p></div>`;
+  } else if (st === 'DONE') {
+    actionHtml = `<div class="card card-announce" data-reveal><h3>🎉 Deal closed</h3>${negFeeHtml(neg)}<p class="muted">The platform commission is due before deal processing. Congratulations to both parties!</p></div>`;
+  } else if (st === 'REJECTED') {
+    actionHtml = `<div class="card" data-reveal><h3>⛔ Negotiation ended</h3><p class="muted">This negotiation was closed without a contract.</p></div>`;
+  } else {
+    actionHtml = waiting(isBuyer ? sellerName : buyerName);
+  }
+
+  const loiCard = `
+  <div class="card" data-reveal>
+    <h3>📨 Letter of Intent</h3>
+    <p style="margin-top:8px;white-space:pre-wrap">${esc(neg.loi_text)}</p>
+    <p class="muted" style="margin-top:8px">📍 Buyer location: <b>${esc(neg.loi_location)}</b>${neg.loi_quantity ? ` · Quantity: ${esc(neg.loi_quantity)}` : ''}</p>
+    ${neg.loi_wishes ? `<p class="muted" style="white-space:pre-wrap">💭 Wishes: ${esc(neg.loi_wishes)}</p>` : ''}
+  </div>`;
+
+  const stateIdx = NEG_STATES.indexOf(st);
+  const pipeline = ['LOI_SENT', 'OFFER_SENT', 'BUYER_APPROVED', 'PO_SENT', 'SIGNED', 'OWNER_APPROVED', 'PENDING_ADMIN', 'DONE'];
+  const curPipe = st === 'REJECTED' ? -1 : pipeline.indexOf(st === 'COUNTER_SENT' ? 'OFFER_SENT' : st === 'SIGNING' ? 'PO_SENT' : st === 'SPLIT_NEGO' ? 'OWNER_APPROVED' : st);
+  const pipelineHtml = `<div class="stepper" role="list" aria-label="Negotiation pipeline">${pipeline.map((s, i) =>
+    `<div class="step-node ${st === 'REJECTED' ? '' : i < curPipe ? 'done' : i === curPipe ? 'current done' : ''}" style="--i:${i}">
+      <span class="step-dot">${i < curPipe ? '✓' : i + 1}</span><span class="step-lbl">${esc(s.replace(/_/g, ' '))}</span>
+    </div>`).join('')}</div>
+    ${st === 'REJECTED' ? '<p style="margin-top:8px"><span class="badge badge-rejected">rejected</span></p>' : ''}`;
+
+  const body = `
+  <div class="feed-head" style="margin-bottom:4px">
+    <div><div class="kicker">Negotiation #${neg.id} · round ${neg.round}</div>
+      <h1 style="font-size:1.6rem;margin-top:4px">🤝 ${esc(deal ? deal.title : 'Deal #' + neg.deal_id)}</h1></div>
+    <a class="btn btn-sm btn-outline" href="/deals/inbox">← Deal inbox</a>
+  </div>
+  <p class="muted" style="margin-bottom:14px">
+    Buyer: <a href="/company/${neg.buyer_id}"><b>${esc(buyerName)}</b></a> · Seller: <a href="/company/${neg.seller_id}"><b>${esc(sellerName)}</b></a>
+    · Deal № ${esc(deal ? (deal.deal_number || String(deal.id)) : String(neg.deal_id))} · ${statusBadge(st)}
+    · <a href="/deal/${neg.deal_id}">view deal</a>
+    ${['PO_SENT', 'SIGNING', 'SIGNED', 'OWNER_APPROVED', 'SPLIT_NEGO', 'PENDING_ADMIN', 'DONE'].includes(st) ? ` · <a href="/negotiation/${neg.id}/po.doc">PO (.doc)</a>` : ''}
+  </p>
+  <div class="card" data-reveal><h3>Pipeline</h3>${pipelineHtml}</div>
+  ${actionHtml}
+  <h3 class="sec-h">Rounds</h3>
+  ${negTimelineHtml(neg.id, names)}
+  ${loiCard}`;
+  res.send(page(`Negotiation #${neg.id}`, body, req.user, req.query.msg, req.query.err));
+});
+
+// ----- Negotiation actions (party-guarded, state-machine enforced) -----
+/** Load neg + check party + expected state; on failure redirects and returns null. */
+function negGuard(req, res, states, role) {
+  const neg = getNegotiation(req.params.id);
+  const back = neg ? `/negotiation/${neg.id}` : '/deals/inbox';
+  if (!neg) { res.redirect('/deals/inbox?err=' + encodeURIComponent('Negotiation not found.')); return null; }
+  if (req.user.isAdmin || (req.user.id !== neg.buyer_id && req.user.id !== neg.seller_id)) {
+    res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Private negotiation</h2></div>', req.user));
+    return null;
+  }
+  if (role === 'seller' && req.user.id !== neg.seller_id) { res.redirect(back + '?err=' + encodeURIComponent('Only the seller can do that.')); return null; }
+  if (role === 'buyer' && req.user.id !== neg.buyer_id) { res.redirect(back + '?err=' + encodeURIComponent('Only the buyer can do that.')); return null; }
+  if (states && !states.includes(neg.state)) { res.redirect(back + '?err=' + encodeURIComponent(`This action is not available in state ${neg.state.replace(/_/g, ' ')}.`)); return null; }
+  return neg;
+}
+
+// Seller sends (or re-sends) a private offer.
+app.post('/negotiation/:id/offer', requireCompany, (req, res) => {
+  const neg = negGuard(req, res, ['LOI_SENT', 'COUNTER_SENT'], 'seller');
+  if (!neg) return;
+  const value = String(req.body.offer_value || '').trim();
+  const num = parseFloat(value);
+  if (!isFinite(num) || num <= 0) return res.redirect(`/negotiation/${neg.id}?err=` + encodeURIComponent('Offer value must be a positive number.'));
+  const currency = DEAL_CURRENCIES.includes(req.body.offer_currency) ? req.body.offer_currency : 'USD';
+  const terms = String(req.body.offer_terms || '').trim().slice(0, 2000);
+  if (!terms) return res.redirect(`/negotiation/${neg.id}?err=` + encodeURIComponent('Offer terms are required.'));
+  if (req.body.incoterm_ok !== 'yes') return res.redirect(`/negotiation/${neg.id}?err=` + encodeURIComponent('Please confirm the deal incoterm.'));
+  const isReoffer = neg.state === 'COUNTER_SENT';
+  const round = neg.round + 1; // the initial offer is round 1, the first re-offer after a counter is round 2, …
+  db.prepare(`UPDATE negotiations SET state = 'OFFER_SENT', round = ?, offer_value = ?, offer_currency = ?, offer_terms = ?, updated_at = ? WHERE id = ?`)
+    .run(round, String(num), currency, terms, now(), neg.id);
+  negEvent(neg.id, req.user.id, 'offer', { value: String(num), currency, terms, note: isReoffer ? `Re-offer — round ${round}` : 'Initial offer' });
+  audit('DEAL AGENT', isReoffer ? 're-offer sent' : 'offer sent', 'pass', `${req.user.name} offered ${num} ${currency} on negotiation #${neg.id} (round ${round})`);
+  notify(neg.buyer_id, 'offer', `${req.user.name} sent you a private offer (${fmtAmount(num)} ${currency}) on negotiation #${neg.id}. Approve or counter.`, `/negotiation/${neg.id}`);
+  res.redirect(`/negotiation/${neg.id}?msg=` + encodeURIComponent('Offer sent to the buyer.'));
+});
+
+// Buyer counters the current offer.
+app.post('/negotiation/:id/counter', requireCompany, (req, res) => {
+  const neg = negGuard(req, res, ['OFFER_SENT'], 'buyer');
+  if (!neg) return;
+  const value = String(req.body.offer_value || '').trim();
+  const num = parseFloat(value);
+  if (!isFinite(num) || num <= 0) return res.redirect(`/negotiation/${neg.id}?err=` + encodeURIComponent('Counter value must be a positive number.'));
+  const currency = DEAL_CURRENCIES.includes(req.body.offer_currency) ? req.body.offer_currency : 'USD';
+  const terms = String(req.body.offer_terms || '').trim().slice(0, 2000);
+  if (!terms) return res.redirect(`/negotiation/${neg.id}?err=` + encodeURIComponent('Counter terms are required.'));
+  db.prepare(`UPDATE negotiations SET state = 'COUNTER_SENT', offer_value = ?, offer_currency = ?, offer_terms = ?, updated_at = ? WHERE id = ?`)
+    .run(String(num), currency, terms, now(), neg.id);
+  negEvent(neg.id, req.user.id, 'counter', { value: String(num), currency, terms });
+  audit('DEAL AGENT', 'counter offer sent', 'pass', `${req.user.name} countered ${num} ${currency} on negotiation #${neg.id}`);
+  notify(neg.seller_id, 'counter', `${req.user.name} countered your offer on negotiation #${neg.id}: ${fmtAmount(num)} ${currency}. Re-offer or decline.`, `/negotiation/${neg.id}`);
+  res.redirect(`/negotiation/${neg.id}?msg=` + encodeURIComponent('Counter offer sent to the seller.'));
+});
+
+// Buyer approves the current offer.
+app.post('/negotiation/:id/approve-offer', requireCompany, (req, res) => {
+  const neg = negGuard(req, res, ['OFFER_SENT'], 'buyer');
+  if (!neg) return;
+  negSetState(neg.id, 'BUYER_APPROVED');
+  negEvent(neg.id, req.user.id, 'approve', { value: neg.offer_value, currency: neg.offer_currency });
+  audit('DEAL AGENT', 'offer approved', 'pass', `${req.user.name} approved the offer on negotiation #${neg.id}`);
+  notify(neg.seller_id, 'offer_approved', `${req.user.name} approved your offer on negotiation #${neg.id}. Approve & send the Purchase Order.`, `/negotiation/${neg.id}`);
+  res.redirect(`/negotiation/${neg.id}?msg=` + encodeURIComponent('Offer approved — the seller can now issue the Purchase Order.'));
+});
+
+// Seller declines (from LOI_SENT or COUNTER_SENT) → REJECTED.
+app.post('/negotiation/:id/decline', requireCompany, (req, res) => {
+  const neg = negGuard(req, res, ['LOI_SENT', 'OFFER_SENT', 'COUNTER_SENT'], 'seller');
+  if (!neg) return;
+  negSetState(neg.id, 'REJECTED');
+  negEvent(neg.id, req.user.id, 'decline');
+  audit('DEAL AGENT', 'negotiation declined', 'fail', `${req.user.name} declined negotiation #${neg.id}`);
+  notify(neg.buyer_id, 'negotiation_declined', `${req.user.name} declined the negotiation on your LOI (negotiation #${neg.id}).`, `/negotiation/${neg.id}`);
+  res.redirect(`/negotiation/${neg.id}?msg=` + encodeURIComponent('Negotiation declined. The buyer has been notified.'));
+});
+
+// Seller approves & issues the Purchase Order (document generated on demand via /po.doc).
+app.post('/negotiation/:id/send-po', requireCompany, (req, res) => {
+  const neg = negGuard(req, res, ['BUYER_APPROVED'], 'seller');
+  if (!neg) return;
+  negSetState(neg.id, 'PO_SENT');
+  negEvent(neg.id, req.user.id, 'po', { value: neg.offer_value, currency: neg.offer_currency });
+  audit('DEAL AGENT', 'purchase order sent', 'pass', `${req.user.name} issued the PO on negotiation #${neg.id}`);
+  notify(neg.buyer_id, 'po_sent', `${req.user.name} issued the Purchase Order for negotiation #${neg.id}. Review it and proceed to signing.`, `/deal/${neg.deal_id}/sign`);
+  res.redirect(`/negotiation/${neg.id}?msg=` + encodeURIComponent('Purchase Order sent — the buyer can now sign in the vault.'));
+});
+
+// Purchase Order document (msword .doc) — parties + admin only, once issued.
+app.get('/negotiation/:id/po.doc', requireCompanyOrAdmin, (req, res) => {
+  const neg = getNegotiation(req.params.id);
+  if (!neg) return res.status(404).send(page('Not found', '<div class="card"><h2>Negotiation not found</h2></div>', req.user));
+  if (!isNegParty(req.user, neg)) {
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Private negotiation document</h2></div>', req.user));
+  }
+  if (!['PO_SENT', 'SIGNING', 'SIGNED', 'OWNER_APPROVED', 'SPLIT_NEGO', 'PENDING_ADMIN', 'DONE'].includes(neg.state)) {
+    return res.redirect(`/negotiation/${neg.id}?err=` + encodeURIComponent('The Purchase Order is issued after the buyer approves the offer.'));
+  }
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(neg.deal_id);
+  const names = companyNameMap();
+  const buyerName = names.get(neg.buyer_id) || 'Unknown';
+  const sellerName = names.get(neg.seller_id) || 'Unknown';
+  const dealNum = deal ? (deal.deal_number || String(deal.id)) : String(neg.deal_id);
+  const f = negFeeBreakdown(neg);
+  const splitLabel = NEG_SPLITS[neg.commission_split] || NEG_SPLITS['50-50'];
+  const feeClause = isFinite(f.fee)
+    ? `PLATFORM COMMISSION. A platform commission of ${f.pct}% of the agreed deal value (${fmtAmount(f.fee)} ${f.cur}) is payable to Dealzoin before deal processing. Split: ${splitLabel} — Buyer: ${fmtAmount(f.buyer)} ${f.cur}, Seller: ${fmtAmount(f.seller)} ${f.cur}.`
+    : `PLATFORM COMMISSION. A platform commission of ${f.pct}% of the agreed deal value is payable to Dealzoin before deal processing. Split: ${splitLabel}.`;
+  const doc = `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word">
+<head><meta charset="utf-8"><title>Purchase Order ${esc(dealNum)}</title></head>
+<body style="font-family:Calibri,Arial,sans-serif">
+  <h1>Purchase Order — Deal № ${esc(dealNum)}</h1>
+  <h2>${esc(deal ? deal.title : 'Deal')}</h2>
+  <p><b>Buyer:</b> ${esc(buyerName)}${neg.loi_location ? ` (${esc(neg.loi_location)})` : ''}<br>
+     <b>Seller:</b> ${esc(sellerName)}<br>
+     <b>Deal number:</b> ${esc(dealNum)}<br>
+     <b>Agreed value:</b> ${esc(neg.offer_value)} ${esc(neg.offer_currency || 'USD')}<br>
+     <b>Incoterm:</b> ${esc(deal ? (deal.incoterm || 'CIF') : 'CIF')}<br>
+     <b>Negotiation rounds:</b> ${neg.round}<br>
+     <b>Issued:</b> ${esc(now())}</p>
+  <h3>Agreed terms</h3><p>${esc(neg.offer_terms)}</p>
+  <h3>Platform commission</h3><p><b>${esc(feeClause)}</b></p>
+  <p>__________________________&nbsp;&nbsp;&nbsp;__________________________<br>
+  Buyer signature&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Seller signature</p>
+</body></html>`;
+  audit('DEAL AGENT', 'PO download', 'pass', `PO for negotiation #${neg.id} downloaded by ${req.user.isAdmin ? 'admin' : req.user.name}`);
+  res.setHeader('Content-Type', 'application/msword');
+  res.setHeader('Content-Disposition', `attachment; filename="PO-${String(dealNum).replace(/[^A-Za-z0-9._-]/g, '_')}.doc"`);
+  res.send(doc);
+});
+
+// Seller (deal owner) approves the buyer's signature.
+app.post('/negotiation/:id/owner-approve', requireCompany, (req, res) => {
+  const neg = negGuard(req, res, ['SIGNED'], 'seller');
+  if (!neg) return;
+  negSetState(neg.id, 'OWNER_APPROVED');
+  negEvent(neg.id, req.user.id, 'owner_approved');
+  audit('CONTRACT AGENT', 'owner approve signature (negotiation)', 'pass', `Seller ${req.user.name} approved the buyer's signature on negotiation #${neg.id}`);
+  notify(neg.buyer_id, 'owner_approved', `${req.user.name} approved your signature on negotiation #${neg.id}. Agree the commission split to reach final approval.`, `/negotiation/${neg.id}`);
+  notify(neg.seller_id, 'owner_approved', `Negotiation #${neg.id}: propose or confirm the commission split to proceed to final approval.`, `/negotiation/${neg.id}`);
+  res.redirect(`/negotiation/${neg.id}?msg=` + encodeURIComponent('Signature approved — now agree the commission split.'));
+});
+
+// Either party proposes (or counter-proposes) the commission split.
+app.post('/negotiation/:id/split', requireCompany, (req, res) => {
+  const neg = negGuard(req, res, ['OWNER_APPROVED', 'SPLIT_NEGO']);
+  if (!neg) return;
+  if (neg.state === 'SPLIT_NEGO' && neg.split_proposed_by === req.user.id) {
+    return res.redirect(`/negotiation/${neg.id}?err=` + encodeURIComponent('You made the current proposal — wait for the other party.'));
+  }
+  const split = String(req.body.split || '');
+  if (!NEG_SPLITS[split]) return res.redirect(`/negotiation/${neg.id}?err=` + encodeURIComponent('Invalid split option.'));
+  db.prepare(`UPDATE negotiations SET commission_split = ?, split_proposed_by = ?, state = 'SPLIT_NEGO', updated_at = ? WHERE id = ?`)
+    .run(split, req.user.id, now(), neg.id);
+  negEvent(neg.id, req.user.id, 'split', { note: `Proposed split: ${NEG_SPLITS[split]}` });
+  audit('DEAL AGENT', 'commission split proposed', 'pass', `${req.user.name} proposed split "${split}" on negotiation #${neg.id}`);
+  const other = req.user.id === neg.buyer_id ? neg.seller_id : neg.buyer_id;
+  notify(other, 'split_proposed', `${req.user.name} proposed a commission split of "${NEG_SPLITS[split]}" on negotiation #${neg.id}. Accept or counter-propose.`, `/negotiation/${neg.id}`);
+  res.redirect(`/negotiation/${neg.id}?msg=` + encodeURIComponent('Split proposed — the other party has been notified.'));
+});
+
+// The other party accepts the proposed split → PENDING_ADMIN.
+app.post('/negotiation/:id/split-accept', requireCompany, (req, res) => {
+  const neg = negGuard(req, res, ['SPLIT_NEGO']);
+  if (!neg) return;
+  if (neg.split_proposed_by === req.user.id) {
+    return res.redirect(`/negotiation/${neg.id}?err=` + encodeURIComponent('You made the current proposal — the other party must accept it.'));
+  }
+  negSetState(neg.id, 'PENDING_ADMIN');
+  negEvent(neg.id, req.user.id, 'split_accept', { note: `Accepted split: ${NEG_SPLITS[neg.commission_split] || neg.commission_split}` });
+  audit('DEAL AGENT', 'commission split accepted', 'pass', `${req.user.name} accepted split "${neg.commission_split}" on negotiation #${neg.id} — pending admin final approval`);
+  const other = req.user.id === neg.buyer_id ? neg.seller_id : neg.buyer_id;
+  notify(other, 'split_accepted', `${req.user.name} accepted the commission split on negotiation #${neg.id} — awaiting admin final approval.`, `/negotiation/${neg.id}`);
+  res.redirect(`/negotiation/${neg.id}?msg=` + encodeURIComponent('Split accepted — the negotiation now awaits admin final approval.'));
+});
+
 // ============================= PRIVATE CONTRACTS MAILBOX =============================
 // Company → company contracts that never touch a public deal. Flow:
 // pending_recipient → (recipient signs w/ OTP) pending_owner → (sender approves) pending_admin → (admin) approved.
@@ -2523,16 +4437,21 @@ function getPrivateContract(id) {
 function canViewPrivateContract(user, pc) {
   return !!user && !!pc && (user.isAdmin || user.id === pc.sender_company_id || user.id === pc.recipient_company_id);
 }
-/** 1% platform-fee clause for private contracts (HTML / plain-text variants). */
+/** Platform-fee helpers for private contracts (HTML / plain-text variants) — dynamic commission. */
 function pcFeeAmount(pc) {
+  const pct = platformFeePct();
   const num = Number(pc && pc.value);
-  return isFinite(num) && num > 0 ? `${fmtAmount(num * PLATFORM_FEE_PCT / 100)} ${pc.currency || 'USD'}` : `1% of contract value`;
+  return isFinite(num) && num > 0 ? `${fmtAmount(num * pct / 100)} ${pc.currency || 'USD'}` : `${pct}% of contract value`;
 }
 function pcFeeLineHtml(pc, style) {
-  return `<div class="muted" style="font-size:12px;${style || ''}">🏦 Platform fee: ${PLATFORM_FEE_PCT}% (${esc(pcFeeAmount(pc))}) — transparent Dealzoin commission</div>`;
+  return `<div class="muted" style="font-size:12px;${style || ''}">🏦 Platform fee: ${platformFeePct()}% (${esc(pcFeeAmount(pc))}) — transparent Dealzoin commission</div>`;
 }
 function pcFeeLineText(pc) {
-  return `Platform fee: ${PLATFORM_FEE_PCT}% (${pcFeeAmount(pc)}) — transparent Dealzoin commission`;
+  return `Platform fee: ${platformFeePct()}% (${pcFeeAmount(pc)}) — transparent Dealzoin commission`;
+}
+/** Platform-fee clause text for private contracts (dynamic commission). */
+function pcFeeClauseText() {
+  return `10. PLATFORM FEE. A transparent platform commission of ${platformFeePct()}% of the stated contract value is payable to Dealzoin. This fee is disclosed to both parties before signing and is separate from the value exchanged between the parties.`;
 }
 /** A letter is "sealed" while the mailbox owner owes the next action on it. */
 function pcIsSealed(pc, viewerId) {
@@ -2575,7 +4494,7 @@ app.get('/contracts/new', requireCompany, (req, res) => {
       </div>
       <label>Terms of the offer</label>
       <textarea name="terms" rows="6" required maxlength="4000" placeholder="Scope, deliverables, payment schedule…"></textarea>
-      ${'<div class="muted" style="font-size:12px;margin-bottom:12px">🏦 A transparent ' + PLATFORM_FEE_PCT + '% Dealzoin platform fee applies and is disclosed to both parties.</div>'}
+      ${'<div class="muted" style="font-size:12px;margin-bottom:12px">🏦 A transparent ' + platformFeePct() + '% Dealzoin platform fee applies and is disclosed to both parties.</div>'}
       <button class="btn" type="submit">Seal &amp; send</button>
       <a class="btn btn-outline" href="/contracts" style="margin-left:8px">Discard draft</a>
     </form>` : `<p class="muted">No approved companies match. <a href="/contracts/new">Clear the search</a> to list all.</p>`}
@@ -2730,7 +4649,7 @@ app.get('/contracts/:id', (req, res) => {
     <h3 style="margin:14px 0 6px">Terms of the offer</h3>
     <p style="white-space:pre-wrap">${esc(pc.terms)}</p>
     <h3 style="margin:14px 0 6px">Platform fee clause</h3>
-    <p class="muted" style="font-size:13px">${esc('10. PLATFORM FEE. A transparent platform commission of 1% of the stated contract value is payable to Dealzoin. This fee is disclosed to both parties before signing and is separate from the value exchanged between the parties.')}</p>
+    <p class="muted" style="font-size:13px">${esc(pcFeeClauseText())}</p>
     ${pcFeeLineHtml(pc, 'margin-top:6px')}
     ${finalized}
     <div class="feed-actions" style="margin-top:16px">
@@ -2765,7 +4684,7 @@ app.get('/contracts/:id/download', (req, res) => {
      <b>Sealed:</b> ${esc(pc.created_at)}${pc.signed_at ? `<br><b>Signed:</b> ${esc(pc.signed_at)}` : ''}${pc.decided_at ? `<br><b>Decided:</b> ${esc(pc.decided_at)}` : ''}</p>
   <h3>Terms of the offer</h3><p>${esc(pc.terms)}</p>
   <h3>Platform fee clause</h3>
-  <p>${esc('10. PLATFORM FEE. A transparent platform commission of 1% of the stated contract value is payable to Dealzoin. This fee is disclosed to both parties before signing and is separate from the value exchanged between the parties.')}</p>
+  <p>${esc(pcFeeClauseText())}</p>
   <p>__________________________&nbsp;&nbsp;&nbsp;__________________________<br>
   Sender signature&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Recipient signature</p>
 </body></html>`;
@@ -2932,6 +4851,25 @@ app.get('/media/:id', (req, res) => {
   res.send(m.data);
 });
 
+// ----- KYC document download: the OWNING company or an admin only (documents are private) -----
+app.get('/documents/:id', (req, res) => {
+  const user = currentUser(req);
+  if (!user) return res.redirect('/login?err=' + encodeURIComponent('Please sign in to view documents.'));
+  const doc = db.prepare('SELECT * FROM documents WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!doc) return res.status(404).send(page('Not found', '<div class="card"><h2>Document not found</h2></div>', user));
+  if (!user.isAdmin && doc.company_id !== user.id) {
+    audit('DOCUMENT AGENT', 'document access', 'fail', `Unauthorized document access attempt: doc #${doc.id} by ${user.name}`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Private document</h2><p class="muted">Only the owning company and the admin can download this document.</p></div>', user));
+  }
+  audit('DOCUMENT AGENT', 'document access', 'pass', `Document #${doc.id} (${doc.doc_type}) downloaded by ${user.isAdmin ? 'admin' : user.name}`);
+  res.setHeader('Content-Type', doc.mime || 'application/pdf');
+  res.setHeader('Content-Length', doc.data.length);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.setHeader('Content-Disposition', `attachment; filename="${String(doc.filename || 'document.pdf').replace(/[^A-Za-z0-9._-]/g, '_')}"`);
+  res.send(doc.data);
+});
+
 // ============================= HOME FEED → TIMELINE =============================
 // The home feed was merged into the (following-only) timeline; keep the route as a redirect.
 app.get('/home', requireCompany, (req, res) => {
@@ -2952,13 +4890,7 @@ app.get('/new', requireCompany, (req, res) => {
       <h2>Post a deal</h2>
       <p class="muted">Title, value, description — plus an optional photo or video.</p>
       <form method="POST" action="/deals" enctype="multipart/form-data" style="margin-top:14px;text-align:left">
-        <label>Deal title</label><input type="text" name="title" required maxlength="160">
-        <label>Deal value (e.g. 50,000 / year)</label><input type="text" name="value" maxlength="80">
-        <div class="grid2" style="gap:10px">
-          <div><label>Currency</label><select name="currency">${optionsHtml(DEAL_CURRENCIES, 'USD')}</select></div>
-          <div><label>Time period</label><select name="time_period">${optionsHtml(DEAL_TIME_PERIODS, '30 days')}</select></div>
-        </div>
-        <label>Description</label><textarea name="description" rows="4" required maxlength="4000"></textarea>
+        ${dealFormFieldsHtml()}
         <label>Photo or video (optional — image ≤ 5 MB, video ≤ 25 MB)</label>${mediaInput}
         <button class="btn" type="submit">Publish deal</button>
       </form>
@@ -2989,7 +4921,7 @@ app.get('/profile', requireCompany, (req, res) => {
     ? deals.map((d, idx) => feedCard(dealFeedItem(d), req.user, names, idx)).join('')
     : '<div class="card"><p class="muted">No deals yet — <a href="/deals/new">post your first deal</a>.</p></div>';
   const postsHtml = posts.length
-    ? posts.map((p, idx) => feedCard({ kind: 'post', ref_id: p.id, company_id: p.company_id, body: p.body, created_at: p.created_at, media_id: p.media_id }, req.user, names, idx)).join('')
+    ? posts.map((p, idx) => feedCard({ kind: 'post', ref_id: p.id, company_id: p.company_id, body: p.body, created_at: p.created_at, media_id: p.media_id, author_name: p.author_name || '', is_system: p.is_system || 0 }, req.user, names, idx)).join('')
     : '<div class="card"><p class="muted">No posts yet — share an update from the <a href="/new">create menu</a>.</p></div>';
 
   const coverHtml = c.header_media_id ? `<img class="profile-cover" src="/media/${c.header_media_id}" alt="${esc(c.name)} header image" loading="lazy">` : '';
@@ -3008,6 +4940,7 @@ app.get('/profile', requireCompany, (req, res) => {
   <h2 class="sec-h">Edit profile</h2>
   <div class="card">
     <h3>Profile images</h3>
+    ${req.user.memberId ? '<p class="muted">Profile images are managed by the main company account.</p>' : `
     <div class="grid2">
       <form method="POST" action="/profile/avatar" enctype="multipart/form-data">
         <label>Avatar (square image works best)</label>
@@ -3019,17 +4952,19 @@ app.get('/profile', requireCompany, (req, res) => {
         ${fileButtonHtml('📎 Attach header image')}
         <button class="btn btn-sm" type="submit">Upload header</button>
       </form>
-    </div>
+    </div>`}
   </div>
+  ${teamSectionHtml(req.user, c)}
   <div class="card">
     <h3>Bio &amp; about</h3>
+    ${req.user.memberId ? '<p class="muted">You are signed in as a team member — profile editing is restricted to the main company account.</p>' : `
     <form method="POST" action="/profile/info">
       <label>Bio — one-liner under your name (max 160 characters)</label>
       <input type="text" name="bio" maxlength="160" value="${esc(c.bio || '')}" placeholder="e.g. Industrial robotics, delivered.">
       <label>About — the full story (max 2000 characters)</label>
       <textarea name="about" rows="6" maxlength="2000" placeholder="What your company does, who you serve, why you win.">${esc(c.about || '')}</textarea>
       <button class="btn" type="submit">Save bio &amp; about</button>
-    </form>
+    </form>`}
   </div>
   <div class="stats">
     <div class="stat" data-reveal style="--i:0"><div class="num gold" data-count="${deals.length}">${deals.length}</div><div class="lbl">My deals</div></div>
@@ -3047,6 +4982,7 @@ app.get('/profile', requireCompany, (req, res) => {
 // ----- Profile editing: avatar, header/cover image, bio & about -----
 function profileImageUpload(field) {
   return [requireCompany, mediaUpload, (req, res) => {
+    if (req.user.memberId) return res.redirect('/profile?err=' + encodeURIComponent('Team members cannot change the company profile.'));
     if (!req.file) return res.redirect('/profile?err=' + encodeURIComponent('Choose an image to upload first.'));
     if (!String(req.file.mimetype).startsWith('image/')) {
       return res.redirect('/profile?err=' + encodeURIComponent('Profile images must be image files (JPG, PNG, GIF or WEBP).'));
@@ -3060,10 +4996,84 @@ app.post('/profile/avatar', ...profileImageUpload('avatar_media_id'));
 app.post('/profile/header', ...profileImageUpload('header_media_id'));
 
 app.post('/profile/info', requireCompany, (req, res) => {
+  if (req.user.memberId) return res.redirect('/profile?err=' + encodeURIComponent('Team members cannot change the company profile.'));
   const bio = String(req.body.bio || '').trim().slice(0, 160);
   const about = String(req.body.about || '').trim().slice(0, 2000);
   db.prepare('UPDATE companies SET bio = ?, about = ? WHERE id = ?').run(bio, about, req.user.id);
   res.redirect('/profile?msg=' + encodeURIComponent('Profile updated.'));
+});
+
+// ============================= SUB-ACCOUNTS (TEAM MEMBERS) =============================
+/** Team management card for /profile — main company account only. */
+function teamSectionHtml(user, company) {
+  if (user.memberId) {
+    return `<div class="card"><h3>👥 Team</h3>
+      <p class="muted">Signed in as team member <b>${esc(user.memberName || '')}</b> (${esc(user.memberRole || 'member')}).
+      Only the main company account can manage the team.</p></div>`;
+  }
+  const members = db.prepare('SELECT * FROM company_members WHERE company_id = ? ORDER BY created_at ASC').all(company.id);
+  const rows = members.length ? members.map(m => `
+    <div class="feed-head" style="padding:8px 0;border-top:1px dashed var(--border-soft)">
+      <div>${avatarHtml(m.name, null)}<b>${esc(m.name)}</b> <span class="badge ${m.status === 'active' ? 'badge-pass' : 'badge-rejected'}">${esc(m.status)}</span>
+        <span class="badge badge-sealed">${esc(m.role)}</span><br>
+        <span class="muted" style="margin-left:42px">${esc(m.email)} · added ${esc(m.created_at.slice(0, 10))}</span></div>
+      ${m.status === 'active' ? `<form method="POST" action="/profile/team/${m.id}/deactivate" onsubmit="return confirm('Deactivate this team member? Their sessions are revoked.')"><button class="btn btn-sm btn-danger" type="submit">Deactivate</button></form>` : ''}
+    </div>`).join('') : '<p class="muted">No team members yet.</p>';
+  return `<div class="card" data-reveal>
+    <h3>👥 Team — sub-accounts</h3>
+    <p class="muted">Team members sign in with their own email &amp; password and act as <b>${esc(company.name)}</b> — posts, deals, chats and signatures show a "— by {name}" attribution. Members cannot manage the team or edit the profile.</p>
+    ${rows}
+    <hr class="sep">
+    <h4 style="margin-bottom:8px">Add a team member</h4>
+    <form method="POST" action="/profile/team/add">
+      <div class="grid2" style="gap:10px">
+        <div><label>Full name</label><input type="text" name="name" required maxlength="120" placeholder="e.g. Dana Procurement"></div>
+        <div><label>Member email</label><input type="email" name="email" required maxlength="200" placeholder="dana@${esc((company.website || 'company.com').replace(/^https?:\/\//, '').split('/')[0])}"></div>
+      </div>
+      <div class="grid2" style="gap:10px">
+        <div><label>Password (min 8 characters)</label><input type="password" name="password" required minlength="8"></div>
+        <div><label>Role</label><select name="role">${optionsHtml(['member', 'manager'], 'member')}</select></div>
+      </div>
+      <button class="btn" type="submit">Add member</button>
+      <p class="muted" style="margin-top:6px">Member sign-in is protected by the same 2FA email codes. All member logins are audit-logged.</p>
+    </form>
+  </div>`;
+}
+
+// ----- Team management actions (main company account only) -----
+app.post('/profile/team/add', requireCompany, (req, res) => {
+  if (req.user.memberId) {
+    audit('TEAM AGENT', 'member add guard', 'fail', `Member ${req.user.memberName} attempted to manage the team of ${req.user.name}`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Only the main company account can manage the team.</h2></div>', req.user));
+  }
+  const name = String(req.body.name || '').trim().slice(0, 120);
+  const email = String(req.body.email || '').trim().toLowerCase().slice(0, 200);
+  const pw = String(req.body.password || '');
+  const role = req.body.role === 'manager' ? 'manager' : 'member';
+  if (!name || !email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    return res.redirect('/profile?err=' + encodeURIComponent('Name and a valid member email are required.'));
+  }
+  if (pw.length < 8) return res.redirect('/profile?err=' + encodeURIComponent('Member password must be at least 8 characters.'));
+  if (db.prepare('SELECT id FROM companies WHERE email = ?').get(email) || db.prepare('SELECT id FROM company_members WHERE email = ?').get(email)) {
+    return res.redirect('/profile?err=' + encodeURIComponent('That email is already in use on Dealzoin.'));
+  }
+  const salt = newSalt();
+  db.prepare('INSERT INTO company_members (company_id, name, email, password_hash, salt, role, status, created_at) VALUES (?,?,?,?,?,?,?,?)')
+    .run(req.user.id, name, email, hashPassword(pw, salt), salt, role, 'active', now());
+  audit('TEAM AGENT', 'member added', 'pass', `${req.user.name} added team member ${name} <${email}> (role: ${role})`);
+  res.redirect('/profile?msg=' + encodeURIComponent(`Team member ${name} added. They can sign in with their own email & password.`));
+});
+
+app.post('/profile/team/:id/deactivate', requireCompany, (req, res) => {
+  if (req.user.memberId) {
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Only the main company account can manage the team.</h2></div>', req.user));
+  }
+  const m = db.prepare('SELECT * FROM company_members WHERE id = ? AND company_id = ?').get(parseInt(req.params.id, 10), req.user.id);
+  if (!m) return res.redirect('/profile?err=' + encodeURIComponent('Team member not found.'));
+  db.prepare(`UPDATE company_members SET status = 'deactivated' WHERE id = ?`).run(m.id);
+  db.prepare('DELETE FROM sessions WHERE member_id = ?').run(m.id); // revoke live sessions
+  audit('TEAM AGENT', 'member deactivated', 'pass', `${req.user.name} deactivated team member ${m.name} <${m.email}> — sessions revoked`);
+  res.redirect('/profile?msg=' + encodeURIComponent(`Team member ${m.name} deactivated.`));
 });
 
 // ============================= DASHBOARD (/dashboard) =============================
@@ -3331,8 +5341,11 @@ app.get('/chat/:id', (req, res) => {
   const bubbles = msgs.length ? msgs.map(m => {
     const mine = !user.isAdmin && m.sender_company_id === user.id;
     const sender = names.get(m.sender_company_id) || 'Unknown';
+    const senderLine = (conv.type === 'group' || m.author_name) && !mine
+      ? `<div class="bubble-sender">${esc(sender)}${m.author_name ? ` — by ${esc(m.author_name)}` : ''}</div>`
+      : (mine && m.author_name ? `<div class="bubble-sender">— by ${esc(m.author_name)}</div>` : '');
     return `<div class="bubble ${mine ? 'mine' : 'theirs'}">
-      ${conv.type === 'group' && !mine ? `<div class="bubble-sender">${esc(sender)}</div>` : ''}
+      ${senderLine}
       ${esc(m.body)}
       <div class="bubble-meta">${esc(m.created_at.slice(0, 16).replace('T', ' '))}</div>
     </div>`;
@@ -3340,22 +5353,115 @@ app.get('/chat/:id', (req, res) => {
 
   const sendForm = user.isAdmin
     ? '<p class="muted">Admin view — conversations are read-only for admins.</p>'
-    : `<form method="POST" action="/chat/${conv.id}/send" class="chat-send">
+    : `<form method="POST" action="/chat/${conv.id}/send" class="chat-send" id="chatform">
          <input type="text" name="body" required maxlength="2000" placeholder="Write a message…" autocomplete="off">
          <button class="btn" type="submit">Send</button>
        </form>`;
+
+  // Live updates via SSE (EventSource). The 8s <meta refresh> below is the no-JS / SSE-error fallback —
+  // it is removed from the DOM as soon as the stream opens.
+  const liveScript = user.isAdmin ? '' : `
+  <script>(function(){
+    var box=document.getElementById('chatbox');
+    var form=document.getElementById('chatform');
+    var ME=${user.id}, ISGROUP=${conv.type === 'group' ? 'true' : 'false'};
+    var CID='c'+Math.random().toString(36).slice(2);
+    function scrollDown(){window.scrollTo(0,document.body.scrollHeight);}
+    function addBubble(m,optimistic){
+      if(!box)return;
+      var div=document.createElement('div');
+      div.className='bubble '+((m.sender_company_id===ME)?'mine':'theirs');
+      if(m.sender_company_id!==ME&&(ISGROUP||m.author_name)){
+        var s=document.createElement('div');s.className='bubble-sender';
+        s.textContent=(m.sender_name||'')+(m.author_name?' — by '+m.author_name:'');
+        div.appendChild(s);
+      }
+      div.appendChild(document.createTextNode(m.body));
+      var meta=document.createElement('div');meta.className='bubble-meta';
+      meta.textContent=(m.created_at||'').slice(0,16).replace('T',' ')+(optimistic?' · sending…':'');
+      div.appendChild(meta);
+      box.appendChild(div);scrollDown();
+    }
+    try{
+      var es=new EventSource('/chat/${conv.id}/stream');
+      es.onopen=function(){
+        var meta=document.querySelector('meta[http-equiv="refresh"]');
+        if(meta&&meta.parentNode)meta.parentNode.removeChild(meta);
+      };
+      es.onmessage=function(ev){
+        try{
+          var m=JSON.parse(ev.data);
+          if(m.cid&&m.cid===CID)return; // own optimistic echo
+          addBubble(m,false);
+        }catch(e){}
+      };
+      es.onerror=function(){
+        // Fallback: if the stream dies and the meta refresh is gone, reload every 8s.
+        if(!document.querySelector('meta[http-equiv="refresh"]')){setTimeout(function(){location.reload();},8000);}
+      };
+    }catch(e){}
+    if(form){form.addEventListener('submit',function(ev){
+      ev.preventDefault();
+      var input=form.elements.body;var txt=(input.value||'').trim();
+      if(!txt)return;
+      input.value='';
+      addBubble({sender_company_id:ME,body:txt,created_at:new Date().toISOString()},true);
+      fetch('/chat/${conv.id}/send',{method:'POST',
+        headers:{'Content-Type':'application/x-www-form-urlencoded','X-DZ-Client':CID},
+        body:'body='+encodeURIComponent(txt)}).then(function(r){
+        if(!r.ok&&!r.redirected)location.reload();
+      }).catch(function(){location.reload();});
+    });}
+  })();</script>`;
 
   const body = `
   <div class="card">
     <div class="feed-head"><h2>${convAvatar}${esc(dn)}</h2>
       <a class="btn btn-sm btn-outline" href="/chats">← All chats</a></div>
-    <p class="muted">${conv.type === 'group' ? 'Group conversation' : 'Private conversation'} · auto-refreshes every 8s</p>
+    <p class="muted">${conv.type === 'group' ? 'Group conversation' : 'Private conversation'} · live updates${user.isAdmin ? '' : ' (SSE)'} · 8s refresh fallback</p>
     <hr class="sep">
     <div class="chat-box" id="chatbox">${bubbles}</div>
     ${sendForm}
   </div>
-  <script>window.scrollTo(0, document.body.scrollHeight);</script>`;
+  <script>window.scrollTo(0, document.body.scrollHeight);</script>
+  ${liveScript}`;
   res.send(page(dn, body, user, req.query.msg, req.query.err, 'chats', '<meta http-equiv="refresh" content="8">'));
+});
+
+// ----- Server-Sent Events: live message push (in-memory; fine for a single dyno) -----
+const sseClients = new Map(); // convId -> Set<res>
+/** Push a message payload to every connected client of a conversation. */
+function sseBroadcast(convId, payload) {
+  const set = sseClients.get(convId);
+  if (!set || !set.size) return;
+  const data = `data: ${JSON.stringify(payload)}\n\n`;
+  for (const r of [...set]) {
+    try { r.write(data); } catch (e) { try { r.end(); } catch (_) {} set.delete(r); }
+  }
+}
+
+app.get('/chat/:id/stream', requireCompany, (req, res) => {
+  const convId = parseInt(req.params.id, 10);
+  const conv = db.prepare('SELECT * FROM conversations WHERE id = ?').get(convId);
+  if (!conv || !isMember(convId, req.user.id)) {
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Private conversation</h2></div>', req.user));
+  }
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  res.write(': connected\n\n');
+  let set = sseClients.get(convId);
+  if (!set) { set = new Set(); sseClients.set(convId, set); }
+  set.add(res);
+  const heartbeat = setInterval(() => { try { res.write(':ping\n\n'); } catch (e) { /* closed */ } }, 25000);
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    set.delete(res);
+    if (!set.size) sseClients.delete(convId);
+  });
 });
 
 app.post('/chat/:id/send', requireCompany, (req, res) => {
@@ -3366,9 +5472,187 @@ app.post('/chat/:id/send', requireCompany, (req, res) => {
   }
   const txt = String(req.body.body || '').trim();
   if (!txt) return res.redirect('/chat/' + convId + '?err=' + encodeURIComponent('Message cannot be empty.'));
-  db.prepare('INSERT INTO messages (conversation_id, sender_company_id, body, created_at) VALUES (?,?,?,?)')
-    .run(convId, req.user.id, txt.slice(0, 2000), now());
+  const ts = now();
+  const info = db.prepare('INSERT INTO messages (conversation_id, sender_company_id, body, created_at, author_name) VALUES (?,?,?,?,?)')
+    .run(convId, req.user.id, txt.slice(0, 2000), ts, req.user.memberName || null);
+  // Live-push to connected SSE clients (cid lets the sender's own tab skip its optimistic echo).
+  sseBroadcast(convId, {
+    id: Number(info.lastInsertRowid), conversation_id: convId,
+    sender_company_id: req.user.id, sender_name: req.user.name,
+    author_name: req.user.memberName || '', body: txt.slice(0, 2000), created_at: ts,
+    cid: String(req.get('x-dz-client') || '')
+  });
   res.redirect('/chat/' + convId);
+});
+
+// ============================= CALENDAR & ONLINE CALLS =============================
+/** Events visible to a company: created by them OR they are a participant. */
+function eventsForCompany(companyId) {
+  return db.prepare(`
+    SELECT DISTINCT e.* FROM events e
+    LEFT JOIN event_participants ep ON ep.event_id = e.id
+    WHERE e.creator_company_id = ? OR ep.company_id = ?
+    ORDER BY e.event_date ASC, e.event_time ASC`).all(companyId, companyId);
+}
+/** True when the user may see the join link: creator, participant, or admin. */
+function canJoinEvent(user, ev) {
+  if (!user || !ev) return false;
+  if (user.isAdmin) return true;
+  if (ev.creator_company_id === user.id) return true;
+  return !!db.prepare('SELECT 1 FROM event_participants WHERE event_id = ? AND company_id = ?').get(ev.id, user.id);
+}
+
+app.get('/calendar', requireCompany, (req, res) => {
+  const names = companyNameMap();
+  // Month navigation (?m=YYYY-MM), clamped to a sane range.
+  let ym = String(req.query.m || '').match(/^(\d{4})-(\d{2})$/);
+  const today = new Date();
+  let year = today.getUTCFullYear(), month = today.getUTCMonth() + 1; // 1-based
+  if (ym) {
+    const y = parseInt(ym[1], 10), mo = parseInt(ym[2], 10);
+    if (y >= 2000 && y <= 2100 && mo >= 1 && mo <= 12) { year = y; month = mo; }
+  }
+  const ymStr = `${year}-${String(month).padStart(2, '0')}`;
+  const prev = new Date(Date.UTC(year, month - 2, 1));
+  const next = new Date(Date.UTC(year, month, 1));
+  const prevStr = `${prev.getUTCFullYear()}-${String(prev.getUTCMonth() + 1).padStart(2, '0')}`;
+  const nextStr = `${next.getUTCFullYear()}-${String(next.getUTCMonth() + 1).padStart(2, '0')}`;
+  const monthName = new Date(Date.UTC(year, month - 1, 1)).toLocaleString('en', { month: 'long', timeZone: 'UTC' });
+
+  const myEvents = eventsForCompany(req.user.id);
+  const inMonth = myEvents.filter(e => String(e.event_date || '').startsWith(ymStr));
+  const byDay = {};
+  for (const e of inMonth) {
+    const day = parseInt(String(e.event_date).slice(8, 10), 10);
+    (byDay[day] = byDay[day] || []).push(e);
+  }
+  // Grid: weeks start Monday.
+  const firstDow = (new Date(Date.UTC(year, month - 1, 1)).getUTCDay() + 6) % 7; // 0 = Monday
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  const todayStr = today.toISOString().slice(0, 10);
+  let cells = '';
+  for (let i = 0; i < firstDow; i++) cells += '<div class="cal-cell cal-empty"></div>';
+  for (let d = 1; d <= daysInMonth; d++) {
+    const dateStr = `${ymStr}-${String(d).padStart(2, '0')}`;
+    const evs = byDay[d] || [];
+    cells += `<div class="cal-cell${dateStr === todayStr ? ' cal-today' : ''}">
+      <div class="cal-day">${d}</div>
+      ${evs.slice(0, 3).map((e, i) => `<a class="cal-event ${e.type === 'signing' ? 'cal-signing' : ''}" href="/calendar?m=${ymStr}#ev-${e.id}" style="--i:${i}" title="${esc(e.title)}${e.event_time ? ' ' + esc(e.event_time) : ''}">${esc(e.title.slice(0, 22))}</a>`).join('')}
+      ${evs.length > 3 ? `<div class="muted" style="font-size:11px">+${evs.length - 3} more</div>` : ''}
+    </div>`;
+  }
+  const dowHead = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].map(d => `<div class="cal-dow">${d}</div>`).join('');
+
+  // Upcoming events list (from today forward), with join-call buttons for allowed viewers.
+  const upcoming = myEvents.filter(e => String(e.event_date || '') >= todayStr).slice(0, 20);
+  const upcomingHtml = upcoming.length ? upcoming.map((e, i) => {
+    const parts = db.prepare('SELECT company_id FROM event_participants WHERE event_id = ?').all(e.id).map(p => names.get(p.company_id) || '?');
+    const dealLink = e.type === 'signing' && e.deal_id ? ` · <a href="/deal/${e.deal_id}">linked deal / contract</a>` : '';
+    return `<div class="card" data-reveal style="--i:${Math.min(i, 10)}" id="ev-${e.id}">
+      <div class="feed-head">
+        <h3>${e.type === 'signing' ? '✍️' : '📅'} ${esc(e.title)}</h3>
+        <span class="badge ${e.type === 'signing' ? 'badge-sealed' : 'badge-pending'}">${esc(e.type)}</span>
+      </div>
+      <p class="muted" style="margin-top:6px">📆 ${esc(e.event_date)}${e.event_time ? ' · ' + esc(e.event_time) + ' UTC' : ''} · by ${esc(names.get(e.creator_company_id) || '?')}
+        ${parts.length ? '<br>👥 ' + esc(parts.join(', ')) : ''}${dealLink}</p>
+      ${e.notes ? `<p style="white-space:pre-wrap;margin-top:6px">${esc(e.notes)}</p>` : ''}
+      ${canJoinEvent(req.user, e) && e.room ? `<div class="feed-actions"><a class="btn btn-sm btn-green" href="/calendar/join/${e.id}">🎥 Join call</a></div>` : ''}
+    </div>`;
+  }).join('') : '<div class="card"><p class="muted">No upcoming events — schedule a meeting or a signing below.</p></div>';
+
+  // Create form: participants = approved companies multi-select; signing events can link a deal.
+  const others = db.prepare(`SELECT id, name FROM companies WHERE status = 'approved' AND id != ? ORDER BY name LIMIT 200`).all(req.user.id);
+  const checks = others.length
+    ? others.map(c => `<label class="member-check"><input type="checkbox" name="participants" value="${c.id}">${esc(c.name)}</label>`).join('')
+    : '<p class="muted">No other approved companies on the network yet.</p>';
+  const myDeals = db.prepare(`SELECT id, title, deal_number FROM deals WHERE company_id = ? OR contract_party_id = ? ORDER BY created_at DESC LIMIT 50`).all(req.user.id, req.user.id);
+  const dealOptions = ['<option value="">— none —</option>']
+    .concat(myDeals.map(d => `<option value="${d.id}">${esc((d.deal_number ? d.deal_number + ' · ' : '') + d.title)}</option>`)).join('');
+
+  const body = `
+  <div class="feed-head" style="margin-bottom:10px">
+    <div><div class="kicker">Meetings &amp; signings</div><h1 style="font-size:1.75rem;margin-top:4px">📅 Calendar — ${monthName} ${year}</h1></div>
+    <div class="feed-actions" style="margin:0">
+      <a class="btn btn-sm btn-outline" href="/calendar?m=${prevStr}">← Prev</a>
+      <a class="btn btn-sm btn-outline" href="/calendar">Today</a>
+      <a class="btn btn-sm btn-outline" href="/calendar?m=${nextStr}">Next →</a>
+    </div>
+  </div>
+  <div class="card" data-reveal>
+    <div class="cal-grid">${dowHead}${cells}</div>
+  </div>
+  <h3 class="sec-h">Upcoming</h3>
+  ${upcomingHtml}
+  <h3 class="sec-h">Schedule an event</h3>
+  <div class="card" data-reveal>
+    <form method="POST" action="/calendar">
+      <label>Title</label><input type="text" name="title" required maxlength="160" placeholder="e.g. Contract signing — DZ-2025-0042">
+      <div class="grid2" style="gap:10px">
+        <div><label>Type</label><select name="type">${optionsHtml(['meeting', 'signing'], 'meeting')}</select></div>
+        <div><label>Related deal (optional, for signings)</label><select name="deal_id">${dealOptions}</select></div>
+      </div>
+      <div class="grid2" style="gap:10px">
+        <div><label>Date</label><input type="date" name="event_date" required value="${todayStr}"></div>
+        <div><label>Time (UTC)</label><input type="time" name="event_time"></div>
+      </div>
+      <label>Notes (optional)</label><textarea name="notes" rows="3" maxlength="2000" placeholder="Agenda, documents to prepare…"></textarea>
+      <label>Participant companies (they get notified)</label>
+      <div style="max-height:200px;overflow:auto">${checks}</div>
+      <button class="btn" type="submit" style="margin-top:10px">Create event</button>
+      <p class="muted" style="margin-top:6px">Every event gets a private Jitsi video room — visible to participants and the admin only.</p>
+    </form>
+  </div>`;
+  res.send(page('Calendar', body, req.user, req.query.msg, req.query.err, 'calendar'));
+});
+
+app.post('/calendar', requireCompany, (req, res) => {
+  const title = String(req.body.title || '').trim().slice(0, 160);
+  const type = req.body.type === 'signing' ? 'signing' : 'meeting';
+  const date = String(req.body.event_date || '').trim();
+  const time = String(req.body.event_time || '').trim().slice(0, 5);
+  const notes = String(req.body.notes || '').trim().slice(0, 2000);
+  if (!title) return res.redirect('/calendar?err=' + encodeURIComponent('Event title is required.'));
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.redirect('/calendar?err=' + encodeURIComponent('Pick a valid date.'));
+  if (time && !/^\d{2}:\d{2}$/.test(time)) return res.redirect('/calendar?err=' + encodeURIComponent('Pick a valid time.'));
+  let dealId = parseInt(req.body.deal_id, 10) || null;
+  if (dealId) {
+    const d = db.prepare('SELECT id FROM deals WHERE id = ? AND (company_id = ? OR contract_party_id = ?)').get(dealId, req.user.id, req.user.id);
+    if (!d) dealId = null;
+  }
+  let participants = req.body.participants || [];
+  if (!Array.isArray(participants)) participants = [participants];
+  const ids = [...new Set(participants.map(p => parseInt(p, 10)).filter(n => Number.isInteger(n) && n > 0 && n !== req.user.id))]
+    .filter(id => db.prepare(`SELECT 1 FROM companies WHERE id = ? AND status = 'approved'`).get(id));
+
+  const create = db.transaction(() => {
+    const evId = db.prepare(`INSERT INTO events (creator_company_id, title, type, event_date, event_time, notes, room, deal_id, created_at)
+      VALUES (?,?,?,?,?,?, '', ?, ?)`).run(req.user.id, title, type, date, time, notes, type === 'signing' ? dealId : null, now()).lastInsertRowid;
+    const room = `Dealzoin-${evId}-${crypto.randomBytes(4).toString('hex')}`;
+    db.prepare('UPDATE events SET room = ? WHERE id = ?').run(room, evId);
+    const ins = db.prepare('INSERT OR IGNORE INTO event_participants (event_id, company_id) VALUES (?,?)');
+    for (const id of ids) ins.run(evId, id);
+    return evId;
+  });
+  const evId = create();
+  audit('CALENDAR AGENT', 'event created', 'pass', `${req.user.name} scheduled ${type} "${title.slice(0, 60)}" on ${date} ${time || ''} with ${ids.length} participant(s)`);
+  for (const id of ids) {
+    notify(id, 'event', `${req.user.name} invited you to ${type === 'signing' ? 'a signing' : 'a meeting'} "${title}" on ${date}${time ? ' ' + time + ' UTC' : ''}. See your calendar for the video room.`, '/calendar#ev-' + evId);
+  }
+  res.redirect('/calendar?msg=' + encodeURIComponent(`Event created${ids.length ? ` — ${ids.length} participant(s) notified` : ''}.`));
+});
+
+// Join gate: participants + creator + admin only; everyone else gets 403.
+app.get('/calendar/join/:id', (req, res) => {
+  const user = currentUser(req);
+  if (!user) return res.redirect('/login?err=' + encodeURIComponent('Please sign in.'));
+  const ev = db.prepare('SELECT * FROM events WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!ev) return res.status(404).send(page('Not found', '<div class="card"><h2>Event not found</h2></div>', user));
+  if (!canJoinEvent(user, ev)) {
+    audit('CALENDAR AGENT', 'join call guard', 'fail', `Unauthorized join attempt on event #${ev.id} by ${user.isAdmin ? 'admin?' : user.name}`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Private call</h2><p class="muted">Only event participants and the admin can join this call.</p></div>', user));
+  }
+  audit('CALENDAR AGENT', 'join call', 'pass', `${user.isAdmin ? 'Admin' : user.name} joined the call for event #${ev.id} ("${ev.title.slice(0, 60)}")`);
+  res.redirect(`https://meet.jit.si/${encodeURIComponent(ev.room)}`);
 });
 
 // ============================= ADMIN ROUTES =============================
@@ -3424,17 +5708,19 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
     flagged: count('SELECT COUNT(*) AS n FROM companies WHERE flagged = 1'),
     deals: count('SELECT COUNT(*) AS n FROM deals'),
     contractsPending: count(`SELECT COUNT(*) AS n FROM contracts WHERE status = 'pending_admin'`) +
-                      count(`SELECT COUNT(*) AS n FROM private_contracts WHERE status = 'pending_admin'`),
+                      count(`SELECT COUNT(*) AS n FROM private_contracts WHERE status = 'pending_admin'`) +
+                      count(`SELECT COUNT(*) AS n FROM negotiations WHERE state = 'PENDING_ADMIN'`),
     follows: count('SELECT COUNT(*) AS n FROM follows')
   };
-  // Platform commission: 1% of the summed value of approved (finalized) deals, broken down per currency.
+  // Platform commission: the live admin-adjustable pct of the summed value of approved (finalized) deals, per currency.
+  const feePct = platformFeePct();
   const approvedDeals = db.prepare(`SELECT value, currency FROM deals WHERE contract_state = 'approved'`).all();
   const feeByCurrency = {};
   for (const d of approvedDeals) {
     const num = parseDealValue(d.value);
     if (!isFinite(num) || num <= 0) continue;
     const cur = d.currency || 'USD';
-    feeByCurrency[cur] = (feeByCurrency[cur] || 0) + num * PLATFORM_FEE_PCT / 100;
+    feeByCurrency[cur] = (feeByCurrency[cur] || 0) + num * feePct / 100;
   }
   const feeCurrencies = Object.keys(feeByCurrency).sort();
   const commissionText = feeCurrencies.length
@@ -3445,25 +5731,40 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
     ['Flagged ⚠️', stats.flagged, ''], ['Deals', stats.deals, ' gold'], ['Contracts pending', stats.contractsPending, ' gold'],
     ['Follows', stats.follows, '']
   ].map(([l, n, cls], ti) => `<div class="stat" data-reveal style="--i:${Math.min(ti, 10)}"><div class="num${cls}" data-count="${n}">${n}</div><div class="lbl">${l}</div></div>`).join('')}
-    <div class="stat" data-reveal style="--i:7"><div class="num gold" style="font-size:1.15rem;line-height:1.4">${commissionText}</div><div class="lbl">Platform commission (approved deals) · ${PLATFORM_FEE_PCT}%</div></div></div>`;
+    <div class="stat" data-reveal style="--i:7"><div class="num gold" style="font-size:1.15rem;line-height:1.4">${commissionText}</div><div class="lbl">Platform commission (approved deals) · ${feePct}%</div></div></div>`;
 
-  // Pending companies queue (with ONBOARDING AGENT flags)
+  // Pending companies queue (with ONBOARDING AGENT flags + KYC documents reviewed inline)
   const pending = db.prepare(`SELECT * FROM companies WHERE status = 'pending' ORDER BY created_at ASC`).all();
-  const pendingHtml = pending.length ? pending.map(c => `
+  const pendingHtml = pending.length ? pending.map(c => {
+    const docs = db.prepare('SELECT * FROM documents WHERE company_id = ? ORDER BY id ASC').all(c.id);
+    const docsHtml = docs.length ? `<div style="margin-top:8px">${docs.map(d => `
+        <div style="padding:5px 0;border-top:1px dashed var(--border-soft)">
+          📄 <b>${esc(DOC_TYPE_LABELS[d.doc_type] || d.doc_type)}</b>
+          <a href="/admin/documents/${d.id}/download">${esc(d.filename || 'document.pdf')}</a>
+          <span class="muted">(${(d.data.length / 1024).toFixed(1)} KB)</span><br>
+          ${authenticityBadge(d.authenticity_status, d.authenticity_notes)}
+        </div>`).join('')}</div>`
+      : '<div class="flag-note" style="margin-top:6px">⚠️ No KYC documents uploaded.</div>';
+    return `
     <tr>
       <td><b>${esc(c.name)}</b> ${c.flagged ? '<span class="warn-badge"><i class="warn-ic">⚠️</i> flagged</span>' : ''}<br>
-        <span class="muted">${esc(c.email)}${c.website ? ' · ' + esc(c.website) : ''}</span>
-        ${c.flagged ? `<br><span class="flag-note">${esc(c.flag_reasons)}</span>` : ''}</td>
+        <span class="muted">${esc(c.email)}${c.website ? ' · <a href="' + esc(c.website) + '" rel="noopener noreferrer nofollow">' + esc(c.website) + '</a>' : ''}</span><br>
+        <span class="muted">${c.category ? 'Category: <b>' + esc(c.category) + '</b> · ' : ''}${c.trade_license ? 'Trade license: <b>' + esc(c.trade_license) + '</b>' : 'Trade license: <span class="flag-note">missing</span>'}</span>
+        ${c.activity ? `<br><span class="muted">Activity: ${esc(c.activity)}</span>` : ''}
+        ${c.signature_name ? `<br><span class="muted">Signed by: ${esc(c.signature_name)} · ${esc((c.signature_at || '').slice(0, 16).replace('T', ' '))} UTC · IP ${esc(c.signature_ip || '—')}</span>` : ''}
+        ${c.flagged ? `<br><span class="flag-note">${esc(c.flag_reasons)}</span>` : ''}
+        ${docsHtml}</td>
       <td class="muted">${esc(c.created_at.slice(0, 10))}</td>
       <td style="white-space:nowrap">
         <form method="POST" action="/admin/companies/${c.id}/approve" style="display:inline"><button class="btn btn-sm btn-green">Approve</button></form>
         <form method="POST" action="/admin/companies/${c.id}/reject" style="display:inline"><button class="btn btn-sm btn-danger">Reject</button></form>
       </td>
-    </tr>`).join('') : '<tr><td colspan="3" class="muted">No pending reviews. The agents are holding the fort. 🛡️</td></tr>';
+    </tr>`;
+  }).join('') : '<tr><td colspan="3" class="muted">No pending reviews. The agents are holding the fort. 🛡️</td></tr>';
 
   // Final approval queue — ONLY contracts the deal owner has already approved (state: pending_admin).
   const names = companyNameMap();
-  const pendingContracts = db.prepare(`SELECT * FROM contracts WHERE status = 'pending_admin' ORDER BY signed_at ASC`).all();
+  const pendingContracts = db.prepare(`SELECT * FROM contracts WHERE status = 'pending_admin' AND negotiation_id IS NULL ORDER BY signed_at ASC`).all();
   const dealContractRows = pendingContracts.map(ct => {
     const deal = db.prepare('SELECT title FROM deals WHERE id = ?').get(ct.deal_id);
     return `<tr>
@@ -3491,13 +5792,35 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
   const allContractRows = [...dealContractRows, ...privateContractRows];
   const contractsHtml = allContractRows.length ? allContractRows.join('') : '<tr><td colspan="4" class="muted">No contracts awaiting final approval. Contracts land here after the deal owner approves them.</td></tr>';
 
+  // Stage C: negotiation final-approval queue — shows the agreed commission split + amounts.
+  const pendingNegs = db.prepare(`SELECT * FROM negotiations WHERE state = 'PENDING_ADMIN' ORDER BY updated_at ASC`).all();
+  const negRows = pendingNegs.map(n => {
+    const deal = db.prepare('SELECT title, deal_number FROM deals WHERE id = ?').get(n.deal_id);
+    const f = negFeeBreakdown(n);
+    const splitLabel = NEG_SPLITS[n.commission_split] || n.commission_split;
+    const amounts = isFinite(f.fee)
+      ? `${f.pct}% = <b>${fmtAmount(f.fee)} ${esc(f.cur)}</b> — buyer ${fmtAmount(f.buyer)} · seller ${fmtAmount(f.seller)} ${esc(f.cur)}`
+      : `${f.pct}% of ${esc(n.offer_value)} ${esc(n.offer_currency || 'USD')}`;
+    return `<tr>
+      <td><b>${esc(deal ? deal.title : '(deal removed)')}</b> <span class="muted">№ ${esc(deal ? (deal.deal_number || String(n.deal_id)) : String(n.deal_id))} · neg #${n.id} · round ${n.round}</span></td>
+      <td>${esc(names.get(n.seller_id) || '?')} ⇄ ${esc(names.get(n.buyer_id) || '?')}</td>
+      <td><b>${esc(splitLabel)}</b><br><span class="muted">${amounts}</span></td>
+      <td style="white-space:nowrap">
+        <a class="btn btn-sm btn-outline" href="/negotiation/${n.id}">View</a>
+        <form method="POST" action="/admin/negotiations/${n.id}/approve" style="display:inline"><button class="btn btn-sm btn-green">Approve</button></form>
+        <form method="POST" action="/admin/negotiations/${n.id}/reject" style="display:inline"><button class="btn btn-sm btn-danger">Reject</button></form>
+      </td>
+    </tr>`;
+  });
+  const negsTableHtml = negRows.length ? negRows.join('') : '<tr><td colspan="4" class="muted">No negotiations awaiting final approval. Negotiations land here once both parties agree the commission split.</td></tr>';
+
   // All companies (suspend / reactivate / delete / reputation / research)
   const allCompanies = db.prepare('SELECT * FROM companies ORDER BY created_at DESC LIMIT 100').all();
   const companiesHtml = allCompanies.map(c => {
     const actions = [];
     if (c.status === 'approved') actions.push(`<form method="POST" action="/admin/companies/${c.id}/suspend" style="display:inline"><button class="btn btn-sm btn-outline">Suspend</button></form>`);
     if (c.status === 'suspended' || c.status === 'rejected') actions.push(`<form method="POST" action="/admin/companies/${c.id}/reactivate" style="display:inline"><button class="btn btn-sm btn-green">Reactivate</button></form>`);
-    actions.push(`<form method="POST" action="/admin/companies/${c.id}/delete" style="display:inline" onsubmit="return confirm('Delete ${esc(c.name)} and ALL their data?')"><button class="btn btn-sm btn-danger">Delete</button></form>`);
+    actions.push(`<a class="btn btn-sm btn-danger" href="/admin/companies/${c.id}/delete">Delete</a>`);
     const repOptions = [0, 1, 2, 3, 4, 5].map(r =>
       `<option value="${r}"${r === (c.reputation || 0) ? ' selected' : ''}>${r === 0 ? 'Unrated' : '★'.repeat(r)}</option>`).join('');
     return `<tr>
@@ -3533,11 +5856,14 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
 
   const body = `
   <h2 class="sec-h" style="margin-top:0;margin-bottom:14px">🛡️ Admin dashboard</h2>
+  <div class="feed-actions" style="margin:0 0 14px"><a class="btn btn-sm btn-outline" href="/admin/documents">🗄️ Document vault</a></div>
   ${statsHtml}
   <div class="card" data-reveal><h3>Pending companies</h3>
     <table><tr><th>Company</th><th>Registered</th><th>Actions</th></tr>${pendingHtml}</table></div>
   <div class="card" data-reveal><h3>Pending contracts — final approval</h3>
     <table><tr><th>Deal</th><th>Parties</th><th>Signed at</th><th>Actions</th></tr>${contractsHtml}</table></div>
+  <div class="card" data-reveal><h3>🤝 Pending negotiations — final approval (commission split)</h3>
+    <table><tr><th>Deal</th><th>Parties</th><th>Split &amp; commission</th><th>Actions</th></tr>${negsTableHtml}</table></div>
   <div class="card" data-reveal><h3>All companies</h3>
     <table><tr><th>Company</th><th>Status</th><th>Reputation</th><th>Actions</th></tr>${companiesHtml}</table></div>
   <div class="card" data-reveal><h3>All deals</h3>
@@ -3548,6 +5874,13 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
       <label>New password (min 10 characters)</label><input type="password" name="next" required minlength="10">
       <button class="btn btn-sm" type="submit">Update password</button>
       <p class="muted" style="margin-top:8px">Stored as a salted hash in the settings table; the env var remains a fallback until changed.</p>
+    </form></div>
+  <div class="card" data-reveal><h3>⚙️ Platform settings</h3>
+    <form method="POST" action="/admin/settings/commission" style="max-width:380px">
+      <label>Platform commission (%) — currently <b style="color:var(--gold)">${feePct}%</b></label>
+      <input type="number" name="platform_fee_pct" min="0.1" max="20" step="0.1" value="${feePct}" required>
+      <button class="btn btn-sm" type="submit">Update commission</button>
+      <p class="muted" style="margin-top:8px">Between 0.1% and 20%. Applied immediately to deal pages, contracts, documents and the commission tile. Changes are audit-logged.</p>
     </form></div>
   <div class="card" data-reveal><h3>🤖 Agent activity (latest 50)</h3>
     <table><tr><th>Time (UTC)</th><th>Agent</th><th>Action</th><th>Result</th><th>Details</th></tr>${auditHtml}</table></div>`;
@@ -3584,12 +5917,9 @@ app.post('/admin/companies/:id/reactivate', requireAdmin, (req, res) => {
   audit('ONBOARDING AGENT', 'admin reactivate company', 'pass', `Admin reactivated "${c.name}"`);
   res.redirect('/admin/dashboard?msg=' + encodeURIComponent(`Reactivated ${c.name}.`));
 });
-app.post('/admin/companies/:id/delete', requireAdmin, (req, res) => {
-  const c = db.prepare('SELECT * FROM companies WHERE id = ?').get(parseInt(req.params.id, 10));
-  if (!c) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Company not found.'));
-  const id = c.id;
-  // Delete cascades ALL company data: posts, deals (+their social graph), likes,
-  // comments, follows, reposts, contracts, sessions, verification codes.
+// ----- 3-step company deletion (replaces one-click delete) -----
+/** Cascade-wipe ALL company data, including KYC documents. */
+function wipeCompanyData(id) {
   const wipe = db.transaction(() => {
     const dealIds = db.prepare('SELECT id FROM deals WHERE company_id = ?').all(id).map(r => r.id);
     const postIds = db.prepare('SELECT id FROM posts WHERE company_id = ?').all(id).map(r => r.id);
@@ -3599,6 +5929,7 @@ app.post('/admin/companies/:id/delete', requireAdmin, (req, res) => {
       db.prepare('DELETE FROM reposts WHERE deal_id = ?').run(d);
       db.prepare('DELETE FROM contracts WHERE deal_id = ?').run(d);
       db.prepare('DELETE FROM counter_offers WHERE deal_id = ?').run(d);
+      db.prepare('DELETE FROM deal_documents WHERE deal_id = ?').run(d);
     }
     for (const p of postIds) {
       db.prepare(`DELETE FROM likes WHERE target_type = 'post' AND target_id = ?`).run(p);
@@ -3617,13 +5948,136 @@ app.post('/admin/companies/:id/delete', requireAdmin, (req, res) => {
     db.prepare('DELETE FROM sessions WHERE company_id = ?').run(id);
     db.prepare('DELETE FROM verification_codes WHERE company_id = ?').run(id);
     db.prepare('DELETE FROM media WHERE company_id = ?').run(id);
+    db.prepare('DELETE FROM documents WHERE company_id = ?').run(id);
+    db.prepare('DELETE FROM deal_documents WHERE company_id = ?').run(id);
     // Remove the company from all conversations (their messages keep attribution as "Unknown").
     db.prepare('DELETE FROM conversation_members WHERE company_id = ?').run(id);
     db.prepare('DELETE FROM companies WHERE id = ?').run(id);
   });
   wipe();
-  audit('ONBOARDING AGENT', 'admin delete company', 'fail', `Admin deleted "${c.name}" and all associated data`);
+}
+
+function deleteStepPage(c, inner, user, msg, err) {
+  return page('Delete company', `
+  <div class="card" style="max-width:560px;margin:0 auto;border-color:var(--err-border)">
+    <div class="kicker" style="color:var(--danger)">Danger zone · irreversible</div>
+    <h2 style="margin:6px 0 10px">🗑️ Delete ${esc(c.name)}</h2>
+    ${inner}
+    <hr class="sep">
+    <a class="btn btn-outline" href="/admin/dashboard">✕ Abort — back to dashboard</a>
+  </div>`, user, msg, err);
+}
+
+// Step 1 (GET): type the exact company name.
+app.get('/admin/companies/:id/delete', requireAdmin, (req, res) => {
+  const c = db.prepare('SELECT * FROM companies WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!c) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Company not found.'));
+  audit('ONBOARDING AGENT', 'delete company step 1', 'flag', `Admin opened deletion flow for "${c.name}"`);
+  res.send(deleteStepPage(c, `
+    <p class="muted" style="margin-bottom:12px"><b>Step 1 of 3.</b> This permanently deletes the company and ALL associated data — deals, posts, contracts, documents, sessions. Type the exact company name to continue:</p>
+    <p style="margin-bottom:10px"><b>${esc(c.name)}</b></p>
+    <form method="POST" action="/admin/companies/${c.id}/delete">
+      <label>Company name (exact match)</label>
+      <input type="text" name="confirm_name" required maxlength="120" autocomplete="off" placeholder="${esc(c.name)}">
+      <button class="btn btn-danger" type="submit">Continue →</button>
+    </form>`, req.user, req.query.msg, req.query.err));
+});
+
+// Step 2 (POST): name verified — now require admin password + acknowledgment checkbox.
+app.post('/admin/companies/:id/delete', requireAdmin, (req, res) => {
+  const c = db.prepare('SELECT * FROM companies WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!c) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Company not found.'));
+  const typed = String(req.body.confirm_name || '').trim();
+  if (typed !== c.name) {
+    audit('ONBOARDING AGENT', 'delete company step 1', 'fail', `Deletion of "${c.name}" aborted at step 1 — name mismatch ("${typed.slice(0, 60)}")`);
+    return res.redirect(`/admin/companies/${c.id}/delete?err=` + encodeURIComponent('The typed name does not match the company name exactly. Deletion aborted.'));
+  }
+  audit('ONBOARDING AGENT', 'delete company step 2', 'flag', `Admin confirmed company name for deletion of "${c.name}" — awaiting password + acknowledgment`);
+  res.send(deleteStepPage(c, `
+    <p class="muted" style="margin-bottom:12px"><b>Step 2 of 3.</b> Company name confirmed. Re-enter your admin password and acknowledge the consequences:</p>
+    <form method="POST" action="/admin/companies/${c.id}/delete/verify">
+      <input type="hidden" name="confirm_name" value="${esc(c.name)}">
+      <label>Admin password</label>
+      <input type="password" name="admin_password" required autocomplete="current-password">
+      <label style="display:flex;gap:8px;align-items:flex-start;margin:10px 0;font-weight:500;color:var(--ink-primary)">
+        <input type="checkbox" name="understand" value="yes" style="width:auto;margin:3px 0 0" required>
+        <span>I understand this permanently deletes all data</span></label>
+      <button class="btn btn-danger" type="submit">Continue →</button>
+    </form>`, req.user, req.query.msg, req.query.err));
+});
+
+// Step 3 (POST): password + checkbox verified — final confirmation screen.
+app.post('/admin/companies/:id/delete/verify', requireAdmin, (req, res) => {
+  const c = db.prepare('SELECT * FROM companies WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!c) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Company not found.'));
+  if (String(req.body.confirm_name || '').trim() !== c.name) {
+    return res.redirect(`/admin/companies/${c.id}/delete?err=` + encodeURIComponent('Confirmation mismatch. Please start the deletion again.'));
+  }
+  if (!adminPasswordOk(String(req.body.admin_password || ''))) {
+    audit('ONBOARDING AGENT', 'delete company step 2', 'fail', `Deletion of "${c.name}" aborted at step 2 — wrong admin password`);
+    return res.redirect(`/admin/companies/${c.id}/delete?err=` + encodeURIComponent('Wrong admin password. Deletion aborted.'));
+  }
+  if (req.body.understand !== 'yes') {
+    audit('ONBOARDING AGENT', 'delete company step 2', 'fail', `Deletion of "${c.name}" aborted at step 2 — acknowledgment checkbox not ticked`);
+    return res.redirect(`/admin/companies/${c.id}/delete?err=` + encodeURIComponent('You must acknowledge the permanent deletion. Deletion aborted.'));
+  }
+  audit('ONBOARDING AGENT', 'delete company step 3', 'flag', `Admin passed password + acknowledgment for deletion of "${c.name}" — final confirmation shown`);
+  res.send(deleteStepPage(c, `
+    <p class="muted" style="margin-bottom:12px"><b>Step 3 of 3 — final confirmation.</b> Identity verified. Press the button below to permanently erase <b>${esc(c.name)}</b> and every piece of their data. There is no undo.</p>
+    <form method="POST" action="/admin/companies/${c.id}/delete/execute">
+      <input type="hidden" name="confirm_name" value="${esc(c.name)}">
+      <button class="btn btn-danger" type="submit">🗑️ Permanently delete ${esc(c.name)}</button>
+    </form>`, req.user, req.query.msg, req.query.err));
+});
+
+// Execute (POST): re-verify name, then cascade-wipe everything (including documents).
+app.post('/admin/companies/:id/delete/execute', requireAdmin, (req, res) => {
+  const c = db.prepare('SELECT * FROM companies WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!c) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Company not found.'));
+  if (String(req.body.confirm_name || '').trim() !== c.name) {
+    return res.redirect(`/admin/companies/${c.id}/delete?err=` + encodeURIComponent('Confirmation mismatch. Deletion aborted.'));
+  }
+  wipeCompanyData(c.id);
+  audit('ONBOARDING AGENT', 'admin delete company', 'fail', `Admin deleted "${c.name}" and all associated data (3-step flow completed)`);
   res.redirect('/admin/dashboard?msg=' + encodeURIComponent(`Deleted ${c.name} and all their data.`));
+});
+
+// ----- Admin document vault: every KYC document, with authenticity badges -----
+app.get('/admin/documents', requireAdmin, (req, res) => {
+  const docs = db.prepare(`
+    SELECT d.*, c.name AS company_name FROM documents d
+    LEFT JOIN companies c ON c.id = d.company_id
+    ORDER BY d.created_at DESC LIMIT 500`).all();
+  const rows = docs.length ? docs.map((d, i) => `
+    <tr data-reveal style="--i:${Math.min(i, 10)}">
+      <td><b>${esc(d.company_name || '(deleted company)')}</b></td>
+      <td>${esc(DOC_TYPE_LABELS[d.doc_type] || d.doc_type)}</td>
+      <td><a href="/admin/documents/${d.id}/download">${esc(d.filename || 'document.pdf')}</a><br>
+        <span class="muted">sha256 ${esc((d.sha256 || '').slice(0, 16))}…</span></td>
+      <td class="muted">${(d.data.length / 1024).toFixed(1)} KB</td>
+      <td>${authenticityBadge(d.authenticity_status, d.authenticity_notes)}</td>
+      <td class="muted" style="white-space:nowrap">${esc(d.created_at.slice(0, 16).replace('T', ' '))}</td>
+    </tr>`).join('') : '<tr><td colspan="6" class="muted">No documents uploaded yet.</td></tr>';
+  const body = `
+  <h2 class="sec-h" style="margin-top:0;margin-bottom:14px">🗄️ Document vault</h2>
+  <div class="feed-actions" style="margin:0 0 14px"><a class="btn btn-sm btn-outline" href="/admin/dashboard">← Back to dashboard</a></div>
+  <div class="card" data-reveal>
+    <p class="muted" style="margin-bottom:12px">All KYC documents uploaded at registration, screened by the Document Authenticity Agent. Downloads are admin-only; each company can also download its own documents via <span class="muted">/documents/:id</span>.</p>
+    <table><tr><th>Company</th><th>Type</th><th>File</th><th>Size</th><th>Authenticity</th><th>Uploaded (UTC)</th></tr>${rows}</table>
+  </div>`;
+  res.send(page('Document vault', body, req.user, req.query.msg, req.query.err));
+});
+
+app.get('/admin/documents/:id/download', requireAdmin, (req, res) => {
+  const doc = db.prepare('SELECT * FROM documents WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!doc) return res.redirect('/admin/documents?err=' + encodeURIComponent('Document not found.'));
+  audit('DOCUMENT AGENT', 'document access', 'pass', `Admin downloaded document #${doc.id} (${doc.doc_type}, "${doc.filename}")`);
+  res.setHeader('Content-Type', doc.mime || 'application/pdf');
+  res.setHeader('Content-Length', doc.data.length);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.setHeader('Content-Disposition', `attachment; filename="${String(doc.filename || 'document.pdf').replace(/[^A-Za-z0-9._-]/g, '_')}"`);
+  res.send(doc.data);
 });
 
 // ----- Admin reputation scale (0 = unrated, 1–5 stars) -----
@@ -3648,6 +6102,7 @@ app.get('/admin/companies/:id/research', requireAdmin, (req, res) => {
     <div class="kicker">🔬 Research Agent</div>
     <h2 style="margin:6px 0 10px">Company intelligence — ${esc(c.name)}</h2>
     <p class="muted" style="margin-bottom:12px">Review and edit the researched fields, then save. They appear on the public company profile.</p>
+    ${c.trade_license ? `<p class="muted" style="margin-bottom:12px">🪪 Trade license: <b>${esc(c.trade_license)}</b></p>` : ''}
     ${c.research_source ? `<p class="muted" style="margin-bottom:12px">Source: <a href="${esc(c.research_source)}" rel="noopener noreferrer nofollow">${esc(c.research_source)}</a></p>` : ''}
     <form method="POST" action="/admin/companies/${c.id}/research">
       <label>Market value</label><input type="text" name="market_value" maxlength="120" value="${esc(c.market_value || '')}" placeholder="e.g. $2.8T (2024)">
@@ -3703,9 +6158,35 @@ app.post('/admin/companies/:id/research', requireAdmin, async (req, res) => {
     // Never overwrite non-empty fields — only fill in blanks.
     if (!c.field) db.prepare('UPDATE companies SET field = ? WHERE id = ?').run(suggestion, c.id);
     if (sourceUrl) db.prepare('UPDATE companies SET research_source = ? WHERE id = ?').run(sourceUrl, c.id);
-    audit('RESEARCH AGENT', 'research run', 'pass', `Research for "${c.name}" — Wikipedia summary found${c.field ? ' (field kept: already set)' : `, suggested field: "${suggestion}"`}${sourceUrl ? ', source: ' + sourceUrl : ''}`);
+    audit('RESEARCH AGENT', 'research run', 'pass', `Research for "${c.name}" — Wikipedia summary found${c.field ? ' (field kept: already set)' : `, suggested field: "${suggestion}"`}${sourceUrl ? ', source: ' + sourceUrl : ''}. Trade license: ${c.trade_license || 'not provided'}`);
   } else {
-    audit('RESEARCH AGENT', 'research run', 'fail', `Research for "${c.name}" — no public summary found (${failReason || 'not found'})`);
+    audit('RESEARCH AGENT', 'research run', 'fail', `Research for "${c.name}" — no public summary found (${failReason || 'not found'}). Trade license: ${c.trade_license || 'not provided'}`);
+  }
+
+  // Trust & KYC upgrade: mine the company's uploaded profile PDF for field/employees hints.
+  let profileNote = '';
+  try {
+    const profileDoc = db.prepare(`SELECT * FROM documents WHERE company_id = ? AND doc_type = 'profile_pdf' ORDER BY id DESC LIMIT 1`).get(c.id);
+    if (profileDoc) {
+      const parsed = await extractPdfText(profileDoc.data);
+      if (parsed && parsed.text.trim()) {
+        const g = guessesFromProfileText(parsed.text);
+        if (!c.field && g.activity) {
+          db.prepare('UPDATE companies SET field = ? WHERE id = ?').run(g.activity.slice(0, 200), c.id);
+          profileNote += `field suggested from profile PDF: "${g.activity.slice(0, 80)}"`;
+        }
+        if (!c.employees && g.employees) {
+          db.prepare('UPDATE companies SET employees = ? WHERE id = ?').run(g.employees.slice(0, 80), c.id);
+          profileNote += `${profileNote ? '; ' : ''}employees suggested from profile PDF: "${g.employees}"`;
+        }
+        if (profileNote) audit('RESEARCH AGENT', 'profile PDF mining', 'pass', `Research for "${c.name}" — ${profileNote}. Trade license: ${c.trade_license || 'not provided'}`);
+        else audit('RESEARCH AGENT', 'profile PDF mining', 'pass', `Research for "${c.name}" — profile PDF contained no new field/employee hints. Trade license: ${c.trade_license || 'not provided'}`);
+      } else {
+        audit('RESEARCH AGENT', 'profile PDF mining', 'flag', `Research for "${c.name}" — profile PDF has no extractable text. Trade license: ${c.trade_license || 'not provided'}`);
+      }
+    }
+  } catch (e) {
+    audit('RESEARCH AGENT', 'profile PDF mining', 'fail', `Research for "${c.name}" — profile PDF mining error: ${e.message}`);
   }
   // Redirect to the edit form so the admin can confirm/edit before saving.
   res.redirect(`/admin/companies/${c.id}/research?` + (suggestion
@@ -3723,6 +6204,7 @@ app.post('/admin/deals/:id/delete', requireAdmin, (req, res) => {
     db.prepare('DELETE FROM reposts WHERE deal_id = ?').run(d.id);
     db.prepare('DELETE FROM contracts WHERE deal_id = ?').run(d.id);
     db.prepare('DELETE FROM counter_offers WHERE deal_id = ?').run(d.id);
+    db.prepare('DELETE FROM deal_documents WHERE deal_id = ?').run(d.id);
     db.prepare('DELETE FROM deals WHERE id = ?').run(d.id);
   });
   wipe();
@@ -3734,15 +6216,17 @@ app.post('/admin/deals/:id/delete', requireAdmin, (req, res) => {
 app.post('/admin/contracts/:id/approve', requireAdmin, (req, res) => {
   const ct = db.prepare('SELECT * FROM contracts WHERE id = ?').get(parseInt(req.params.id, 10));
   if (!ct) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Contract not found.'));
+  if (ct.negotiation_id) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Negotiation-linked contracts are approved from the negotiations queue below.'));
   if (ct.status !== 'pending_admin') {
     return res.redirect('/admin/dashboard?err=' + encodeURIComponent('This contract is not awaiting final approval (owner must approve first).'));
   }
-  // 1) Mark the deal as approved and record the signing party on the deal itself.
+  // 1) Mark the deal as approved, record the signing party on the deal, and close the status pipeline.
   const signer = db.prepare('SELECT name FROM companies WHERE id = ?').get(ct.signer_company_id);
   const party = signer ? signer.name : 'Unknown';
   const dealRow = db.prepare('SELECT title FROM deals WHERE id = ?').get(ct.deal_id);
   const dealTitle = dealRow ? dealRow.title : 'deal #' + ct.deal_id;
-  db.prepare(`UPDATE deals SET contract_state = 'approved', contract_party = ? WHERE id = ?`).run(party, ct.deal_id);
+  db.prepare(`UPDATE deals SET contract_state = 'approved', contract_party = ?, contract_party_id = ?, status = 'closed' WHERE id = ?`)
+    .run(party, ct.signer_company_id, ct.deal_id);
   // 2) Approved contracts are archived: the row is deleted; the deal carries the state.
   db.prepare('DELETE FROM contracts WHERE id = ?').run(ct.id);
   // TODO PHASE 3 — PAYMENT-ESCROW AGENT: when admin approves a contract, hook Stripe escrow initiation here (create escrow, notify both parties, release funds on delivery confirmation). Not implemented in this version.
@@ -3755,6 +6239,7 @@ app.post('/admin/contracts/:id/approve', requireAdmin, (req, res) => {
 app.post('/admin/contracts/:id/reject', requireAdmin, (req, res) => {
   const ct = db.prepare('SELECT * FROM contracts WHERE id = ?').get(parseInt(req.params.id, 10));
   if (!ct) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Contract not found.'));
+  if (ct.negotiation_id) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Negotiation-linked contracts are rejected from the negotiations queue below.'));
   if (ct.status !== 'pending_admin') {
     return res.redirect('/admin/dashboard?err=' + encodeURIComponent('This contract is not awaiting final approval.'));
   }
@@ -3777,6 +6262,7 @@ app.post('/admin/private-contracts/:id/approve', requireAdmin, (req, res) => {
   audit('CONTRACT AGENT', 'admin approve private contract', 'pass', `Private contract #${pc.id} "${pc.title}" (${names.get(pc.sender_company_id) || '?'} ⇄ ${names.get(pc.recipient_company_id) || '?'}) approved by admin — kept on file in both mailboxes`);
   notify(pc.sender_company_id, 'private_contract_approved', `Final approval granted — your private contract "${pc.title}" is finalized. 🎉`, `/contracts/${pc.id}`);
   notify(pc.recipient_company_id, 'private_contract_approved', `Final approval granted — the private contract "${pc.title}" is finalized. 🎉`, `/contracts/${pc.id}`);
+  postCongrats(pc.title, '', names.get(pc.sender_company_id) || 'Sender', names.get(pc.recipient_company_id) || 'Recipient');
   res.redirect('/admin/dashboard?msg=' + encodeURIComponent('Private contract approved and kept on file.'));
 });
 app.post('/admin/private-contracts/:id/reject', requireAdmin, (req, res) => {
@@ -3809,6 +6295,74 @@ app.post('/admin/password', requireAdmin, (req, res) => {
   upsert.run('admin_password_salt', salt);
   audit('AUTHENTICATION AGENT', 'admin password change', 'pass', 'Admin password updated (hashed override stored)');
   res.redirect('/admin/dashboard?msg=' + encodeURIComponent('Admin password updated.'));
+});
+
+// ----- Platform settings: adjustable commission (0.1–20%), audit-logged old→new -----
+app.post('/admin/settings/commission', requireAdmin, (req, res) => {
+  const pct = parseFloat(String(req.body.platform_fee_pct || '').replace(',', '.'));
+  if (!isFinite(pct) || pct < 0.1 || pct > 20) {
+    return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Commission must be a number between 0.1 and 20.'));
+  }
+  const rounded = Math.round(pct * 100) / 100;
+  const old = platformFeePct();
+  db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+    .run('platform_fee_pct', String(rounded));
+  audit('ADMIN', 'platform commission change', 'pass', `Platform fee changed from ${old}% to ${rounded}%`);
+  res.redirect('/admin/dashboard?msg=' + encodeURIComponent(`Platform commission updated from ${old}% to ${rounded}%.`));
+});
+
+// ----- Admin final approval for negotiations (split + amounts shown in the queue) -----
+app.post('/admin/negotiations/:id/approve', requireAdmin, (req, res) => {
+  const neg = getNegotiation(req.params.id);
+  if (!neg) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Negotiation not found.'));
+  if (neg.state !== 'PENDING_ADMIN') {
+    return res.redirect('/admin/dashboard?err=' + encodeURIComponent('This negotiation is not awaiting final approval.'));
+  }
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(neg.deal_id);
+  const names = companyNameMap();
+  const buyerName = names.get(neg.buyer_id) || 'Unknown';
+  const sellerName = names.get(neg.seller_id) || 'Unknown';
+  const dealTitle = deal ? deal.title : 'deal #' + neg.deal_id;
+  const f = negFeeBreakdown(neg);
+  const splitLabel = NEG_SPLITS[neg.commission_split] || NEG_SPLITS['50-50'];
+  const feeNote = isFinite(f.fee)
+    ? ` Commission due before deal processing: ${fmtAmount(f.fee)} ${f.cur} (${splitLabel} — buyer ${fmtAmount(f.buyer)} ${f.cur}, seller ${fmtAmount(f.seller)} ${f.cur}).`
+    : ` The ${f.pct}% platform commission (${splitLabel}) is due before deal processing.`;
+  const finalize = db.transaction(() => {
+    // 1) Mark the deal as approved, record the buyer on the deal, close the status pipeline.
+    db.prepare(`UPDATE deals SET contract_state = 'approved', contract_party = ?, contract_party_id = ?, status = 'closed' WHERE id = ?`)
+      .run(buyerName, neg.buyer_id, neg.deal_id);
+    // 2) Archive the signature record (same pattern as the legacy contract queue).
+    db.prepare('DELETE FROM contracts WHERE negotiation_id = ?').run(neg.id);
+    // 3) Close the negotiation.
+    db.prepare(`UPDATE negotiations SET state = 'DONE', updated_at = ? WHERE id = ?`).run(now(), neg.id);
+  });
+  finalize();
+  negEvent(neg.id, null, 'admin_approved', { note: `Split: ${splitLabel}` });
+  audit('CONTRACT AGENT', 'admin approve negotiation', 'pass', `Negotiation #${neg.id} (deal ${deal ? deal.deal_number || deal.id : neg.deal_id}) approved by admin — DONE. Split: ${splitLabel}.${isFinite(f.fee) ? ` Fee ${fmtAmount(f.fee)} ${f.cur} (buyer ${fmtAmount(f.buyer)}, seller ${fmtAmount(f.seller)}).` : ''}`);
+  notify(neg.buyer_id, 'deal_closed', `Final approval granted — "${dealTitle}" is finalized. Deal closed! 🎉${feeNote}`, `/negotiation/${neg.id}`);
+  notify(neg.seller_id, 'deal_closed', `Final approval granted — "${dealTitle}" is finalized. Deal closed! 🎉${feeNote}`, `/negotiation/${neg.id}`);
+  postCongrats(dealTitle, deal ? (deal.deal_number || '') : '', sellerName, buyerName);
+  res.redirect('/admin/dashboard?msg=' + encodeURIComponent('Negotiation approved — deal closed, both parties notified, congratulations posted.'));
+});
+
+app.post('/admin/negotiations/:id/reject', requireAdmin, (req, res) => {
+  const neg = getNegotiation(req.params.id);
+  if (!neg) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Negotiation not found.'));
+  if (neg.state !== 'PENDING_ADMIN') {
+    return res.redirect('/admin/dashboard?err=' + encodeURIComponent('This negotiation is not awaiting final approval.'));
+  }
+  const deal = db.prepare('SELECT title FROM deals WHERE id = ?').get(neg.deal_id);
+  const reject = db.transaction(() => {
+    db.prepare(`UPDATE negotiations SET state = 'REJECTED', updated_at = ? WHERE id = ?`).run(now(), neg.id);
+    db.prepare(`UPDATE contracts SET status = 'rejected', decided_at = ? WHERE negotiation_id = ?`).run(now(), neg.id);
+  });
+  reject();
+  negEvent(neg.id, null, 'admin_rejected');
+  audit('CONTRACT AGENT', 'admin reject negotiation', 'fail', `Negotiation #${neg.id} (deal #${neg.deal_id}) rejected by admin at final approval`);
+  notify(neg.buyer_id, 'negotiation_rejected', `An admin rejected the contract on "${deal ? deal.title : 'deal #' + neg.deal_id}" at final approval.`, `/negotiation/${neg.id}`);
+  notify(neg.seller_id, 'negotiation_rejected', `An admin rejected the contract on "${deal ? deal.title : 'deal #' + neg.deal_id}" at final approval.`, `/negotiation/${neg.id}`);
+  res.redirect('/admin/dashboard?msg=' + encodeURIComponent('Negotiation rejected.'));
 });
 
 // ============================= 404 & SERVER START =============================
