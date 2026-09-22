@@ -353,6 +353,26 @@ try { db.exec('ALTER TABLE posts ADD COLUMN is_system INTEGER DEFAULT 0'); } cat
 try { db.exec('ALTER TABLE contracts ADD COLUMN negotiation_id INTEGER'); } catch (e) { /* column already exists */ }
 try { db.exec('ALTER TABLE negotiations ADD COLUMN split_proposed_by INTEGER'); } catch (e) { /* column already exists */ }
 
+// Commission payment gate (old databases keep booting; finalized legacy deals stay 'none' = unaffected).
+try { db.exec("ALTER TABLE deals ADD COLUMN payment_status TEXT DEFAULT 'none'"); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE deals ADD COLUMN payment_split TEXT'); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE deals ADD COLUMN payment_fee REAL'); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE deals ADD COLUMN payment_currency TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+// Manual commission-payment confirmations (party → admin review). deal_id is NULL for private-contract
+// payments (private contracts have no deal row); private_contract_id is NULL for deal payments.
+db.exec(`CREATE TABLE IF NOT EXISTS commission_payments (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  deal_id             INTEGER,
+  private_contract_id INTEGER,
+  company_id          INTEGER NOT NULL,
+  amount              REAL NOT NULL DEFAULT 0,
+  currency            TEXT NOT NULL DEFAULT 'USD',
+  note                TEXT DEFAULT '',
+  status              TEXT NOT NULL DEFAULT 'pending', -- pending | approved | rejected
+  created_at          TEXT NOT NULL,
+  decided_at          TEXT
+)`);
+
 /** Next unique deal number for the current year: DZ-<year>-<zero-padded seq> (counter in settings). */
 function nextDealNumber(year) {
   const yr = year || new Date().getFullYear();
@@ -419,6 +439,149 @@ function feeLineText(deal) {
   return isFinite(num) && num > 0
     ? `Platform fee: ${pct}% (${fmtAmount(num * pct / 100)} ${cur}) — transparent Dealzoin commission`
     : `Platform fee: ${pct}% of deal value — transparent Dealzoin commission`;
+}
+
+// ============================= COMMISSION PAYMENT GATE =============================
+/** Lock message shown (and returned) while a finalized deal awaits commission payment approval. */
+const PAYMENT_LOCK_MSG = '🔒 Shipment tracking unlocks after commission payment is approved by the administrator';
+/** Admin bank-transfer details shown on commission payment cards (settings key admin_bank_details). */
+function adminBankDetails() {
+  try {
+    const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('admin_bank_details');
+    if (row && String(row.value).trim()) return String(row.value).trim();
+  } catch (e) { /* fall through to default */ }
+  return 'Bank transfer details are being set up — please ask the platform administrator for the current account details before transferring.';
+}
+/** True while a deal is inside the commission-payment gate (pending or already paid). */
+function paymentGateApplies(deal) {
+  return !!deal && (deal.payment_status === 'pending_payment' || deal.payment_status === 'paid');
+}
+/**
+ * Commission math for a finalized deal, frozen at final-approval time:
+ * payment_fee / payment_currency / payment_split are recorded on the deal when the admin approves,
+ * so later platform-fee changes never rewrite a finalized deal's obligation.
+ * Split: '50-50' (both parties pay half) | 'buyer-pays' | 'seller-pays'.
+ */
+function dealPaymentBreakdown(deal) {
+  const split = NEG_SPLITS[deal.payment_split] ? deal.payment_split : '50-50';
+  const fee = Number(deal.payment_fee);
+  const cur = deal.payment_currency || deal.currency || 'USD';
+  const ok = isFinite(fee) && fee > 0;
+  // The split decides WHO owes (fraction), independent of whether the fee amount is known.
+  const buyerFrac = split === 'buyer-pays' ? 1 : (split === 'seller-pays' ? 0 : 0.5);
+  return {
+    pct: platformFeePct(), cur, fee: ok ? fee : NaN, split,
+    buyerId: dealBuyerId(deal), sellerId: deal.company_id,
+    buyerShare: ok ? fee * buyerFrac : NaN, sellerShare: ok ? fee * (1 - buyerFrac) : NaN,
+    buyerOwes: buyerFrac > 0, sellerOwes: (1 - buyerFrac) > 0
+  };
+}
+/** The company ids that owe an (approved) commission share for a deal, per the frozen split. */
+function dealRequiredPayers(bd) {
+  const req = [];
+  if (bd.buyerId && bd.buyerOwes) req.push(bd.buyerId);
+  if (bd.sellerId && bd.sellerOwes) req.push(bd.sellerId);
+  return req;
+}
+/** Commission math for a finalized private contract (always split 50 / 50 between sender and recipient). */
+function pcPaymentBreakdown(pc) {
+  const pct = platformFeePct();
+  const cur = pc.currency || 'USD';
+  const v = Number(pc.value);
+  const fee = isFinite(v) && v > 0 ? v * pct / 100 : NaN;
+  const share = isFinite(fee) ? fee / 2 : NaN;
+  return { pct, cur, fee, senderShare: share, recipientShare: share, senderId: pc.sender_company_id, recipientId: pc.recipient_company_id };
+}
+/** Small status badge for a commission-payment confirmation row. */
+function paymentBadge(status) {
+  const map = { pending: '⏳ pending review', approved: '✅ approved', rejected: '❌ rejected' };
+  const cls = status === 'approved' ? 'badge-contract' : (status === 'rejected' ? 'badge-sealed' : '');
+  return `<span class="badge ${cls}">${map[status] || esc(status)}</span>`;
+}
+/** Notification text sent to both parties when a deal/contract enters the payment gate. */
+function commissionDueMessage(amountText, splitLabel, what) {
+  return `${what} approved! Commission of ${amountText} (${splitLabel}) is due before deal processing. Pay via bank transfer and confirm below.`;
+}
+/**
+ * After an admin approves a commission_payment row, check whether EVERY required share for its
+ * deal (per the frozen split: 50-50 = both parties; buyer-pays / seller-pays = only that party)
+ * is now approved. On completion the deal unlocks: payment_status='paid', both parties notified,
+ * audit-logged. Returns true when the deal just flipped to paid.
+ */
+function maybeCompleteDealPayment(dealId) {
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(dealId);
+  if (!deal || deal.payment_status !== 'pending_payment') return false;
+  const bd = dealPaymentBreakdown(deal);
+  const required = dealRequiredPayers(bd);
+  if (!required.length) return false;
+  const approved = new Set(db.prepare(`SELECT DISTINCT company_id FROM commission_payments WHERE deal_id = ? AND status = 'approved'`).all(deal.id).map(r => r.company_id));
+  if (!required.every(id => approved.has(id))) return false;
+  db.prepare(`UPDATE deals SET payment_status = 'paid' WHERE id = ?`).run(deal.id);
+  const msg = `Payment approved — shipment tracking is now live 🚢 Deal ${deal.deal_number || '#' + deal.id} ("${deal.title}") is unlocked: the status stepper and tracking maps are active.`;
+  if (bd.buyerId) notify(bd.buyerId, 'payment_complete', msg, `/deal/${deal.id}`);
+  if (bd.sellerId) notify(bd.sellerId, 'payment_complete', msg, `/deal/${deal.id}`);
+  audit('PAYMENT AGENT', 'deal payment complete', 'pass', `Deal ${deal.deal_number || '#' + deal.id} fully paid (${bd.split}) — shipment tracking unlocked`);
+  return true;
+}
+/** Same completion check for private-contract payments (both parties always owe half). */
+function maybeCompletePcPayment(pcId) {
+  const pc = db.prepare('SELECT * FROM private_contracts WHERE id = ?').get(pcId);
+  if (!pc || pc.status !== 'approved') return false;
+  const approved = new Set(db.prepare(`SELECT DISTINCT company_id FROM commission_payments WHERE private_contract_id = ? AND status = 'approved'`).all(pc.id).map(r => r.company_id));
+  if (!approved.has(pc.sender_company_id) || !approved.has(pc.recipient_company_id)) return false;
+  // Only fire once: complete = both approved AND no pending rows left to review for this contract.
+  const pendingLeft = db.prepare(`SELECT COUNT(*) AS n FROM commission_payments WHERE private_contract_id = ? AND status = 'pending'`).get(pc.id).n;
+  if (pendingLeft > 0) return false;
+  const msg = `Payment approved — the commission on your private contract "${pc.title}" is fully settled. ✅`;
+  notify(pc.sender_company_id, 'payment_complete', msg, `/contracts/${pc.id}`);
+  notify(pc.recipient_company_id, 'payment_complete', msg, `/contracts/${pc.id}`);
+  audit('PAYMENT AGENT', 'private contract payment complete', 'pass', `Private contract #${pc.id} "${pc.title}" commission fully settled`);
+  return true;
+}
+/** Gold commission-payment card for a finalized private contract (parties + admin; 50 / 50 split). */
+function pcPaymentCardHtml(pc, user) {
+  if (!pc || pc.status !== 'approved' || !(Number(pc.value) > 0)) return '';
+  if (!user || !(user.isAdmin || user.id === pc.sender_company_id || user.id === pc.recipient_company_id)) return '';
+  const pcb = pcPaymentBreakdown(pc);
+  const names = companyNameMap();
+  const rows = db.prepare('SELECT * FROM commission_payments WHERE private_contract_id = ? ORDER BY id DESC LIMIT 50').all(pc.id);
+  const latestBy = {};
+  for (const r of rows) { if (!latestBy[r.company_id]) latestBy[r.company_id] = r; }
+  const settled = ['sender_company_id', 'recipient_company_id']
+    .every(k => { const r = latestBy[pc[k]]; return r && r.status === 'approved'; });
+  const partyRow = (cid, label, share) => {
+    const r = latestBy[cid];
+    const st = r ? paymentBadge(r.status) : '<span class="badge">— no confirmation yet</span>';
+    const meta = r ? `<br><span class="muted">${r.note ? `“${esc(r.note)}” · ` : ''}${esc(r.created_at.slice(0, 16).replace('T', ' '))} UTC</span>` : '';
+    return `<div style="padding:6px 0;border-top:1px dashed var(--border-soft)">${label} <b>${esc(names.get(cid) || 'Unknown')}</b> — ${isFinite(share) ? `${fmtAmount(share)} ${esc(pcb.cur)}` : 'amount per instructions'} ${st}${meta}</div>`;
+  };
+  let confirmHtml = '';
+  if (!user.isAdmin && !settled) {
+    const myShare = user.id === pc.sender_company_id ? pcb.senderShare : pcb.recipientShare;
+    const mine = latestBy[user.id];
+    if (mine && mine.status === 'pending') {
+      confirmHtml = `<p class="muted" style="margin-top:10px">⏳ Your payment confirmation${isFinite(mine.amount) && mine.amount > 0 ? ` of ${fmtAmount(mine.amount)} ${esc(mine.currency)}` : ''} is awaiting admin review.</p>`;
+    } else {
+      confirmHtml = `<hr class="sep">
+      <h4 style="margin-bottom:8px">Confirm your payment (${isFinite(myShare) ? `${fmtAmount(myShare)} ${esc(pcb.cur)}` : 'amount per instructions'})</h4>
+      ${mine && mine.status === 'rejected' ? '<p class="flag-note">Your previous confirmation was rejected by the administrator. You can re-confirm once the transfer is made.</p>' : ''}
+      <form method="POST" action="/contracts/${pc.id}/payment-confirm">
+        <label>Payment reference / note (optional)</label>
+        <input type="text" name="note" maxlength="300" placeholder="e.g. Bank transfer ref #TRX-12345, sent today">
+        <button class="btn btn-sm btn-green" type="submit">Confirm payment sent</button>
+      </form>`;
+    }
+  }
+  return `<div class="card vault" data-reveal>
+    <h3>💰 Commission payment ${settled ? '<span class="badge badge-contract">settled ✓</span>' : '<span class="badge badge-sealed">awaiting payment</span>'}</h3>
+    <p style="margin-top:6px">Total commission: <span class="deal-value" style="font-size:1rem">${isFinite(pcb.fee) ? `${fmtAmount(pcb.fee)} ${esc(pcb.cur)}` : `${pcb.pct}% of contract value`}</span>
+      <span class="muted">(${pcb.pct}% of contract value · split: <b>${esc(NEG_SPLITS['50-50'])}</b>)</span></p>
+    ${partyRow(pc.sender_company_id, '✉️ Sender', pcb.senderShare)}
+    ${partyRow(pc.recipient_company_id, '📬 Recipient', pcb.recipientShare)}
+    <h4 style="margin:12px 0 6px">🏦 Payment instructions (bank transfer)</h4>
+    <p class="muted" style="white-space:pre-wrap">${esc(adminBankDetails())}</p>
+    ${settled ? '<p style="margin-top:10px"><span class="badge badge-contract">Commission fully settled ✓</span></p>' : confirmHtml}
+  </div>`;
 }
 
 // ============================= MEDIA UPLOADS (MULTER) =============================
@@ -2074,18 +2237,31 @@ function dealBuyerId(deal) {
   }
   return null;
 }
-/** Themed gold shipment stepper (open → production → dispatched → shipped → delivered). */
+/** Themed gold shipment stepper (open → production → dispatched → shipped → delivered).
+ *  Commission-gated deals (payment_status pending_payment/paid) behave differently: the stepper
+ *  tracks the post-contract SHIPMENT progress instead of forcing all-done, and while the payment
+ *  is pending it renders frozen behind a lock overlay. Legacy deals (payment_status 'none') are unchanged. */
 function stepperHtml(deal) {
+  const gated = paymentGateApplies(deal);
+  const locked = deal.payment_status === 'pending_payment';
   const closed = deal.contract_state === 'approved' || deal.status === 'closed';
+  const allDone = closed && !gated; // legacy behavior: finalized deals show the whole pipeline done
   const curIdx = DEAL_STATUSES.indexOf(deal.status);
-  const doneThrough = closed ? DEAL_STATUSES.length - 1 : (curIdx < 0 ? 0 : curIdx);
+  const doneThrough = allDone ? DEAL_STATUSES.length - 1 : (curIdx < 0 ? 0 : curIdx);
   const nodes = DEAL_STATUSES.map((s, i) => {
-    const cls = closed || i < doneThrough ? 'done' : (i === doneThrough ? (closed ? 'done' : 'current done') : '');
-    return `<div class="step-node ${cls}" style="--i:${i}"><span class="step-dot">${closed || i <= doneThrough ? '✓' : (i + 1)}</span><span class="step-lbl">${esc(s)}</span></div>`;
+    const cls = allDone || i < doneThrough ? 'done' : (i === doneThrough ? (allDone ? 'done' : 'current done') : '');
+    return `<div class="step-node ${cls}" style="--i:${i}"><span class="step-dot">${allDone || i <= doneThrough ? '✓' : (i + 1)}</span><span class="step-lbl">${esc(s)}</span></div>`;
   }).join('');
-  const fillPct = closed ? 100 : Math.round((doneThrough / (DEAL_STATUSES.length - 1)) * 100);
-  return `<div class="stepper" role="list" aria-label="Deal status">${nodes}</div>`
-    + `<div class="stepper__bar" aria-hidden="true" style="--p:${fillPct}%"></div>`
+  const fillPct = allDone ? 100 : Math.round((doneThrough / (DEAL_STATUSES.length - 1)) * 100);
+  const core = `<div class="stepper" role="list" aria-label="Deal status">${nodes}</div>`
+    + `<div class="stepper__bar" aria-hidden="true" style="--p:${fillPct}%"></div>`;
+  const lockOverlay = locked ? `<div style="position:relative" aria-label="Tracking locked">
+      <div style="opacity:.4;filter:grayscale(.5);pointer-events:none" aria-hidden="true">${core}</div>
+      <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:8px">
+        <div style="background:var(--surface-card);border:1px solid var(--border-gold);border-radius:12px;padding:10px 16px;text-align:center;box-shadow:var(--gold-shadow-md);font-weight:600">${PAYMENT_LOCK_MSG}</div>
+      </div>
+    </div>` : core;
+  return lockOverlay
     + (closed ? '<p style="margin-top:8px"><span class="badge badge-contract">Deal closed — contract finalized ✓</span></p>' : '');
 }
 
@@ -2184,6 +2360,12 @@ async function dealGeo(deal) {
  *  deal status at render time: open/production 5%, dispatched 35%, shipped 65%, delivered/closed 100%. */
 function statusProgress(deal) {
   if (!deal) return 0.05;
+  if (paymentGateApplies(deal)) { // gated deals: track post-payment shipment progress (status may still read 'closed' right after final approval)
+    if (deal.status === 'delivered') return 1;
+    if (deal.status === 'dispatched') return 0.35;
+    if (deal.status === 'shipped') return 0.65;
+    return 0.05;
+  }
   if (deal.contract_state === 'approved' || deal.status === 'closed' || deal.status === 'delivered') return 1;
   if (deal.status === 'dispatched') return 0.35;
   if (deal.status === 'shipped') return 0.65;
@@ -3463,6 +3645,63 @@ app.get('/deal/:id', requireCompanyOrAdmin, async (req, res) => {
       ? `<a class="btn btn-green" href="/negotiation/${myDealNeg.id}">View negotiation ${statusBadge(myDealNeg.state)}</a>`
       : `<a class="btn btn-green" href="/deal/${deal.id}/loi">Express interest (LOI)</a>`) : '';
 
+  // ---- Commission payment gate card (finalized deals only; parties + admin — amounts stay private) ----
+  let paymentHtml = '';
+  if (paymentGateApplies(deal) && (isOwner || isBuyer || req.user.isAdmin)) {
+    const bd = dealPaymentBreakdown(deal);
+    const paid = deal.payment_status === 'paid';
+    const payRows = db.prepare('SELECT * FROM commission_payments WHERE deal_id = ? ORDER BY id DESC LIMIT 50').all(deal.id);
+    const latestBy = {};
+    for (const r of payRows) { if (!latestBy[r.company_id]) latestBy[r.company_id] = r; }
+    const splitLabel = NEG_SPLITS[bd.split] || bd.split;
+    const shareLine = isFinite(bd.fee)
+      ? `<p style="margin-top:6px">Total commission: <span class="deal-value" style="font-size:1rem">${fmtAmount(bd.fee)} ${esc(bd.cur)}</span>
+          <span class="muted">(${bd.pct}% of deal value · split: <b>${esc(splitLabel)}</b>)</span><br>
+          <span class="muted">Buyer owes ${fmtAmount(bd.buyerShare)} ${esc(bd.cur)} · Seller owes ${fmtAmount(bd.sellerShare)} ${esc(bd.cur)}</span></p>`
+      : `<p class="muted" style="margin-top:6px">Commission: <b>${bd.pct}%</b> of the deal value — split: <b>${esc(splitLabel)}</b>. The administrator confirms the exact amount.</p>`;
+    const partyRow = (cid, label, share, owes) => {
+      if (!cid || !owes) return '';
+      const r = latestBy[cid];
+      const st = r ? paymentBadge(r.status) : '<span class="badge">— no confirmation yet</span>';
+      const meta = r ? `<br><span class="muted">${r.note ? `“${esc(r.note)}” · ` : ''}${esc(r.created_at.slice(0, 16).replace('T', ' '))} UTC</span>` : '';
+      return `<div style="padding:6px 0;border-top:1px dashed var(--border-soft)">${label} <b>${esc(names.get(cid) || 'Unknown')}</b> — ${isFinite(share) ? `${fmtAmount(share)} ${esc(bd.cur)}` : 'amount per instructions'} ${st}${meta}</div>`;
+    };
+    const partiesList = partyRow(bd.buyerId, '🧾 Buyer', bd.buyerShare, bd.buyerOwes)
+      + partyRow(bd.sellerId, '🏷️ Seller', bd.sellerShare, bd.sellerOwes);
+    // Confirm-payment form for the current party (the amount is computed server-side — never sent by the client).
+    let confirmHtml = '';
+    if (!req.user.isAdmin && !paid && (isOwner || isBuyer)) {
+      const myShare = isOwner ? bd.sellerShare : bd.buyerShare;
+      const myOwes = isOwner ? bd.sellerOwes : bd.buyerOwes;
+      const mine = latestBy[req.user.id];
+      if (myOwes) {
+        if (mine && mine.status === 'pending') {
+          confirmHtml = `<p class="muted" style="margin-top:10px">⏳ Your payment confirmation${isFinite(mine.amount) && mine.amount > 0 ? ` of ${fmtAmount(mine.amount)} ${esc(mine.currency)}` : ''} is awaiting admin review.</p>`;
+        } else {
+          confirmHtml = `<hr class="sep">
+          <h4 style="margin-bottom:8px">Confirm your payment (${isFinite(myShare) ? `${fmtAmount(myShare)} ${esc(bd.cur)}` : 'amount per instructions'})</h4>
+          ${mine && mine.status === 'rejected' ? '<p class="flag-note">Your previous confirmation was rejected by the administrator. You can re-confirm once the transfer is made.</p>' : ''}
+          <form method="POST" action="/deal/${deal.id}/payment-confirm">
+            <label>Payment reference / note (optional)</label>
+            <input type="text" name="note" maxlength="300" placeholder="e.g. Bank transfer ref #TRX-12345, sent today">
+            <button class="btn btn-sm btn-green" type="submit">Confirm payment sent</button>
+            <p class="muted" style="margin-top:6px">The administrator verifies the bank transfer and approves — shipment tracking unlocks once all required shares are approved.</p>
+          </form>`;
+        }
+      } else {
+        confirmHtml = '<p class="muted" style="margin-top:10px">Under the agreed split your party owes no commission — the other party’s approved payment unlocks the deal.</p>';
+      }
+    }
+    paymentHtml = `<div class="card vault" data-reveal>
+      <h3>💰 Commission payment ${paid ? '<span class="badge badge-contract">paid ✓</span>' : '<span class="badge badge-sealed">awaiting payment</span>'}</h3>
+      ${shareLine}
+      ${partiesList}
+      <h4 style="margin:12px 0 6px">🏦 Payment instructions (bank transfer)</h4>
+      <p class="muted" style="white-space:pre-wrap">${esc(adminBankDetails())}</p>
+      ${paid ? '<p style="margin-top:10px"><span class="badge badge-contract">Commission fully paid ✓ — shipment tracking is live 🚢</span></p>' : confirmHtml}
+    </div>`;
+  }
+
   // ---- Status & shipment tracking (CIF/CRF only; FOP has no platform tracking) ----
   const isFop = (deal.incoterm || 'CIF') === 'FOP';
   let statusHtml;
@@ -3477,7 +3716,9 @@ app.get('/deal/:id', requireCompanyOrAdmin, async (req, res) => {
       <p style="margin-top:10px">🚚 <b>Tracking:</b> ${deal.tracking_number ? `<span class="deal-num">${esc(deal.tracking_number)}</span>` : ''}
         ${deal.tracking_url ? ` · <a href="${esc(deal.tracking_url)}" rel="noopener noreferrer nofollow">Track shipment →</a>` : ''}</p>` : '';
     const note = deal.status_note ? `<p class="muted" style="margin-top:8px">📝 ${esc(deal.status_note)}</p>` : '';
-    const canUpdate = (isOwner || isBuyer || req.user.isAdmin) && deal.contract_state !== 'approved' && deal.status !== 'closed';
+    // Commission gate: finalized deals stay locked until payment_status='paid'; legacy deals keep the old rule.
+    const canUpdate = (isOwner || isBuyer || req.user.isAdmin)
+      && (paymentGateApplies(deal) ? deal.payment_status === 'paid' : (deal.contract_state !== 'approved' && deal.status !== 'closed'));
     const updateForm = canUpdate ? `
       <hr class="sep">
       <h4 style="margin-bottom:8px">Advance status</h4>
@@ -3505,6 +3746,11 @@ app.get('/deal/:id', requireCompanyOrAdmin, async (req, res) => {
   // Coordinates are geocoded lazily here (first map view), never on deal creation; failures render a placeholder.
   let mapHtml = '', mapHead = '';
   if (!isFop && canViewDealTerms(req.user, deal)) {
+    if (deal.payment_status === 'pending_payment') {
+      // Commission gate: the per-deal map stays hidden behind a lock card until the admin approves payment.
+      mapHtml = `<div class="card map-placeholder" data-reveal><h3>🗺️ Shipment tracking map</h3>
+        <p class="muted" style="margin-top:8px">${PAYMENT_LOCK_MSG}.</p></div>`;
+    } else {
     try {
       const geo = await dealGeo(deal);
       const section = dealMapSection(deal, geo);
@@ -3513,6 +3759,7 @@ app.get('/deal/:id', requireCompanyOrAdmin, async (req, res) => {
     } catch (e) {
       mapHtml = `<div class="card map-placeholder" data-reveal><h3>🗺️ Shipment tracking map</h3>
         <p class="muted" style="margin-top:8px">Map activates once origin &amp; destination are geocoded.</p></div>`;
+    }
     }
   }
 
@@ -3599,6 +3846,7 @@ app.get('/deal/:id', requireCompanyOrAdmin, async (req, res) => {
     ${mediaHtml(deal.media_id)}
     <div class="feed-actions">${signBtn}</div>
   </div>
+  ${paymentHtml}
   ${statusHtml}
   ${mapHtml}
   ${proofHtml}
@@ -3624,7 +3872,12 @@ app.post('/deal/:id/status', (req, res) => {
   if ((deal.incoterm || 'CIF') === 'FOP') {
     return res.redirect(back + '?err=' + encodeURIComponent('FOP terms — shipment tracking is not available on the platform.'));
   }
-  if (deal.contract_state === 'approved' || deal.status === 'closed') {
+  // Commission gate: finalized deals are locked until the admin approves the commission payment.
+  if (deal.payment_status === 'pending_payment') {
+    audit('PAYMENT AGENT', 'status update locked', 'fail', `${user.isAdmin ? 'Admin' : user.name} tried to advance deal ${deal.deal_number || '#' + deal.id} before commission payment approval`);
+    return res.redirect(back + '?err=' + encodeURIComponent(PAYMENT_LOCK_MSG + '.'));
+  }
+  if (!paymentGateApplies(deal) && (deal.contract_state === 'approved' || deal.status === 'closed')) {
     return res.redirect(back + '?err=' + encodeURIComponent('This deal is closed — the contract is finalized.'));
   }
   const newStatus = String(req.body.status || '');
@@ -3647,6 +3900,40 @@ app.post('/deal/:id/status', (req, res) => {
   if (user.isAdmin || isBuyer) notify(deal.company_id, 'deal_status', label, `/deal/${deal.id}`);
   if (user.isAdmin || isOwner) { if (buyerId) notify(buyerId, 'deal_status', label, `/deal/${deal.id}`); }
   res.redirect(back + '?msg=' + encodeURIComponent(`Deal status updated to "${newStatus}".`));
+});
+
+// ----- POST /deal/:id/payment-confirm — a deal party confirms it sent its commission share (bank transfer) -----
+app.post('/deal/:id/payment-confirm', requireCompany, (req, res) => {
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!deal) return res.redirect('/timeline?err=' + encodeURIComponent('Deal not found.'));
+  const back = `/deal/${deal.id}`;
+  if (deal.payment_status !== 'pending_payment') {
+    return res.redirect(back + '?err=' + encodeURIComponent('No commission payment is currently pending for this deal.'));
+  }
+  const bd = dealPaymentBreakdown(deal);
+  const isOwner = req.user.id === deal.company_id;
+  const isBuyer = !!bd.buyerId && bd.buyerId === req.user.id;
+  if (!isOwner && !isBuyer) {
+    audit('PAYMENT AGENT', 'payment confirm guard', 'fail', `${req.user.name} attempted to confirm a commission payment on deal #${deal.id} without being a party`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Parties only</h2><p class="muted">Only the two deal parties can confirm commission payments.</p></div>', req.user));
+  }
+  const myOwes = isOwner ? bd.sellerOwes : bd.buyerOwes;
+  const myShare = isOwner ? bd.sellerShare : bd.buyerShare;
+  if (!myOwes) {
+    return res.redirect(back + '?err=' + encodeURIComponent('Under the agreed split your party owes no commission on this deal.'));
+  }
+  // One pending confirmation per party per deal (re-confirm is allowed after a rejection).
+  const existing = db.prepare(`SELECT id FROM commission_payments WHERE deal_id = ? AND company_id = ? AND status = 'pending'`).get(deal.id, req.user.id);
+  if (existing) {
+    return res.redirect(back + '?err=' + encodeURIComponent('Your payment confirmation is already awaiting admin review.'));
+  }
+  const note = String(req.body.note || '').trim().slice(0, 300);
+  const amount = isFinite(myShare) ? Math.round(myShare * 100) / 100 : 0; // computed server-side — never trusted from the client
+  db.prepare(`INSERT INTO commission_payments (deal_id, private_contract_id, company_id, amount, currency, note, status, created_at)
+              VALUES (?, NULL, ?, ?, ?, ?, 'pending', ?)`)
+    .run(deal.id, req.user.id, amount, bd.cur, note, now());
+  audit('PAYMENT AGENT', 'payment confirmation submitted', 'pass', `${req.user.name} confirmed a commission payment of ${isFinite(myShare) ? `${fmtAmount(amount)} ${bd.cur}` : 'amount TBC'} on deal ${deal.deal_number || '#' + deal.id}${note ? ` — note: ${note}` : ''}`);
+  res.redirect(back + '?msg=' + encodeURIComponent('Payment confirmation submitted — the administrator will verify your transfer and approve it.'));
 });
 
 // ----- POST /deal/:id/request-docs — a non-owner company asks the owner for more documents -----
@@ -5167,8 +5454,37 @@ app.get('/contracts/:id', (req, res) => {
       <a class="btn btn-sm btn-outline" href="/contracts">← Mailbox</a>
     </div>
     ${actions}
-  </div>`;
+  </div>
+  ${pcPaymentCardHtml(pc, user)}`;
   res.send(page('Private contract — ' + pc.title, body, user, req.query.msg, req.query.err, user.isAdmin ? undefined : 'contracts'));
+});
+
+// ----- POST /contracts/:id/payment-confirm — sender/recipient confirms their 50% commission share -----
+app.post('/contracts/:id/payment-confirm', requireCompany, (req, res) => {
+  const pc = getPrivateContract(req.params.id);
+  if (!pc) return res.redirect('/contracts?err=' + encodeURIComponent('Contract not found.'));
+  const back = `/contracts/${pc.id}`;
+  if (pc.status !== 'approved' || !(Number(pc.value) > 0)) {
+    return res.redirect(back + '?err=' + encodeURIComponent('No commission payment is currently pending for this contract.'));
+  }
+  const isParty = req.user.id === pc.sender_company_id || req.user.id === pc.recipient_company_id;
+  if (!isParty) {
+    audit('PAYMENT AGENT', 'payment confirm guard', 'fail', `${req.user.name} attempted to confirm a commission payment on private contract #${pc.id} without being a party`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Parties only</h2><p class="muted">Only the two contract parties can confirm commission payments.</p></div>', req.user));
+  }
+  const existing = db.prepare(`SELECT id FROM commission_payments WHERE private_contract_id = ? AND company_id = ? AND status = 'pending'`).get(pc.id, req.user.id);
+  if (existing) {
+    return res.redirect(back + '?err=' + encodeURIComponent('Your payment confirmation is already awaiting admin review.'));
+  }
+  const pcb = pcPaymentBreakdown(pc);
+  const myShare = req.user.id === pc.sender_company_id ? pcb.senderShare : pcb.recipientShare;
+  const note = String(req.body.note || '').trim().slice(0, 300);
+  const amount = isFinite(myShare) ? Math.round(myShare * 100) / 100 : 0; // computed server-side
+  db.prepare(`INSERT INTO commission_payments (deal_id, private_contract_id, company_id, amount, currency, note, status, created_at)
+              VALUES (NULL, ?, ?, ?, ?, ?, 'pending', ?)`)
+    .run(pc.id, req.user.id, amount, pcb.cur, note, now());
+  audit('PAYMENT AGENT', 'payment confirmation submitted', 'pass', `${req.user.name} confirmed a commission payment of ${isFinite(myShare) ? `${fmtAmount(amount)} ${pcb.cur}` : 'amount TBC'} on private contract #${pc.id}${note ? ` — note: ${note}` : ''}`);
+  res.redirect(back + '?msg=' + encodeURIComponent('Payment confirmation submitted — the administrator will verify your transfer and approve it.'));
 });
 
 // ----- Download the letter as a Word-compatible document -----
@@ -6201,7 +6517,9 @@ const TRACKING_MAP_SCRIPT = `<script>(function(){
 app.get('/tracking', requireCompanyOrAdmin, async (req, res) => {
   let deals = [];
   try {
-    deals = db.prepare(`SELECT * FROM deals WHERE status IN ('dispatched','shipped') AND COALESCE(incoterm, 'CIF') != 'FOP' ORDER BY id DESC LIMIT 200`).all();
+    // Commission gate: deals awaiting commission payment approval never appear on the tracking map
+    // ('none' = legacy/not-yet-finalized deals keep existing behavior; 'paid' = unlocked).
+    deals = db.prepare(`SELECT * FROM deals WHERE status IN ('dispatched','shipped') AND COALESCE(incoterm, 'CIF') != 'FOP' AND COALESCE(payment_status, 'none') != 'pending_payment' ORDER BY id DESC LIMIT 200`).all();
   } catch (e) { deals = []; }
   const markers = [];
   for (const d of deals) {
@@ -6322,12 +6640,17 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
   const commissionText = feeCurrencies.length
     ? feeCurrencies.map(cur => `${esc(cur)} ${fmtAmount(feeByCurrency[cur])}`).join(' · ')
     : '—';
+  // Payments tile: commission collected (approved confirmations) per currency + pending count.
+  const collectedRows = db.prepare(`SELECT currency, SUM(amount) AS s FROM commission_payments WHERE status = 'approved' GROUP BY currency ORDER BY currency`).all();
+  const collectedText = collectedRows.length ? collectedRows.map(r => `${esc(r.currency)} ${fmtAmount(r.s || 0)}`).join(' · ') : '—';
+  const pendingPayCount = count(`SELECT COUNT(*) AS n FROM commission_payments WHERE status = 'pending'`);
   const statsHtml = `<div class="stats">${[
     ['Total companies', stats.companies, ''], ['Pending', stats.pending, ''], ['Approved', stats.approved, ' mint'],
     ['Flagged ⚠️', stats.flagged, ''], ['Deals', stats.deals, ' gold'], ['Contracts pending', stats.contractsPending, ' gold'],
     ['Follows', stats.follows, '']
   ].map(([l, n, cls], ti) => `<div class="stat js-tilt" data-reveal style="--i:${Math.min(ti, 8)}"><div class="num${cls}" data-count="${n}">${n}</div><div class="lbl">${l}</div></div>`).join('')}
-    <div class="stat js-tilt" data-reveal style="--i:7"><div class="num gold" style="font-size:1.15rem;line-height:1.4">${commissionText}</div><div class="lbl">Platform commission (approved deals) · ${feePct}%</div></div></div>`;
+    <div class="stat js-tilt" data-reveal style="--i:7"><div class="num gold" style="font-size:1.15rem;line-height:1.4">${commissionText}</div><div class="lbl">Platform commission (approved deals) · ${feePct}%</div></div>
+    <div class="stat js-tilt" data-reveal style="--i:8"><div class="num gold" style="font-size:1.15rem;line-height:1.4">${collectedText}</div><div class="lbl">💰 Commission collected · ${pendingPayCount} payment${pendingPayCount === 1 ? '' : 's'} pending</div></div></div>`;
 
   // Pending companies queue (with ONBOARDING AGENT flags + KYC documents reviewed inline)
   const pending = db.prepare(`SELECT * FROM companies WHERE status = 'pending' ORDER BY created_at ASC`).all();
@@ -6410,6 +6733,38 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
   });
   const negsTableHtml = negRows.length ? negRows.join('') : '<tr><td colspan="4" class="muted">No negotiations awaiting final approval. Negotiations land here once both parties agree the commission split.</td></tr>';
 
+  // 💰 Commission payments — pending party confirmations awaiting admin verification (bank transfer).
+  const pendingPayments = db.prepare(`SELECT * FROM commission_payments WHERE status = 'pending' ORDER BY created_at ASC LIMIT 100`).all();
+  const paymentRows = pendingPayments.map(p => {
+    let ref;
+    if (p.deal_id) {
+      const d = db.prepare('SELECT title, deal_number FROM deals WHERE id = ?').get(p.deal_id);
+      ref = d
+        ? `<a href="/deal/${p.deal_id}"><b>${esc(d.title)}</b></a> <span class="muted">№ ${esc(d.deal_number || String(p.deal_id))}</span>`
+        : `<span class="muted">(deal #${p.deal_id} removed)</span>`;
+    } else {
+      const pcRow = db.prepare('SELECT title FROM private_contracts WHERE id = ?').get(p.private_contract_id);
+      ref = pcRow
+        ? `<a href="/contracts/${p.private_contract_id}"><b>${esc(pcRow.title)}</b></a> <span class="badge badge-sealed">Private contract #${p.private_contract_id}</span>`
+        : `<span class="muted">(private contract #${p.private_contract_id} removed)</span>`;
+    }
+    return `<tr>
+      <td>${ref}</td>
+      <td>${esc(names.get(p.company_id) || '?')}</td>
+      <td><b>${fmtAmount(p.amount)} ${esc(p.currency)}</b></td>
+      <td class="muted">${p.note ? esc(p.note) : '—'}</td>
+      <td class="muted" style="white-space:nowrap">${esc(p.created_at.slice(0, 16).replace('T', ' '))}</td>
+      <td style="white-space:nowrap">
+        <form method="POST" action="/admin/payments/${p.id}/approve" style="display:inline"><button class="btn btn-sm btn-green">Approve</button></form>
+        <form method="POST" action="/admin/payments/${p.id}/reject" style="display:inline-flex;gap:4px;align-items:center">
+          <input type="text" name="reason" maxlength="200" placeholder="Reason (optional)" style="max-width:150px;padding:4px 8px;font-size:12px">
+          <button class="btn btn-sm btn-danger">Reject</button>
+        </form>
+      </td>
+    </tr>`;
+  });
+  const paymentsTableHtml = paymentRows.length ? paymentRows.join('') : '<tr><td colspan="6" class="muted">No payment confirmations awaiting review. Parties confirm their bank transfers from the deal page.</td></tr>';
+
   // All companies (suspend / reactivate / delete / reputation / research)
   const allCompanies = db.prepare('SELECT * FROM companies ORDER BY created_at DESC LIMIT 100').all();
   const companiesHtml = allCompanies.map(c => {
@@ -6460,6 +6815,9 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
     <table><tr><th>Deal</th><th>Parties</th><th>Signed at</th><th>Actions</th></tr>${contractsHtml}</table></div>
   <div class="card" data-reveal><h3>🤝 Pending negotiations — final approval (commission split)</h3>
     <table><tr><th>Deal</th><th>Parties</th><th>Split &amp; commission</th><th>Actions</th></tr>${negsTableHtml}</table></div>
+  <div class="card" data-reveal><h3>💰 Commission payments ${pendingPayCount ? `<span class="badge badge-sealed">${pendingPayCount} pending</span>` : ''}</h3>
+    <p class="muted" style="margin-bottom:8px">Verify each bank transfer, then approve. A deal's shipment tracking unlocks once every required share (per the agreed split) is approved.</p>
+    <table><tr><th>Deal / contract</th><th>Company</th><th>Amount</th><th>Note</th><th>Date (UTC)</th><th>Actions</th></tr>${paymentsTableHtml}</table></div>
   <div class="card" data-reveal><h3>All companies</h3>
     <table><tr><th>Company</th><th>Status</th><th>Reputation</th><th>Actions</th></tr>${companiesHtml}</table></div>
   <div class="card" data-reveal><h3>All deals</h3>
@@ -6477,6 +6835,13 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
       <input type="number" name="platform_fee_pct" min="0.1" max="20" step="0.1" value="${feePct}" required>
       <button class="btn btn-sm" type="submit">Update commission</button>
       <p class="muted" style="margin-top:8px">Between 0.1% and 20%. Applied immediately to deal pages, contracts, documents and the commission tile. Changes are audit-logged.</p>
+    </form>
+    <hr class="sep">
+    <form method="POST" action="/admin/settings/bank-details" style="max-width:480px">
+      <label>Commission payment instructions (bank details)</label>
+      <textarea name="admin_bank_details" rows="4" maxlength="1000" placeholder="e.g. Dealzoin Ltd · IBAN DE00 1234 5678 9000 0000 00 · SWIFT DEUTDEFF · Reference: deal number">${esc((db.prepare('SELECT value FROM settings WHERE key = ?').get('admin_bank_details') || {}).value || '')}</textarea>
+      <button class="btn btn-sm" type="submit">Update bank details</button>
+      <p class="muted" style="margin-top:8px">Shown to both parties on the commission payment card of every finalized deal and private contract. Save an empty field to restore the default note.</p>
     </form></div>
   <div class="card" data-reveal><h3>🤖 Agent activity (latest 50)</h3>
     <table><tr><th>Time (UTC)</th><th>Agent</th><th>Action</th><th>Result</th><th>Details</th></tr>${auditHtml}</table></div>`;
@@ -6526,6 +6891,7 @@ function wipeCompanyData(id) {
       db.prepare('DELETE FROM contracts WHERE deal_id = ?').run(d);
       db.prepare('DELETE FROM counter_offers WHERE deal_id = ?').run(d);
       db.prepare('DELETE FROM deal_documents WHERE deal_id = ?').run(d);
+      db.prepare('DELETE FROM commission_payments WHERE deal_id = ?').run(d);
     }
     for (const p of postIds) {
       db.prepare(`DELETE FROM likes WHERE target_type = 'post' AND target_id = ?`).run(p);
@@ -6541,6 +6907,7 @@ function wipeCompanyData(id) {
     db.prepare('DELETE FROM private_contracts WHERE sender_company_id = ? OR recipient_company_id = ?').run(id, id);
     db.prepare('DELETE FROM counter_offers WHERE from_company_id = ?').run(id);
     db.prepare('DELETE FROM notifications WHERE company_id = ?').run(id);
+    db.prepare('DELETE FROM commission_payments WHERE company_id = ?').run(id);
     db.prepare('DELETE FROM sessions WHERE company_id = ?').run(id);
     db.prepare('DELETE FROM verification_codes WHERE company_id = ?').run(id);
     db.prepare('DELETE FROM media WHERE company_id = ?').run(id);
@@ -6801,6 +7168,7 @@ app.post('/admin/deals/:id/delete', requireAdmin, (req, res) => {
     db.prepare('DELETE FROM contracts WHERE deal_id = ?').run(d.id);
     db.prepare('DELETE FROM counter_offers WHERE deal_id = ?').run(d.id);
     db.prepare('DELETE FROM deal_documents WHERE deal_id = ?').run(d.id);
+    db.prepare('DELETE FROM commission_payments WHERE deal_id = ?').run(d.id);
     db.prepare('DELETE FROM deals WHERE id = ?').run(d.id);
   });
   wipe();
@@ -6819,17 +7187,28 @@ app.post('/admin/contracts/:id/approve', requireAdmin, (req, res) => {
   // 1) Mark the deal as approved, record the signing party on the deal, and close the status pipeline.
   const signer = db.prepare('SELECT name FROM companies WHERE id = ?').get(ct.signer_company_id);
   const party = signer ? signer.name : 'Unknown';
-  const dealRow = db.prepare('SELECT title FROM deals WHERE id = ?').get(ct.deal_id);
+  const dealRow = db.prepare('SELECT title, value, currency FROM deals WHERE id = ?').get(ct.deal_id);
   const dealTitle = dealRow ? dealRow.title : 'deal #' + ct.deal_id;
-  db.prepare(`UPDATE deals SET contract_state = 'approved', contract_party = ?, contract_party_id = ?, status = 'closed' WHERE id = ?`)
-    .run(party, ct.signer_company_id, ct.deal_id);
+  // Commission payment gate: freeze the fee (platform % × deal value) + default 50-50 split on the deal.
+  const pct = platformFeePct();
+  const cur = (dealRow && dealRow.currency) || 'USD';
+  const valNum = parseDealValue(dealRow && dealRow.value);
+  const fee = isFinite(valNum) && valNum > 0 ? Math.round(valNum * pct) / 100 : null; // pct/100 × value, 2dp
+  db.prepare(`UPDATE deals SET contract_state = 'approved', contract_party = ?, contract_party_id = ?, status = 'closed',
+              payment_status = 'pending_payment', payment_split = '50-50', payment_fee = ?, payment_currency = ? WHERE id = ?`)
+    .run(party, ct.signer_company_id, fee, cur, ct.deal_id);
   // 2) Approved contracts are archived: the row is deleted; the deal carries the state.
   db.prepare('DELETE FROM contracts WHERE id = ?').run(ct.id);
   // TODO PHASE 3 — PAYMENT-ESCROW AGENT: when admin approves a contract, hook Stripe escrow initiation here (create escrow, notify both parties, release funds on delivery confirmation). Not implemented in this version.
+  // NOTE: the manual-confirmation flow below (commission_payments + /admin/payments approve/reject) is the interim gate — it will be replaced by Stripe webhook auto-approval.
   audit('CONTRACT AGENT', 'admin approve contract', 'pass', `Contract #${ct.id} (deal #${ct.deal_id}) approved by admin — deal marked approved (party: ${party}); contract record archived (deleted)`);
+  audit('PAYMENT AGENT', 'payment gate opened', 'pass', `Deal #${ct.deal_id} enters pending_payment — ${fee != null ? `${fmtAmount(fee)} ${cur}` : `${pct}% of deal value`} due (50 / 50 shared)`);
   // Both parties are notified when the deal is finalized.
   notify(ct.signer_company_id, 'contract_approved', `Final approval granted — your contract on "${dealTitle}" is finalized. Deal closed! 🎉`, `/deal/${ct.deal_id}`);
   notify(ct.owner_company_id, 'contract_approved', `Final approval granted — the contract with ${party} on "${dealTitle}" is finalized. Deal closed! 🎉`, `/deal/${ct.deal_id}`);
+  const dueMsg = commissionDueMessage(fee != null ? `${fmtAmount(fee)} ${cur}` : `${pct}% of the deal value`, NEG_SPLITS['50-50'], 'Deal');
+  notify(ct.signer_company_id, 'payment_due', dueMsg, `/deal/${ct.deal_id}`);
+  notify(ct.owner_company_id, 'payment_due', dueMsg, `/deal/${ct.deal_id}`);
   res.redirect('/admin/dashboard?msg=' + encodeURIComponent('Contract approved and archived. The deal now shows its finalized state.'));
 });
 app.post('/admin/contracts/:id/reject', requireAdmin, (req, res) => {
@@ -6858,6 +7237,15 @@ app.post('/admin/private-contracts/:id/approve', requireAdmin, (req, res) => {
   audit('CONTRACT AGENT', 'admin approve private contract', 'pass', `Private contract #${pc.id} "${pc.title}" (${names.get(pc.sender_company_id) || '?'} ⇄ ${names.get(pc.recipient_company_id) || '?'}) approved by admin — kept on file in both mailboxes`);
   notify(pc.sender_company_id, 'private_contract_approved', `Final approval granted — your private contract "${pc.title}" is finalized. 🎉`, `/contracts/${pc.id}`);
   notify(pc.recipient_company_id, 'private_contract_approved', `Final approval granted — the private contract "${pc.title}" is finalized. 🎉`, `/contracts/${pc.id}`);
+  // Commission payment gate: private contracts have no deal row (and no shipment tracking), so the
+  // gate lives on the contract page — both parties owe half (50 / 50) and confirm from /contracts/:id.
+  const pcb = pcPaymentBreakdown(pc);
+  if (isFinite(pcb.fee) && pcb.fee > 0) {
+    const dueMsg = commissionDueMessage(`${fmtAmount(pcb.fee)} ${pcb.cur}`, NEG_SPLITS['50-50'], 'Contract');
+    notify(pc.sender_company_id, 'payment_due', dueMsg, `/contracts/${pc.id}`);
+    notify(pc.recipient_company_id, 'payment_due', dueMsg, `/contracts/${pc.id}`);
+    audit('PAYMENT AGENT', 'payment gate opened', 'pass', `Private contract #${pc.id} "${pc.title}" — ${fmtAmount(pcb.fee)} ${pcb.cur} due (50 / 50 shared)`);
+  }
   postCongrats(pc.title, '', names.get(pc.sender_company_id) || 'Sender', names.get(pc.recipient_company_id) || 'Recipient');
   res.redirect('/admin/dashboard?msg=' + encodeURIComponent('Private contract approved and kept on file.'));
 });
@@ -6907,6 +7295,56 @@ app.post('/admin/settings/commission', requireAdmin, (req, res) => {
   res.redirect('/admin/dashboard?msg=' + encodeURIComponent(`Platform commission updated from ${old}% to ${rounded}%.`));
 });
 
+// ----- Platform settings: commission payment instructions (bank details shown to both parties) -----
+app.post('/admin/settings/bank-details', requireAdmin, (req, res) => {
+  const v = String(req.body.admin_bank_details || '').trim().slice(0, 1000);
+  db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+    .run('admin_bank_details', v);
+  audit('ADMIN', 'bank details change', 'pass', v ? 'Commission payment bank details updated' : 'Commission payment bank details reset to default');
+  res.redirect('/admin/dashboard?msg=' + encodeURIComponent(v ? 'Bank details updated — shown on all commission payment cards.' : 'Bank details reset to the default note.'));
+});
+
+// ----- Commission payment review: approve a party's bank-transfer confirmation -----
+app.post('/admin/payments/:id/approve', requireAdmin, (req, res) => {
+  const p = db.prepare('SELECT * FROM commission_payments WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!p) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Payment confirmation not found.'));
+  if (p.status !== 'pending') return res.redirect('/admin/dashboard?err=' + encodeURIComponent('This payment confirmation was already decided.'));
+  db.prepare(`UPDATE commission_payments SET status = 'approved', decided_at = ? WHERE id = ?`).run(now(), p.id);
+  const who = db.prepare('SELECT name FROM companies WHERE id = ?').get(p.company_id);
+  const whoName = who ? who.name : 'company #' + p.company_id;
+  const ref = p.deal_id ? `deal #${p.deal_id}` : `private contract #${p.private_contract_id}`;
+  audit('PAYMENT AGENT', 'payment approved', 'pass', `Commission payment #${p.id} approved — ${whoName}, ${fmtAmount(p.amount)} ${p.currency} (${ref})`);
+  let completed = false;
+  if (p.deal_id) {
+    completed = maybeCompleteDealPayment(p.deal_id);
+    const deal = db.prepare('SELECT title, deal_number FROM deals WHERE id = ?').get(p.deal_id);
+    notify(p.company_id, 'payment_approved', `Your commission payment of ${fmtAmount(p.amount)} ${p.currency} on "${deal ? deal.title : 'deal #' + p.deal_id}" was approved by the administrator.${completed ? ' Shipment tracking is now live 🚢' : ''}`, `/deal/${p.deal_id}`);
+  } else {
+    completed = maybeCompletePcPayment(p.private_contract_id);
+    const pcRow = db.prepare('SELECT title FROM private_contracts WHERE id = ?').get(p.private_contract_id);
+    notify(p.company_id, 'payment_approved', `Your commission payment of ${fmtAmount(p.amount)} ${p.currency} on private contract "${pcRow ? pcRow.title : '#' + p.private_contract_id}" was approved by the administrator.`, `/contracts/${p.private_contract_id}`);
+  }
+  res.redirect('/admin/dashboard?msg=' + encodeURIComponent(completed
+    ? 'Payment approved — ALL required shares are now settled. Shipment tracking is live and both parties were notified.'
+    : 'Payment approved. Waiting for the other party’s confirmation before tracking unlocks.'));
+});
+
+// ----- Commission payment review: reject a confirmation (optional reason, party may re-confirm) -----
+app.post('/admin/payments/:id/reject', requireAdmin, (req, res) => {
+  const p = db.prepare('SELECT * FROM commission_payments WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!p) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Payment confirmation not found.'));
+  if (p.status !== 'pending') return res.redirect('/admin/dashboard?err=' + encodeURIComponent('This payment confirmation was already decided.'));
+  const reason = String(req.body.reason || '').trim().slice(0, 200);
+  db.prepare(`UPDATE commission_payments SET status = 'rejected', decided_at = ? WHERE id = ?`).run(now(), p.id);
+  const who = db.prepare('SELECT name FROM companies WHERE id = ?').get(p.company_id);
+  const whoName = who ? who.name : 'company #' + p.company_id;
+  const ref = p.deal_id ? `deal #${p.deal_id}` : `private contract #${p.private_contract_id}`;
+  audit('PAYMENT AGENT', 'payment rejected', 'fail', `Commission payment #${p.id} rejected — ${whoName}, ${fmtAmount(p.amount)} ${p.currency} (${ref})${reason ? ` — reason: ${reason}` : ''}`);
+  const link = p.deal_id ? `/deal/${p.deal_id}` : `/contracts/${p.private_contract_id}`;
+  notify(p.company_id, 'payment_rejected', `Your commission payment confirmation of ${fmtAmount(p.amount)} ${p.currency} was rejected by the administrator${reason ? `: ${reason}` : ''}. You can re-confirm once the transfer is made.`, link);
+  res.redirect('/admin/dashboard?msg=' + encodeURIComponent('Payment confirmation rejected — the party was notified and may re-confirm.'));
+});
+
 // ----- Admin final approval for negotiations (split + amounts shown in the queue) -----
 app.post('/admin/negotiations/:id/approve', requireAdmin, (req, res) => {
   const neg = getNegotiation(req.params.id);
@@ -6926,8 +7364,11 @@ app.post('/admin/negotiations/:id/approve', requireAdmin, (req, res) => {
     : ` The ${f.pct}% platform commission (${splitLabel}) is due before deal processing.`;
   const finalize = db.transaction(() => {
     // 1) Mark the deal as approved, record the buyer on the deal, close the status pipeline.
-    db.prepare(`UPDATE deals SET contract_state = 'approved', contract_party = ?, contract_party_id = ?, status = 'closed' WHERE id = ?`)
-      .run(buyerName, neg.buyer_id, neg.deal_id);
+    //    The commission payment gate opens here: payment_status flips 'none' → 'pending_payment'
+    //    and the fee/split are frozen on the deal (later fee-pct changes never rewrite them).
+    db.prepare(`UPDATE deals SET contract_state = 'approved', contract_party = ?, contract_party_id = ?, status = 'closed',
+                payment_status = 'pending_payment', payment_split = ?, payment_fee = ?, payment_currency = ? WHERE id = ?`)
+      .run(buyerName, neg.buyer_id, f.split, isFinite(f.fee) ? Math.round(f.fee * 100) / 100 : null, f.cur, neg.deal_id);
     // 2) Archive the signature record (same pattern as the legacy contract queue).
     db.prepare('DELETE FROM contracts WHERE negotiation_id = ?').run(neg.id);
     // 3) Close the negotiation.
@@ -6935,9 +7376,13 @@ app.post('/admin/negotiations/:id/approve', requireAdmin, (req, res) => {
   });
   finalize();
   negEvent(neg.id, null, 'admin_approved', { note: `Split: ${splitLabel}` });
-  audit('CONTRACT AGENT', 'admin approve negotiation', 'pass', `Negotiation #${neg.id} (deal ${deal ? deal.deal_number || deal.id : neg.deal_id}) approved by admin — DONE. Split: ${splitLabel}.${isFinite(f.fee) ? ` Fee ${fmtAmount(f.fee)} ${f.cur} (buyer ${fmtAmount(f.buyer)}, seller ${fmtAmount(f.seller)}).` : ''}`);
+  audit('CONTRACT AGENT', 'admin approve negotiation', 'pass', `Negotiation #${neg.id} (deal ${deal ? deal.deal_number || deal.id : neg.deal_id}) approved by admin — DONE. Split: ${splitLabel}.${isFinite(f.fee) ? ` Fee ${fmtAmount(f.fee)} ${f.cur} (buyer ${fmtAmount(f.buyer)}, seller ${fmtAmount(f.seller)}).` : ''} Commission payment gate opened.`);
+  audit('PAYMENT AGENT', 'payment gate opened', 'pass', `Deal ${deal ? (deal.deal_number || '#' + deal.id) : '#' + neg.deal_id} enters pending_payment — ${isFinite(f.fee) ? `${fmtAmount(f.fee)} ${f.cur}` : `${f.pct}% of deal value`} due (${splitLabel})`);
   notify(neg.buyer_id, 'deal_closed', `Final approval granted — "${dealTitle}" is finalized. Deal closed! 🎉${feeNote}`, `/negotiation/${neg.id}`);
   notify(neg.seller_id, 'deal_closed', `Final approval granted — "${dealTitle}" is finalized. Deal closed! 🎉${feeNote}`, `/negotiation/${neg.id}`);
+  const dueMsg = commissionDueMessage(isFinite(f.fee) ? `${fmtAmount(f.fee)} ${f.cur}` : `${f.pct}% of the deal value`, splitLabel, 'Deal');
+  notify(neg.buyer_id, 'payment_due', dueMsg, `/deal/${neg.deal_id}`);
+  notify(neg.seller_id, 'payment_due', dueMsg, `/deal/${neg.deal_id}`);
   postCongrats(dealTitle, deal ? (deal.deal_number || '') : '', sellerName, buyerName);
   res.redirect('/admin/dashboard?msg=' + encodeURIComponent('Negotiation approved — deal closed, both parties notified, congratulations posted.'));
 });
