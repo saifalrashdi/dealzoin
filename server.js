@@ -1157,70 +1157,73 @@ function sendVerificationCode(email, code) {
 }
 
 // ============================= HTML LAYOUT & CSS =============================
-// "The Gilded Ledger" theme (BRAND2) — Midnight Floor dark / Day Ledger light.
-// Craft layers: reeded coin edges, banknote guilloché, sealed-letter mailbox.
+// "Titan Ledger" theme (TITAN.md) — Midnight Trading Floor dark / Paper Exchange light.
+// Craft layers: reeded coin edges, banknote guilloché, sealed-letter mailbox, corner-cut numbered cards.
 const CSS = `
-  :root {
-    --bg-void:       #0A0912;
-    --bg-elevated:   #0F0D19;
-    --bg-spotlight:  #1B1929;
-    --surface-card:  #15131F;
-    --surface-deal:  linear-gradient(165deg, #1E1A30 0%, #14121E 55%, #171322 100%);
-    --gold:          #F5B942;
-    --gold-deep:     #C98A1E;
-    --gold-glow:     rgba(245,185,66,0.16);
+  :root, [data-theme="dark"] {
+    --bg-void:       #0D1321;
+    --bg-elevated:   #0F1728;
+    --bg-spotlight:  #16203A;
+    --surface-card:  #141D31;
+    --surface-deal:  linear-gradient(165deg, #1A2745 0%, #131C30 55%, #16203A 100%);
+    --gold:          #F58A3A;
+    --gold-deep:     #D0611C;
+    --gold-glow:     rgba(245,138,58,0.16);
     --mint:          #3FE0B0;
     --mint-deep:     #1FAF85;
-    --ink-primary:   #F5F0E4;
-    --ink-muted:     #A39FB2;
-    --ink-faint:     #5C5A6B;
+    --ink-primary:   #F4F1E8;
+    --ink-muted:     #A3ACC2;
+    --ink-faint:     #6E7A95;
     --success:       #3FE0B0;
     --warning:       #FFB454;
-    --danger:        #FF5C7A;
+    --danger:        #FF6B85;
     --danger-deep:   #C93A56;
-    --border-soft:   #262438;
-    --border-gold:   rgba(245,185,66,0.38);
-    --gradient-coin: linear-gradient(120deg, #F5B942 0%, #FFE1A0 45%, #C98A1E 100%);
-    --gold-bright:   #FFD97A;
-    --on-gold:       #241A05;
+    --border-soft:   #24304A;
+    --border-gold:   rgba(245,138,58,0.38);
+    --gradient-coin: linear-gradient(120deg, #F08A3C 0%, #FFB37A 45%, #D0611C 100%);
+    --gold-bright:   #FFB37A;
+    --on-gold:       #160E04;
     --on-mint:       #FFF7F0;
     --on-danger:     #FFF7F0;
-    --bg-glow:       radial-gradient(1200px 600px at 50% -10%, rgba(245,185,66,0.07), transparent 60%);
-    --nav-bg:        rgba(10,9,18,0.85);
-    --media-bg:      #0A0912;
-    --row-hover:     rgba(27,25,41,0.5);
-    --bubble-mine-bg: linear-gradient(160deg, #33280F 0%, #231B0B 100%);
-    --bubble-theirs-bg: #1E1B2D;
+    --bg-glow:       radial-gradient(1200px 600px at 50% -10%, rgba(232,119,42,0.08), transparent 60%);
+    --nav-bg:        rgba(13,19,33,0.85);
+    --media-bg:      #0A0F1C;
+    --row-hover:     rgba(22,32,58,0.55);
+    --bubble-mine-bg: linear-gradient(160deg, #3A2412 0%, #241708 100%);
+    --bubble-theirs-bg: #1A2438;
     --card-shadow:        0 10px 34px rgba(0,0,0,0.50);
     --card-shadow-hover:  0 16px 44px rgba(0,0,0,0.55);
-    --card-inset:         inset 0 1px 0 rgba(255,217,122,0.10);
-    --input-bg:      #12101C;
-    --input-border:  #2A2840;
+    --card-inset:         inset 0 1px 0 rgba(255,179,122,0.12);
+    --input-bg:      #101828;
+    --input-border:  #2A3852;
     --ok-bg:         rgba(63,224,176,0.12);
     --ok-border:     rgba(63,224,176,0.4);
     --ok-badge-bg:   rgba(63,224,176,0.13);
     --ok-badge-border: rgba(63,224,176,0.3);
-    --err-bg:        rgba(255,92,122,0.12);
-    --err-border:    rgba(255,92,122,0.4);
-    --err-badge-border: rgba(255,92,122,0.3);
+    --err-bg:        rgba(255,107,133,0.12);
+    --err-border:    rgba(255,107,133,0.4);
+    --err-badge-border: rgba(255,107,133,0.3);
     --warn-bg:       rgba(255,180,84,0.13);
     --warn-border:   rgba(255,180,84,0.35);
     --warn-badge-border: rgba(255,180,84,0.3);
-    --badge-flag-bg: rgba(255,92,122,0.12);
-    --badge-flag-fg: #FF7A92;
-    --gold-shadow-sm: 0 2px 12px rgba(245,185,66,0.35);
-    --gold-shadow-md: 0 4px 18px rgba(245,185,66,0.28);
-    --gold-shadow-lg: 0 8px 26px rgba(245,185,66,0.42);
-    --gold-shadow-plus: 0 4px 18px rgba(245,185,66,0.35);
-    --gold-shadow-plus-hover: 0 8px 26px rgba(245,185,66,0.5);
-    --shadow-gold:   0 6px 24px rgba(245,185,66,0.28);
+    --badge-flag-bg: rgba(255,107,133,0.12);
+    --badge-flag-fg: #FF8FA3;
+    --gold-shadow-sm: 0 2px 12px rgba(232,119,42,0.35);
+    --gold-shadow-md: 0 4px 18px rgba(232,119,42,0.28);
+    --gold-shadow-lg: 0 8px 26px rgba(232,119,42,0.42);
+    --gold-shadow-plus: 0 4px 18px rgba(232,119,42,0.35);
+    --gold-shadow-plus-hover: 0 8px 26px rgba(232,119,42,0.5);
+    --shadow-gold:   0 6px 24px rgba(232,119,42,0.28);
+    --ghost-num:     rgba(244,241,232,0.06); /* giant ghost numbers (decorative) */
+    --hero-ink:      #F4F1E8;                /* headline ink on the navy hero (both themes) */
     --font-display: "Space Grotesk", "Segoe UI", system-ui, sans-serif;
     --font-body:    "Inter", -apple-system, "Segoe UI", Roboto, sans-serif;
-    /* Theme-agnostic craft layers (BRAND2) */
-    --coin-reed:     repeating-linear-gradient(90deg, rgba(0,0,0,0.22) 0 2px, transparent 2px 5px);
-    --guilloche:     repeating-radial-gradient(circle at 50% -60%, transparent 0 7px, rgba(140,110,40,0.06) 7px 8px);
+    /* Theme-agnostic craft layers */
+    --coin-reed:     repeating-linear-gradient(90deg, rgba(0,0,0,0.20) 0 2px, transparent 2px 5px);
+    --guilloche:     repeating-radial-gradient(circle at 50% -60%, transparent 0 7px, rgba(168,73,11,0.06) 7px 8px);
     --radius-card:   16px;
     --radius-ctl:    10px;
+    --cut:           24px; /* signature corner cut */
     /* KINETIC physics system — 6 named easings */
     --ez-out:     cubic-bezier(.16,1,.3,1);     /* ENTRANCES — fast attack, long silk settle */
     --ez-spring:  cubic-bezier(.34,1.56,.64,1); /* POPS — overshoot: likes, badges, magnet release */
@@ -1229,43 +1232,43 @@ const CSS = `
     --ez-release: cubic-bezier(.22,1.4,.36,1);  /* RELEASE — small settle bounce */
     --ez-drift:   cubic-bezier(.45,0,.55,1);    /* AMBIENT LOOPS — symmetric, seamless */
   }
-  /* Light theme — "Day Ledger": 100% beige-family parchment, espresso ink, darkened bullion gold. No white anywhere. */
+  /* Light theme — "Paper Exchange": warm paper (never pure white), navy ink, orange signature. */
   [data-theme="light"] {
-    --bg-void:       #ECE2CB;
-    --bg-elevated:   #E2D6B8;
-    --bg-spotlight:  #EFE6CD;
-    --surface-card:  #F5EEDA;
-    --surface-deal:  linear-gradient(165deg, #F9F2DE 0%, #F1E7CC 55%, #F5EBD2 100%);
-    --gold:          #8A5C08;
-    --gold-deep:     #6E4A05;
-    --gold-glow:     rgba(138,92,8,0.14);
+    --bg-void:       #F4EEE0;
+    --bg-elevated:   #ECE3D0;
+    --bg-spotlight:  #F8F3E8;
+    --surface-card:  #FBF7EE;
+    --surface-deal:  linear-gradient(165deg, #FCF8EF 0%, #F3EBDA 55%, #F7F0E0 100%);
+    --gold:          #A8490B;
+    --gold-deep:     #8A3D08;
+    --gold-glow:     rgba(168,73,11,0.14);
     --mint:          #0B7A58;
     --mint-deep:     #0B6B4E;
-    --ink-primary:   #2B2114;
-    --ink-muted:     #6E6046;
-    --ink-faint:     #8B8574;
+    --ink-primary:   #101A2E;
+    --ink-muted:     #54607A;
+    --ink-faint:     #7A8296;
     --success:       #0B7A58;
     --warning:       #8F5200;
     --danger:        #C22A47;
     --danger-deep:   #A31F3C;
-    --border-soft:   #D8CBA6;
-    --border-gold:   rgba(138,92,8,0.45);
-    --gradient-coin: linear-gradient(120deg, #D9A02B 0%, #F0C668 45%, #A9760F 100%);
-    --gold-bright:   #6E4A05;
-    --on-gold:       #241A05;
+    --border-soft:   #DED4BC;
+    --border-gold:   rgba(168,73,11,0.45);
+    --gradient-coin: linear-gradient(120deg, #E8772A 0%, #F59A55 45%, #C75E1A 100%);
+    --gold-bright:   #8A3D08;
+    --on-gold:       #160E04;
     --on-mint:       #FFF7F0;
     --on-danger:     #FFF7F0;
-    --bg-glow:       radial-gradient(1200px 600px at 50% -10%, rgba(138,92,8,0.06), transparent 60%);
-    --nav-bg:        rgba(236,226,203,0.88);
-    --media-bg:      #11111C;
-    --row-hover:     rgba(74,56,20,0.06);
-    --bubble-mine-bg: linear-gradient(160deg, #F3DFA6 0%, #EBD18C 100%);
-    --bubble-theirs-bg: #F5EEDA;
-    --card-shadow:        0 10px 28px rgba(74,56,20,0.14);
-    --card-shadow-hover:  0 16px 36px rgba(74,56,20,0.16);
-    --card-inset:         inset 0 1px 0 rgba(255,255,255,0.6);
-    --input-bg:      #F9F3E2;
-    --input-border:  #CDBF97;
+    --bg-glow:       radial-gradient(1200px 600px at 50% -10%, rgba(232,119,42,0.07), transparent 60%);
+    --nav-bg:        rgba(251,247,238,0.88);
+    --media-bg:      #0D1321;
+    --row-hover:     rgba(16,26,46,0.05);
+    --bubble-mine-bg: linear-gradient(160deg, #F9DFC0 0%, #F3CD9E 100%);
+    --bubble-theirs-bg: #F8F3E8;
+    --card-shadow:        0 10px 28px rgba(16,26,46,0.12);
+    --card-shadow-hover:  0 16px 36px rgba(16,26,46,0.16);
+    --card-inset:         inset 0 1px 0 rgba(255,255,255,0.5);
+    --input-bg:      #FDFAF3;
+    --input-border:  #CFC3A4;
     --ok-bg:         rgba(11,122,88,0.10);
     --ok-border:     rgba(11,122,88,0.4);
     --ok-badge-bg:   #DFF0E4;
@@ -1278,22 +1281,24 @@ const CSS = `
     --warn-badge-border: rgba(122,78,0,0.4);
     --badge-flag-bg: #F6DDE2;
     --badge-flag-fg: #A31F3C;
-    --gold-shadow-sm: 0 2px 12px rgba(138,92,8,0.25);
-    --gold-shadow-md: 0 4px 18px rgba(138,92,8,0.18);
-    --gold-shadow-lg: 0 8px 26px rgba(138,92,8,0.30);
-    --gold-shadow-plus: 0 4px 18px rgba(138,92,8,0.25);
-    --gold-shadow-plus-hover: 0 8px 26px rgba(138,92,8,0.38);
-    --shadow-gold:   0 6px 22px rgba(138,92,8,0.28);
+    --gold-shadow-sm: 0 2px 12px rgba(168,73,11,0.22);
+    --gold-shadow-md: 0 4px 18px rgba(168,73,11,0.18);
+    --gold-shadow-lg: 0 8px 26px rgba(168,73,11,0.28);
+    --gold-shadow-plus: 0 4px 18px rgba(168,73,11,0.22);
+    --gold-shadow-plus-hover: 0 8px 26px rgba(168,73,11,0.34);
+    --shadow-gold:   0 6px 22px rgba(168,73,11,0.26);
+    --ghost-num:     rgba(16,26,46,0.07);
+    --hero-ink:      #F4F1E8;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background-color: var(--bg-void); background-image: var(--bg-glow); background-attachment: fixed; background-repeat: no-repeat; color: var(--ink-primary); font-family: var(--font-body); font-size: 16px; line-height: 1.6; min-height: 100vh; }
+  body { background-color: var(--bg-void); background-image: var(--bg-glow); background-attachment: fixed; background-repeat: no-repeat; color: var(--ink-primary); font-family: var(--font-body); font-size: 16px; line-height: 1.6; min-height: 100vh; overflow-x: hidden; }
   a { color: var(--gold); text-decoration: none; }
   a:hover { color: var(--gold-bright); }
   h1, h2, h3 { font-family: var(--font-display); color: var(--ink-primary); }
   h1 { font-size: 2rem; font-weight: 700; letter-spacing: -0.02em; }
   h2 { font-size: 1.375rem; font-weight: 700; letter-spacing: -0.015em; }
   h3 { font-size: 1.125rem; font-weight: 700; letter-spacing: -0.015em; }
-  .kicker { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.14em; color: var(--mint); }
+  .kicker { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.14em; color: var(--gold); } /* Titan orange eyebrow */
   .sec-h { margin: 18px 0 10px; }
 
   /* Nav — sticky, blurred, members-only feel */
@@ -1304,6 +1309,7 @@ const CSS = `
   .nav .coin { width: 30px; height: 30px; border-radius: 50%; background: var(--gradient-coin); color: var(--on-gold); display: inline-flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; letter-spacing: 0; box-shadow: var(--gold-shadow-sm); }
   .nav a.navlink { color: var(--ink-muted); font-size: 14px; font-weight: 500; padding-bottom: 2px; border-bottom: 2px solid transparent; }
   .nav a.navlink:hover { color: var(--ink-primary); }
+  .nav a.navlink.active { color: var(--gold); border-bottom: 2px solid var(--gold); }
   .nav .spacer { flex: 1; }
 
   .container { max-width: 860px; margin: 28px auto; padding: 0 16px; }
@@ -1345,7 +1351,8 @@ const CSS = `
     box-shadow: inset 0 2px 4px rgba(0,0,0,0.12);
   }
   input::placeholder, textarea::placeholder { color: var(--ink-faint); }
-  input:focus, textarea:focus, select:focus { outline: none; border-color: var(--border-gold); box-shadow: 0 0 0 3px var(--gold-glow); background: var(--bg-spotlight); }
+  input:focus, textarea:focus, select:focus { outline: none; border-color: var(--border-gold); box-shadow: 0 0 0 3px rgba(245,138,58,0.18); background: var(--bg-spotlight); }
+  [data-theme="light"] input:focus, [data-theme="light"] textarea:focus, [data-theme="light"] select:focus { box-shadow: 0 0 0 3px rgba(168,73,11,0.18); }
   select { cursor: pointer; }
   label { display: block; font-size: 0.8125rem; font-weight: 600; color: var(--ink-muted); margin-bottom: 6px; }
 
@@ -1397,11 +1404,28 @@ const CSS = `
   .feed-actions form { display: inline; }
   .comment { border-top: 1px solid var(--border-soft); padding: 8px 0; font-size: 13px; }
 
-  /* Landing page */
-  .hero { text-align: center; padding: 72px 20px 52px; }
-  .hero h1 { font-size: clamp(2.75rem, 6vw, 4.5rem); font-weight: 700; letter-spacing: -0.03em; line-height: 1.05; margin: 16px 0 18px; }
-  .hero h1 .gold { background: var(--gradient-coin); -webkit-background-clip: text; background-clip: text; color: transparent; }
-  .hero p { color: var(--ink-muted); font-size: 17px; max-width: 640px; margin: 0 auto 30px; }
+  /* Landing display scale (Titan editorial) */
+  .display-xl { font: 700 clamp(2.6rem, 6vw, 4.75rem)/1.04 var(--font-display); letter-spacing: -0.03em; }
+  .display-lg { font: 700 clamp(2rem, 4vw, 3rem)/1.08 var(--font-display); letter-spacing: -0.02em; }
+
+  /* Landing hero — full-bleed navy panel in BOTH themes (Titan's photo slot, CSS-only).
+     Overlays: one .bg-grid + one .orb--gold inside the panel; content sits above in .hero-in. */
+  .hero { position: relative; overflow: hidden; text-align: center; min-height: 78vh; display: flex; align-items: center; justify-content: center;
+    width: 100vw; margin: -28px 0 26px calc(50% - 50vw); padding: 72px 20px 64px;
+    background: linear-gradient(180deg, #0D1321, #131E38); border-radius: 0; }
+  .hero .bg-grid { z-index: 0; }
+  .hero .orb--gold { z-index: 0; }
+  [data-theme="light"] .hero .bg-grid { background: linear-gradient(rgba(232,119,42,0.05) 1px, transparent 1px), linear-gradient(90deg, rgba(232,119,42,0.05) 1px, transparent 1px); background-size: 56px 56px; }
+  [data-theme="light"] .hero .orb--gold { background: radial-gradient(circle, rgba(232,119,42,0.10), transparent 65%); }
+  .hero .hero-in { position: relative; z-index: 1; max-width: 860px; }
+  .hero .coin-hero { margin-bottom: 10px; }
+  .hero .kicker { color: #F58A3A; } /* hero is navy in both themes — always the dark-theme orange */
+  .hero h1 { color: var(--hero-ink); margin: 16px 0 18px; }
+  .hero h1 .w { display: inline-block; overflow: hidden; vertical-align: bottom; padding-bottom: 0.08em; margin-bottom: -0.08em; }
+  .hero h1 .w > span { display: inline-block; }
+  .hero p { color: rgba(244,241,232,0.78); font-size: 1.125rem; max-width: 640px; margin: 0 auto 30px; }
+  .hero .btn-outline { background: transparent; border: 1px solid rgba(244,241,232,0.35); color: var(--hero-ink); box-shadow: none; }
+  .hero .btn-outline:hover { border-color: rgba(244,241,232,0.6); background: rgba(244,241,232,0.07); color: var(--hero-ink); }
   .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin: 10px 0 26px; }
   .step { background: var(--surface-card); border: 1px solid var(--border-soft); border-radius: 14px; padding: 1.1rem 1.25rem; }
   .step .stepnum { font-family: var(--font-display); font-weight: 700; font-size: 1.1rem; color: var(--gold); }
@@ -1523,15 +1547,15 @@ const CSS = `
   .wax-seal {
     position: relative; flex: 0 0 auto; width: 40px; height: 40px; border-radius: 50%;
     display: grid; place-items: center;
-    background: radial-gradient(circle at 32% 28%, #FFD97A 0%, #F5B942 42%, #C98A1E 78%, #9A6A0A 100%);
-    box-shadow: inset 0 2px 3px rgba(255,255,255,0.45), inset 0 -3px 5px rgba(80,50,0,0.45),
+    background: radial-gradient(circle at 32% 28%, #FFB37A 0%, #F08A3C 42%, #D0611C 78%, #A8490B 100%);
+    box-shadow: inset 0 2px 3px rgba(255,255,255,0.45), inset 0 -3px 5px rgba(60,30,0,0.45),
                 0 2px 6px rgba(0,0,0,0.35);
     transform: rotate(-8deg);
-    font: 700 0.875rem var(--font-display); color: #4A3200; letter-spacing: -0.02em;
+    font: 700 0.875rem var(--font-display); color: #160E04; letter-spacing: -0.02em;
   }
   .wax-seal::before {              /* embossed inner ring */
     content: ""; position: absolute; inset: 4px; border-radius: 50%;
-    border: 1px solid rgba(80,50,0,0.35); box-shadow: inset 0 1px 1px rgba(255,255,255,0.3);
+    border: 1px solid rgba(60,30,0,0.35); box-shadow: inset 0 1px 1px rgba(255,255,255,0.3);
   }
   .wax-seal > span { position: relative; }
   /* Opened letters: the seal is cracked — desaturated, dashed ring, upright */
@@ -1608,19 +1632,19 @@ const CSS = `
      once as the first child of <body>: .bg-fx > .bg-grid + .orb--gold + .orb--mint. */
   .bg-fx { position: fixed; inset: 0; z-index: -1; overflow: hidden; pointer-events: none; }
   .orb { position: absolute; width: 46vmax; height: 46vmax; border-radius: 50%; }
-  .orb--gold { top: -14vmax; left: -10vmax; background: radial-gradient(circle, rgba(245,185,66,.10), transparent 65%);
+  .orb--gold { top: -14vmax; left: -10vmax; background: radial-gradient(circle, rgba(232,119,42,.10), transparent 65%);
     animation: kf-orb-a 62s var(--ez-drift) infinite alternate; }
   .orb--mint { bottom: -16vmax; right: -12vmax; background: radial-gradient(circle, rgba(63,224,176,.07), transparent 65%);
     animation: kf-orb-b 84s var(--ez-drift) infinite alternate; }
-  [data-theme="light"] .orb--gold { background: radial-gradient(circle, rgba(138,92,8,.09), transparent 65%); }
+  [data-theme="light"] .orb--gold { background: radial-gradient(circle, rgba(168,73,11,.09), transparent 65%); }
   [data-theme="light"] .orb--mint { background: radial-gradient(circle, rgba(11,122,88,.06), transparent 65%); }
   @keyframes kf-orb-a { to { transform: translate(16vw,12vh) scale(1.18); } }
   @keyframes kf-orb-b { to { transform: translate(-14vw,-10vh) scale(1.12); } }
   .bg-grid { position: absolute; inset: -60%; opacity: .5;
-    background: linear-gradient(rgba(245,185,66,.05) 1px, transparent 1px), linear-gradient(90deg, rgba(245,185,66,.05) 1px, transparent 1px);
+    background: linear-gradient(rgba(232,119,42,.05) 1px, transparent 1px), linear-gradient(90deg, rgba(232,119,42,.05) 1px, transparent 1px);
     background-size: 56px 56px; animation: kf-grid 36s linear infinite;
     -webkit-mask: radial-gradient(70% 60% at 50% 40%, #000, transparent); mask: radial-gradient(70% 60% at 50% 40%, #000, transparent); }
-  [data-theme="light"] .bg-grid { background: linear-gradient(rgba(138,92,8,.06) 1px, transparent 1px), linear-gradient(90deg, rgba(138,92,8,.06) 1px, transparent 1px); background-size: 56px 56px; }
+  [data-theme="light"] .bg-grid { background: linear-gradient(rgba(16,26,46,.05) 1px, transparent 1px), linear-gradient(90deg, rgba(16,26,46,.05) 1px, transparent 1px); background-size: 56px 56px; } /* navy grid on paper */
   @keyframes kf-grid { to { transform: translate(56px,56px); } }
 
   /* ==================== KINETIC — Choreography ====================
@@ -1727,7 +1751,7 @@ const CSS = `
 
   /* --- Stage C: congratulations announcement card --- */
   .card-announce { border: 1px solid var(--border-gold);
-    background: linear-gradient(150deg, rgba(245,185,66,.12), rgba(63,224,176,.06) 60%, transparent),
+    background: linear-gradient(150deg, rgba(232,119,42,.12), rgba(63,224,176,.06) 60%, transparent),
       var(--surface-card); box-shadow: 0 0 34px var(--gold-glow); }
 
   /* --- Stage C: calendar grid --- */
@@ -1783,7 +1807,7 @@ const CSS = `
      (.is-mint); repeat visits get .is-static (fully static coin); click re-flips. */
   .coin-hero { width: 96px; height: 96px; border-radius: 50%; display: grid; place-items: center; position: relative; cursor: pointer;
     margin: 0 auto; user-select: none; -webkit-user-select: none;
-    background: var(--gradient-coin); font: 700 2rem var(--font-display); color: #14100A;
+    background: var(--gradient-coin); font: 700 2rem var(--font-display); color: var(--on-gold);
     box-shadow: inset 0 0 0 3px rgba(0,0,0,.18), inset 0 2px 4px rgba(255,255,255,.4), var(--shadow-gold);
     animation: kf-float 6s var(--ez-drift) infinite; }
   .coin-hero::before { content: ""; position: absolute; inset: 0; border-radius: 50%; opacity: .5;
@@ -1820,14 +1844,14 @@ const CSS = `
   /* ==================== KINETIC — Reactive surfaces: tilt, glare, magnet, ripple ==================== */
   /* Bullion shimmer: cursor-tracked gold glare, driven by --gx/--gy (child div inside .card-deal / .stat) */
   .card__glare { position: absolute; inset: -45%; pointer-events: none; opacity: 0; transition: opacity .35s var(--ez-out);
-    background: radial-gradient(circle, rgba(245,185,66,.16), transparent 55%); transform: translate(var(--gx,0), var(--gy,0)); }
-  [data-theme="light"] .card__glare { background: radial-gradient(circle, rgba(138,92,8,.14), transparent 55%); }
+    background: radial-gradient(circle, rgba(232,119,42,.16), transparent 55%); transform: translate(var(--gx,0), var(--gy,0)); }
+  [data-theme="light"] .card__glare { background: radial-gradient(circle, rgba(232,119,42,.12), transparent 55%); }
   .js-tilt:hover .card__glare { opacity: 1; }
   .js-tilt { transform: perspective(800px) rotateX(var(--rx,0)) rotateY(var(--ry,0)); will-change: transform; }
   .js-tilt.is-tilting { transition: transform .05s linear; }
   .js-tilt:not(.is-tilting) { transition: transform .5s var(--ez-spring), box-shadow .2s ease, border-color .18s ease; }
   /* The tilt transform owns the element while physics are attached — hover lifts must not fight it */
-  .card-deal.js-tilt:hover, .card.js-tilt:hover, .stat.js-tilt:hover { transform: perspective(800px) rotateX(var(--rx,0)) rotateY(var(--ry,0)); }
+  .card-deal.js-tilt:hover, .card.js-tilt:hover, .stat.js-tilt:hover, .card--cut.js-tilt:hover { transform: perspective(800px) rotateX(var(--rx,0)) rotateY(var(--ry,0)); }
   .card-deal.js-tilt:hover { box-shadow: var(--card-shadow-hover), var(--shadow-gold), 0 0 0 1px var(--border-gold); }
   /* Magnetic primary buttons: pull within a 40px halo, <=10px travel, spring back */
   .js-magnet { transition: transform .28s var(--ez-spring); will-change: transform; }
@@ -1867,9 +1891,9 @@ const CSS = `
   /* UPLOAD DROPZONE — breathing border; drag state kills the loop and locks gold */
   .dropzone { border: 1.5px dashed var(--border-soft); border-radius: var(--radius-ctl); transition: transform .2s var(--ez-spring);
     animation: kf-breathe 3.2s var(--ez-drift) infinite; }
-  @keyframes kf-breathe { 50% { border-color: var(--border-gold); box-shadow: 0 0 0 5px rgba(245,185,66,.06); } }
+  @keyframes kf-breathe { 50% { border-color: var(--border-gold); box-shadow: 0 0 0 5px rgba(232,119,42,.06); } }
   [data-theme="light"] .dropzone { animation-name: kf-breathe-l; }
-  @keyframes kf-breathe-l { 50% { border-color: var(--border-gold); box-shadow: 0 0 0 5px rgba(138,92,8,.08); } }
+  @keyframes kf-breathe-l { 50% { border-color: var(--border-gold); box-shadow: 0 0 0 5px rgba(168,73,11,.08); } }
   .dropzone.is-over { animation: none; border-color: var(--gold); border-style: solid; transform: scale(1.015); }
   /* THEME TOGGLE — sun/moon spin: JS adds .is-spin for 650ms, swaps glyph at midpoint */
   .btn-theme .ic { display: inline-block; transition: transform .6s var(--ez-spring); font-style: normal; }
@@ -1895,6 +1919,39 @@ const CSS = `
   .tick { animation: kf-tick .5s var(--ez-spring); }
   @keyframes kf-tick { 35% { transform: scale(1.18); color: var(--gold); } }
 
+  /* ==================== TITAN — Signature corner-cut cards (.card--cut) ====================
+     Angled 24px top-right cut (one clip-path polygon), orange top bar, giant decorative
+     ghost number from data-num. No borders/radius under the clip — shadow + top bar only. */
+  .card--cut { position: relative; overflow: hidden; border-radius: 0; border: none; background: var(--surface-card);
+    box-shadow: var(--card-shadow); clip-path: polygon(0 0, calc(100% - var(--cut)) 0, 100% var(--cut), 100% 100%, 0 100%);
+    padding: 1.5rem; transition: transform .2s var(--ez-out), box-shadow .2s var(--ez-out); }
+  .card--cut::before { content: ""; position: absolute; top: 0; left: 0; right: var(--cut); height: 3px; background: var(--gradient-coin); }
+  .card--cut::after { content: attr(data-num); position: absolute; right: .4rem; bottom: -1.5rem; pointer-events: none;
+    font: 700 7rem/1 var(--font-display); color: var(--ghost-num); }
+  .card--cut.is-feature { background: var(--gradient-coin); color: var(--on-gold); }
+  .card--cut.is-feature h3, .card--cut.is-feature p { color: var(--on-gold); }
+  .card--cut.is-feature::after { color: rgba(0,0,0,.12); }
+  .card--cut:hover { transform: translateY(-4px); box-shadow: var(--card-shadow-hover), var(--shadow-gold); }
+
+  /* Back-to-top — round orange coin, appears after 600px of scroll */
+  .back-to-top { position: fixed; right: 24px; bottom: 24px; z-index: 50; width: 44px; height: 44px; border-radius: 50%;
+    border: none; background: var(--gradient-coin); color: var(--on-gold); font: 700 18px/1 var(--font-body);
+    display: grid; place-items: center; cursor: pointer; box-shadow: var(--gold-shadow-md);
+    opacity: 0; transform: translateY(12px); pointer-events: none;
+    transition: opacity .3s var(--ez-out), transform .3s var(--ez-out); }
+  .back-to-top.is-show { opacity: 1; transform: none; pointer-events: auto; }
+  .back-to-top:hover { transform: translateY(-3px); }
+  .back-to-top:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+
+  /* TITAN motion additions: ghost-number slide-in (fires with the card's reveal) + hero word-rise */
+  @keyframes kf-ghost-in { from { transform: translateX(28px); opacity: 0; } to { transform: none; opacity: 1; } }
+  @keyframes kf-word { from { transform: translateY(110%); opacity: 0; } to { transform: none; opacity: 1; } }
+  @media (prefers-reduced-motion: no-preference) {
+    .js .rv.is-in.card--cut::after, .js [data-reveal].is-in.card--cut::after, .js .a-enter.card--cut::after {
+      animation: kf-ghost-in .5s var(--ez-out) both; animation-delay: calc(var(--i,0) * 90ms + var(--stage,0ms) + 200ms); }
+    .js .hero h1 .w > span { animation: kf-word .7s var(--ez-out) both; animation-delay: calc(var(--i,0) * 80ms + 300ms); }
+  }
+
   /* Reduced motion: kill every animation/transition globally, show content instantly. */
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after {
@@ -1905,7 +1962,7 @@ const CSS = `
     }
     /* KINETIC kill-switch: every entrance/reveal state forced visible, ambient loops stopped */
     .js .a-enter, .js .rv, .js [data-reveal] { opacity: 1 !important; transform: none !important; animation: none !important; transition: none !important; }
-    .orb, .bg-grid, .ticker__track, .pin::after, .dropzone, .coin-hero, .coin-hero::after, .feed-in { animation: none !important; }
+    .orb, .bg-grid, .ticker__track, .pin::after, .dropzone, .coin-hero, .coin-hero::after, .feed-in, .hero h1 .w>span, .card--cut::after { animation: none !important; }
     .js body { animation: none !important; }
   }
 `;
@@ -2006,6 +2063,7 @@ ${ticker}
   ${body}
 </main>
 <div class="footer">Dealzoin — the B2B deal network. Companies only. 🪙</div>
+<button class="back-to-top" id="back-to-top" type="button" aria-label="Back to top" title="Back to top">&uarr;</button>
 <script>(function(){
   /* ===== KINETIC — the one shared script: physics, reactive surfaces, choreography ===== */
   var RM=!!(window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches);
@@ -2043,15 +2101,17 @@ ${ticker}
     });
   });
   // Stat tiles: count-up 0 -> value over 800ms ease-out (reduced motion: jumps to final).
+  // The final frame restores the server's formatted label ("2,400+", "$1.2B" stay intact).
   function countUp(el){
     var target=parseFloat(el.getAttribute('data-count'));
     if(!isFinite(target))return;
-    if(RM){el.textContent=String(target);return;}
+    var finalText=el.textContent;
+    if(RM){el.textContent=finalText;return;}
     var t0=null,dur=800;
     var step=function(ts){
       if(t0===null)t0=ts;
       var p=Math.min(1,(ts-t0)/dur),e=1-Math.pow(1-p,3);
-      el.textContent=String(Math.round(target*e));
+      el.textContent=p<1?String(Math.round(target*e)):finalText;
       if(p<1)requestAnimationFrame(step);
     };
     requestAnimationFrame(step);
@@ -2173,6 +2233,13 @@ ${ticker}
       if(last)window.dzFly(last);
     },0);
   });
+  /* H) Back-to-top — shows after 600px of scroll, smooth-scrolls to the top. */
+  var btt=document.getElementById('back-to-top');
+  if(btt){
+    var bttSync=function(){btt.classList.toggle('is-show',(window.pageYOffset||document.documentElement.scrollTop||0)>600);};
+    addEventListener('scroll',bttSync,{passive:true});bttSync();
+    btt.addEventListener('click',function(){window.scrollTo({top:0,behavior:RM?'auto':'smooth'});});
+  }
 })();</script>
 </body></html>`;
 }
@@ -2397,7 +2464,7 @@ const DEAL_MAP_SCRIPT = `<script>(function(){
       .bindPopup('<b>'+escH(originName)+'</b><br>Deal '+escH(dealNum)+' · origin · '+escH(status));
     L.marker([dLat,dLng],{icon:L.divIcon({className:'dz-marker dz-marker-mint',iconSize:[16,16],iconAnchor:[8,8]})}).addTo(map)
       .bindPopup('<b>'+escH(destName)+'</b><br>Deal '+escH(dealNum)+' · destination · '+escH(status));
-    L.polyline([[oLat,oLng],[dLat,dLng]],{color:'#F5B942',weight:2.5,dashArray:'7 7',opacity:.9}).addTo(map);
+    L.polyline([[oLat,oLng],[dLat,dLng]],{color:'#E8772A',weight:2.5,dashArray:'7 7',opacity:.9}).addTo(map);
     var ship=L.marker([oLat,oLng],{icon:L.divIcon({className:'dz-ship-dot',iconSize:[14,14],iconAnchor:[7,7]}),interactive:false}).addTo(map);
     map.fitBounds([[oLat,oLng],[dLat,dLng]],{padding:[36,36]});
     function lerp(a,b,t){return a+(b-a)*t;}
@@ -2567,31 +2634,35 @@ app.get('/', (req, res) => {
   const user = currentUser(req);
   const body = `
   <div class="hero">
-    <div class="coin-hero" role="button" tabindex="0" aria-label="Dealzoin mint coin — activate to flip">Dz</div>
-    <div class="kicker a-enter" data-stage="hero" style="--i:0">The B2B deal network</div>
-    <h1 class="a-enter" data-stage="hero" style="--i:1">Where <span class="gold">companies</span> close.</h1>
-    <p class="a-enter" data-stage="hero" style="--i:2">Dealzoin is the social network for businesses — post deals to every company's timeline,
-       follow the players in your industry, and sign binding contracts in AI-guarded signing rooms.</p>
-    ${user
-      ? `<a class="btn js-magnet a-enter" data-stage="hero" style="--i:3" href="${user.isAdmin ? '/admin' : '/timeline'}">Open ${user.isAdmin ? 'dashboard' : 'timeline'} &rarr;</a>`
-      : `<a class="btn js-magnet a-enter" data-stage="hero" style="--i:3" href="/signup">Register your company</a>
-         &nbsp; <a class="btn btn-outline a-enter" data-stage="hero" style="--i:4" href="/login">Sign in</a>`}
+    <div class="bg-grid" aria-hidden="true"></div>
+    <div class="orb orb--gold" aria-hidden="true"></div>
+    <div class="hero-in">
+      <div class="coin-hero" role="button" tabindex="0" aria-label="Dealzoin mint coin — activate to flip">Dz</div>
+      <div class="kicker a-enter" data-stage="hero" style="--i:0">The B2B deal network</div>
+      <h1 class="display-xl"><span class="w" style="--i:0"><span>Verified</span></span> <span class="w" style="--i:1"><span>Partners.</span></span> <span class="w" style="--i:2"><span>Private</span></span> <span class="w" style="--i:3"><span>Rooms.</span></span> <span class="w" style="--i:4"><span>Signed</span></span> <span class="w" style="--i:5"><span>Deals.</span></span></h1>
+      <p class="a-enter" data-stage="hero" style="--i:2">Dealzoin is the closed network where vetted companies post opportunities, negotiate in private deal rooms, and sign — every step on the record.</p>
+      <div class="a-enter" data-stage="hero" style="--i:3">
+      ${user
+        ? `<a class="btn js-magnet" href="${user.isAdmin ? '/admin' : '/timeline'}">Enter the Deal Floor &rarr;</a>`
+        : `<a class="btn js-magnet" href="/signup">Enter the Deal Floor &rarr;</a>
+           &nbsp; <a class="btn btn-outline" href="#why">See how it works</a>`}
+      </div>
+    </div>
   </div>
-  <div class="grid2">
-    <div class="card a-enter" data-stage="cards" style="--i:0"><h3>📣 Deals on every timeline</h3><p class="muted">Publish a deal once; it's live on every follower company's feed instantly. Likes, comments and reposts built in — dealmaking with a pulse.</p></div>
-    <div class="card a-enter" data-stage="cards" style="--i:1"><h3>✍️ Private signing rooms</h3><p class="muted">Take it off the feed and into the vault. Password re-verification, signing-authority checks, and downloadable contract documents — from handshake to signature in minutes.</p></div>
-    <div class="card a-enter" data-stage="cards" style="--i:2"><h3>🤖 AI security agents on duty</h3><p class="muted">Automated agents screen onboarding, verify 2FA login codes and watch every signature — all logged to a tamper-evident audit trail.</p></div>
-    <div class="card a-enter" data-stage="cards" style="--i:3"><h3>🏢 Companies only. No noise.</h3><p class="muted">No personal profiles, no influencers. Every member is a vetted business, approved before it can post a single deal.</p></div>
+  <div id="why">
+    <div class="kicker a-enter" data-stage="cards" style="--i:0">Why Dealzoin</div>
+    <h2 class="display-lg a-enter" data-stage="cards" style="--i:1;margin:6px 0 16px">Built for companies that mean business..</h2>
   </div>
-  <div class="kicker a-enter" data-stage="cards" style="--i:4;margin-top:26px;margin-bottom:10px">How it works</div>
   <div class="steps">
-    <div class="step a-enter" data-stage="cards" style="--i:5"><div class="stepnum">01</div><h3>Register &amp; get vetted</h3><p class="muted">Your company joins the network after admin approval.</p></div>
-    <div class="step a-enter" data-stage="cards" style="--i:6"><div class="stepnum">02</div><h3>Post or follow deals</h3><p class="muted">Put your offer on the wire; watch the right companies react.</p></div>
-    <div class="step a-enter" data-stage="cards" style="--i:7"><div class="stepnum">03</div><h3>Sign in the vault</h3><p class="muted">Close in a private signing room, guarded by AI agents.</p></div>
+    <div class="card card--cut js-tilt a-enter" data-stage="cards" style="--i:2" data-num="01"><h3>01 Verified Network</h3><p class="muted">Every company is identity-checked and trade-referenced before it can post. No anonymous offers. Ever.</p></div>
+    <div class="card card--cut is-feature js-tilt a-enter" data-stage="cards" style="--i:3" data-num="02"><h3>02 Private Deal Rooms</h3><p>Negotiate terms, exchange documents and message counterparties in encrypted rooms — sealed until both sides sign.</p></div>
+    <div class="card card--cut js-tilt a-enter" data-stage="cards" style="--i:4" data-num="03"><h3>03 The Trust Ledger</h3><p class="muted">Every offer, counter-offer and signature is timestamped to an audit trail your compliance team will actually enjoy.</p></div>
   </div>
-  <div class="trust rv">
-    <div class="kicker">Security, built in</div>
-    <p>Every onboarding, login and signature is screened by Dealzoin's AI security agents and written to a tamper-evident audit trail. Real contracts deserve real locks.</p>
+  <div class="stats">
+    <div class="stat card--cut rv" style="--i:0" data-num="01"><div class="num gold" data-count="2400">2,400+</div><div class="lbl">Verified companies</div></div>
+    <div class="stat card--cut rv" style="--i:1" data-num="02"><div class="num gold">$1.2B</div><div class="lbl">Signed deal volume</div></div>
+    <div class="stat card--cut rv" style="--i:2" data-num="03"><div class="num gold" data-count="38">38</div><div class="lbl">Countries</div></div>
+    <div class="stat card--cut rv" style="--i:3" data-num="04"><div class="num gold">&lt;4h</div><div class="lbl">Median first response</div></div>
   </div>`;
   res.send(page('Welcome', body, user, req.query.msg, req.query.err));
 });
@@ -5794,10 +5865,10 @@ app.get('/profile', requireCompany, (req, res) => {
     </form>`}
   </div>
   <div class="stats">
-    <div class="stat js-tilt" data-reveal style="--i:0"><div class="num gold" data-count="${deals.length}">${deals.length}</div><div class="lbl">My deals</div></div>
-    <div class="stat js-tilt" data-reveal style="--i:1"><div class="num" data-count="${posts.length}">${posts.length}</div><div class="lbl">My posts</div></div>
-    <div class="stat js-tilt" data-reveal style="--i:2"><div class="num mint" data-count="${fc.followers}">${fc.followers}</div><div class="lbl">Followers</div></div>
-    <div class="stat js-tilt" data-reveal style="--i:3"><div class="num" data-count="${fc.following}">${fc.following}</div><div class="lbl">Following</div></div>
+    <div class="stat card--cut js-tilt" data-reveal style="--i:0" data-num="01"><div class="num gold" data-count="${deals.length}">${deals.length}</div><div class="lbl">My deals</div></div>
+    <div class="stat card--cut js-tilt" data-reveal style="--i:1" data-num="02"><div class="num" data-count="${posts.length}">${posts.length}</div><div class="lbl">My posts</div></div>
+    <div class="stat card--cut js-tilt" data-reveal style="--i:2" data-num="03"><div class="num mint" data-count="${fc.followers}">${fc.followers}</div><div class="lbl">Followers</div></div>
+    <div class="stat card--cut js-tilt" data-reveal style="--i:3" data-num="04"><div class="num" data-count="${fc.following}">${fc.following}</div><div class="lbl">Following</div></div>
   </div>
   <h2 class="sec-h">My deals</h2>
   ${dealsHtml}
@@ -5931,7 +6002,7 @@ app.get('/dashboard', requireCompany, (req, res) => {
     ['Contracts I signed', stats.signedPending + ' pending · ' + stats.signedApproved + ' approved', ''],
     ['Contracts on my deals', stats.minePending + ' pending · ' + stats.mineApproved + ' approved', '']
   ];
-  const tilesHtml = `<div class="stats">${tiles.map(([l, n, cls], ti) => `<div class="stat js-tilt" data-reveal style="--i:${Math.min(ti, 8)}"><div class="num${cls}"${typeof n === 'number' ? ` data-count="${n}"` : ''}>${n}</div><div class="lbl">${l}</div></div>`).join('')}</div>`;
+  const tilesHtml = `<div class="stats">${tiles.map(([l, n, cls], ti) => `<div class="stat card--cut js-tilt" data-reveal style="--i:${Math.min(ti, 8)}" data-num="${String(ti + 1).padStart(2, '0')}"><div class="num${cls}"${typeof n === 'number' ? ` data-count="${n}"` : ''}>${n}</div><div class="lbl">${l}</div></div>`).join('')}</div>`;
 
   // My deals table + per-deal chart data
   const myDeals = db.prepare('SELECT * FROM deals WHERE company_id = ? ORDER BY created_at DESC LIMIT 50').all(myId);
@@ -5967,8 +6038,8 @@ app.get('/dashboard', requireCompany, (req, res) => {
     if (!window.Chart) return;
     var cs = getComputedStyle(document.documentElement);
     var v = function (name, fb) { var x = cs.getPropertyValue(name).trim(); return x || fb; };
-    var ink = v('--ink-muted', '#9A97A8'), soft = v('--border-soft', '#242435'), primary = v('--ink-primary', '#F4F1E8');
-    var gold = v('--gold', '#F5B942'), mint = v('--mint', '#3FE0B0'), warn = v('--warning', '#FFB454'), dgr = v('--danger', '#FF5C7A'), faint = v('--ink-faint', '#5C5A6B'), bgv = v('--bg-void', '#0A0A12');
+    var ink = v('--ink-muted', '#A3ACC2'), soft = v('--border-soft', '#24304A'), primary = v('--ink-primary', '#F4F1E8');
+    var gold = v('--gold', '#F58A3A'), mint = v('--mint', '#3FE0B0'), warn = v('--warning', '#FFB454'), dgr = v('--danger', '#FF6B85'), faint = v('--ink-faint', '#6E7A95'), bgv = v('--bg-void', '#0D1321');
     var base = { responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { color: primary } } } };
     var bar = ${jsonForHtml({ labels: barLabels, likes: barLikes, comments: barComments })};
     var bctx = document.getElementById('chart-deals');
@@ -6648,9 +6719,9 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
     ['Total companies', stats.companies, ''], ['Pending', stats.pending, ''], ['Approved', stats.approved, ' mint'],
     ['Flagged ⚠️', stats.flagged, ''], ['Deals', stats.deals, ' gold'], ['Contracts pending', stats.contractsPending, ' gold'],
     ['Follows', stats.follows, '']
-  ].map(([l, n, cls], ti) => `<div class="stat js-tilt" data-reveal style="--i:${Math.min(ti, 8)}"><div class="num${cls}" data-count="${n}">${n}</div><div class="lbl">${l}</div></div>`).join('')}
-    <div class="stat js-tilt" data-reveal style="--i:7"><div class="num gold" style="font-size:1.15rem;line-height:1.4">${commissionText}</div><div class="lbl">Platform commission (approved deals) · ${feePct}%</div></div>
-    <div class="stat js-tilt" data-reveal style="--i:8"><div class="num gold" style="font-size:1.15rem;line-height:1.4">${collectedText}</div><div class="lbl">💰 Commission collected · ${pendingPayCount} payment${pendingPayCount === 1 ? '' : 's'} pending</div></div></div>`;
+  ].map(([l, n, cls], ti) => `<div class="stat card--cut js-tilt" data-reveal style="--i:${Math.min(ti, 8)}" data-num="${String(ti + 1).padStart(2, '0')}"><div class="num${cls}" data-count="${n}">${n}</div><div class="lbl">${l}</div></div>`).join('')}
+    <div class="stat card--cut js-tilt" data-reveal style="--i:7" data-num="08"><div class="num gold" style="font-size:1.15rem;line-height:1.4">${commissionText}</div><div class="lbl">Platform commission (approved deals) · ${feePct}%</div></div>
+    <div class="stat card--cut js-tilt" data-reveal style="--i:8" data-num="09"><div class="num gold" style="font-size:1.15rem;line-height:1.4">${collectedText}</div><div class="lbl">💰 Commission collected · ${pendingPayCount} payment${pendingPayCount === 1 ? '' : 's'} pending</div></div></div>`;
 
   // Pending companies queue (with ONBOARDING AGENT flags + KYC documents reviewed inline)
   const pending = db.prepare(`SELECT * FROM companies WHERE status = 'pending' ORDER BY created_at ASC`).all();
