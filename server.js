@@ -334,7 +334,7 @@ CREATE TABLE IF NOT EXISTS events (
   event_date         TEXT NOT NULL,                -- YYYY-MM-DD
   event_time         TEXT DEFAULT '',              -- HH:MM
   notes              TEXT DEFAULT '',
-  room               TEXT DEFAULT '',              -- Jitsi room slug
+  room               TEXT DEFAULT '',              -- legacy room slug (deprecated — calls are native in-platform rooms now)
   deal_id            INTEGER,
   created_at         TEXT NOT NULL
 );
@@ -1933,8 +1933,9 @@ const CSS = `
   .card--cut.is-feature::after { color: rgba(0,0,0,.12); }
   .card--cut:hover { transform: translateY(-4px); box-shadow: var(--card-shadow-hover), var(--shadow-gold); }
 
-  /* Back-to-top — round orange coin, appears after 600px of scroll */
-  .back-to-top { position: fixed; right: 24px; bottom: 24px; z-index: 50; width: 44px; height: 44px; border-radius: 50%;
+  /* Back-to-top — round orange coin, appears after 600px of scroll.
+     Shifted 70px up (24px + 70px) so the Zo assistant owns the bottom-right corner. */
+  .back-to-top { position: fixed; right: 24px; bottom: 94px; z-index: 50; width: 44px; height: 44px; border-radius: 50%;
     border: none; background: var(--gradient-coin); color: var(--on-gold); font: 700 18px/1 var(--font-body);
     display: grid; place-items: center; cursor: pointer; box-shadow: var(--gold-shadow-md);
     opacity: 0; transform: translateY(12px); pointer-events: none;
@@ -1942,6 +1943,67 @@ const CSS = `
   .back-to-top.is-show { opacity: 1; transform: none; pointer-events: auto; }
   .back-to-top:hover { transform: translateY(-3px); }
   .back-to-top:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+
+  /* ----- ZO — the 24/7 assistant widget (floating button + chat panel) ----- */
+  .zo { position: fixed; right: 24px; bottom: 24px; z-index: 60; }
+  .zo[hidden], .zo-panel[hidden] { display: none; }
+  .zo-fab { position: relative; width: 56px; height: 56px; border-radius: 50%; border: none; cursor: pointer;
+    background: var(--gradient-coin); color: var(--on-gold); font: 700 15px/1 var(--font-display); letter-spacing: .02em;
+    display: grid; place-items: center; box-shadow: var(--gold-shadow-lg);
+    transition: transform .18s var(--ez-spring), box-shadow .18s var(--ez-out); }
+  .zo-fab:hover { transform: translateY(-3px) scale(1.05); }
+  .zo-fab:focus-visible { outline: 2px solid var(--gold); outline-offset: 3px; }
+  .zo-fab__pulse { position: absolute; inset: 0; border-radius: 50%; pointer-events: none;
+    box-shadow: 0 0 0 0 rgba(232,119,42,.45); animation: kf-zo-pulse 2.6s var(--ez-drift) infinite; }
+  @keyframes kf-zo-pulse { 0% { box-shadow: 0 0 0 0 rgba(232,119,42,.45); } 70% { box-shadow: 0 0 0 16px rgba(232,119,42,0); } 100% { box-shadow: 0 0 0 0 rgba(232,119,42,0); } }
+  .zo-panel { position: absolute; right: 0; bottom: 70px; width: 360px; max-width: calc(100vw - 32px); max-height: 70vh;
+    display: flex; flex-direction: column; overflow: hidden; background: var(--surface-card);
+    border: 1px solid var(--border-soft); border-radius: var(--radius-card); box-shadow: var(--card-shadow-hover);
+    transform-origin: bottom right; animation: kf-zo-open .32s var(--ez-spring); }
+  @keyframes kf-zo-open { from { opacity: 0; transform: translateY(16px) scale(.92); } to { opacity: 1; transform: none; } }
+  .zo-head { display: flex; align-items: center; gap: 10px; padding: 12px 14px; background: var(--gradient-coin); color: var(--on-gold); }
+  .zo-dot { width: 9px; height: 9px; border-radius: 50%; background: #3FE0B0; box-shadow: 0 0 0 3px rgba(63,224,176,.28); flex: none; }
+  .zo-title { display: flex; flex-direction: column; line-height: 1.25; font-size: 14px; }
+  .zo-sub { font-size: 11px; opacity: .85; }
+  .zo-close { margin-left: auto; background: none; border: none; color: inherit; font-size: 20px; line-height: 1;
+    cursor: pointer; padding: 4px 8px; border-radius: 8px; }
+  .zo-close:hover { background: rgba(0,0,0,.14); }
+  .zo-log { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 8px; min-height: 160px; }
+  .zo-msg { display: flex; flex-direction: column; }
+  .zo-msg.zo-zo { align-items: flex-start; }
+  .zo-msg.zo-me { align-items: flex-end; }
+  .zo-bubble { max-width: 85%; border-radius: 14px; padding: 9px 13px; font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; }
+  .zo-msg.zo-zo .zo-bubble { background: var(--bubble-theirs-bg); border: 1px solid var(--border-soft); border-bottom-left-radius: 4px; color: var(--ink-primary); }
+  .zo-msg.zo-me .zo-bubble { background: var(--bubble-mine-bg); border: 1px solid var(--border-gold); border-bottom-right-radius: 4px; color: var(--ink-primary); }
+  .zo-links { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; max-width: 85%; }
+  .zo-link { font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 999px;
+    border: 1px solid var(--border-gold); color: var(--gold); background: var(--gold-glow); }
+  .zo-link:hover { color: var(--gold-bright); }
+  .zo-typing { display: inline-flex; gap: 5px; align-items: center; }
+  .zo-typing span { width: 7px; height: 7px; border-radius: 50%; background: var(--ink-faint); animation: kf-zo-dot 1s var(--ez-drift) infinite; }
+  .zo-typing span:nth-child(2) { animation-delay: .15s; }
+  .zo-typing span:nth-child(3) { animation-delay: .3s; }
+  @keyframes kf-zo-dot { 0%, 60%, 100% { transform: none; opacity: .4; } 30% { transform: translateY(-4px); opacity: 1; } }
+  .zo-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 14px 8px; }
+  .zo-chips:empty { padding: 0; }
+  .zo-chip { font-size: 12px; padding: 5px 11px; border-radius: 999px; border: 1px solid var(--border-gold);
+    background: transparent; color: var(--gold); cursor: pointer; font-family: var(--font-body);
+    transition: background .15s var(--ez-release), transform .12s var(--ez-press); }
+  .zo-chip:hover { background: var(--gold-glow); }
+  .zo-chip:active { transform: scale(.94); }
+  .zo-form { display: flex; gap: 8px; padding: 10px 12px; border-top: 1px solid var(--border-soft); }
+  .zo-form input { flex: 1; min-width: 0; background: var(--input-bg); border: 1px solid var(--input-border);
+    border-radius: var(--radius-ctl); color: var(--ink-primary); padding: 9px 12px; font: 400 14px var(--font-body); }
+  .zo-form input:focus { outline: none; border-color: var(--gold); }
+  .zo-send { border: none; border-radius: var(--radius-ctl); background: var(--gradient-coin); color: var(--on-gold);
+    padding: 0 14px; cursor: pointer; font-size: 15px; box-shadow: var(--gold-shadow-sm); transition: transform .12s var(--ez-press); }
+  .zo-send:active { transform: scale(.92); }
+  /* Mobile: the panel becomes a full-width bottom sheet under 480px. */
+  @media (max-width: 480px) {
+    .zo { right: 12px; bottom: 12px; }
+    .zo-panel { position: fixed; left: 0; right: 0; bottom: 0; width: auto; max-width: none; max-height: 78vh;
+      border-radius: 16px 16px 0 0; transform-origin: bottom center; }
+  }
 
   /* TITAN motion additions: ghost-number slide-in (fires with the card's reveal) + hero word-rise */
   @keyframes kf-ghost-in { from { transform: translateX(28px); opacity: 0; } to { transform: none; opacity: 1; } }
@@ -2064,6 +2126,26 @@ ${ticker}
 </main>
 <div class="footer">Dealzoin — the B2B deal network. Companies only. 🪙</div>
 <button class="back-to-top" id="back-to-top" type="button" aria-label="Back to top" title="Back to top">&uarr;</button>
+<!-- ZO — 24/7 assistant widget (hidden until JS reveals it; no-JS visitors simply never see it) -->
+<div class="zo" id="zo" hidden>
+  <button class="zo-fab" id="zo-fab" type="button" aria-label="Chat with Zo, the Dealzoin assistant" aria-expanded="false" title="Zo — ask me anything">
+    <span class="zo-fab__pulse" aria-hidden="true"></span>
+    <span class="zo-fab__label">Zo</span>
+  </button>
+  <section class="zo-panel" id="zo-panel" role="dialog" aria-label="Zo — Dealzoin assistant" hidden>
+    <header class="zo-head">
+      <span class="zo-dot" aria-hidden="true"></span>
+      <div class="zo-title"><b>Zo — Dealzoin Assistant</b><span class="zo-sub">online 24/7</span></div>
+      <button class="zo-close" id="zo-close" type="button" aria-label="Close Zo chat" title="Close">&times;</button>
+    </header>
+    <div class="zo-log" id="zo-log" aria-live="polite"></div>
+    <div class="zo-chips" id="zo-chips"></div>
+    <form class="zo-form" id="zo-form" action="/assistant/ask" method="POST">
+      <input type="text" id="zo-input" name="message" maxlength="500" placeholder="Ask Zo anything…" autocomplete="off" aria-label="Message Zo">
+      <button class="zo-send" id="zo-send" type="submit" aria-label="Send message">&#10148;</button>
+    </form>
+  </section>
+</div>
 <script>(function(){
   /* ===== KINETIC — the one shared script: physics, reactive surfaces, choreography ===== */
   var RM=!!(window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches);
@@ -2101,7 +2183,7 @@ ${ticker}
     });
   });
   // Stat tiles: count-up 0 -> value over 800ms ease-out (reduced motion: jumps to final).
-  // The final frame restores the server's formatted label ("2,400+", "$1.2B" stay intact).
+  // The final frame restores the server's exact formatted label.
   function countUp(el){
     var target=parseFloat(el.getAttribute('data-count'));
     if(!isFinite(target))return;
@@ -2239,6 +2321,94 @@ ${ticker}
     var bttSync=function(){btt.classList.toggle('is-show',(window.pageYOffset||document.documentElement.scrollTop||0)>600);};
     addEventListener('scroll',bttSync,{passive:true});bttSync();
     btt.addEventListener('click',function(){window.scrollTo({top:0,behavior:RM?'auto':'smooth'});});
+  }
+  /* I) Zo — the 24/7 assistant widget. All rendering via createElement/textContent
+     (never innerHTML): user text and server text are inserted as text nodes, and the
+     server's optional links array becomes internal-only anchor buttons. */
+  var zoRoot=document.getElementById('zo');
+  if(zoRoot){
+    zoRoot.hidden=false;
+    var zoFab=document.getElementById('zo-fab'),zoPanel=document.getElementById('zo-panel'),
+        zoLog=document.getElementById('zo-log'),zoChips=document.getElementById('zo-chips'),
+        zoForm=document.getElementById('zo-form'),zoInput=document.getElementById('zo-input'),
+        zoClose=document.getElementById('zo-close');
+    var zoOpen=false,zoBusy=false,zoWelcomed=false;
+    function zoBubble(text,who,links){
+      var wrap=document.createElement('div');wrap.className='zo-msg zo-'+who;
+      var bub=document.createElement('div');bub.className='zo-bubble';
+      String(text==null?'':text).split('\\n').forEach(function(line,i){
+        if(i>0)bub.appendChild(document.createElement('br'));
+        bub.appendChild(document.createTextNode(line));
+      });
+      wrap.appendChild(bub);
+      if(links&&links.length){
+        var row=document.createElement('div');row.className='zo-links';
+        links.forEach(function(l){
+          if(!l||typeof l.href!=='string'||l.href.charAt(0)!=='/')return; /* internal links only */
+          var a=document.createElement('a');a.className='zo-link';a.href=l.href;
+          a.textContent=String(l.label||l.href);
+          row.appendChild(a);
+        });
+        if(row.childNodes.length)wrap.appendChild(row);
+      }
+      zoLog.appendChild(wrap);zoLog.scrollTop=zoLog.scrollHeight;
+      return wrap;
+    }
+    function zoTyping(on){
+      var t=document.getElementById('zo-typing');
+      if(on&&!t){
+        t=document.createElement('div');t.className='zo-msg zo-zo';t.id='zo-typing';
+        var bb=document.createElement('div');bb.className='zo-bubble zo-typing';
+        for(var i=0;i<3;i++)bb.appendChild(document.createElement('span'));
+        t.appendChild(bb);zoLog.appendChild(t);zoLog.scrollTop=zoLog.scrollHeight;
+      }else if(!on&&t){t.remove();}
+    }
+    function zoSuggest(list){
+      zoChips.textContent='';
+      (list||[]).slice(0,4).forEach(function(s){
+        var c=document.createElement('button');c.type='button';c.className='zo-chip';
+        c.textContent=String(s);
+        c.addEventListener('click',function(){zoSend(String(s));});
+        zoChips.appendChild(c);
+      });
+    }
+    function zoSend(text){
+      text=String(text||'').replace(/\s+$/,'').slice(0,500);
+      if(!text||zoBusy)return;
+      zoBubble(text,'me');zoSuggest([]);
+      zoBusy=true;zoTyping(true);
+      var start=Date.now();
+      fetch('/assistant/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text})})
+        .then(function(r){return r.json();})
+        .then(function(d){
+          var wait=Math.max(0,600-(Date.now()-start)); /* typing indicator shows ~600ms */
+          setTimeout(function(){
+            zoTyping(false);zoBusy=false;
+            zoBubble(d&&d.reply?d.reply:'Sorry — something went wrong on my side. Please try again.','zo',d&&d.links);
+            zoSuggest(d&&d.suggestions);
+          },wait);
+        })
+        .catch(function(){
+          zoTyping(false);zoBusy=false;
+          zoBubble('Connection hiccup — please try again in a moment.','zo');
+        });
+    }
+    function zoToggle(open){
+      zoOpen=open;
+      zoPanel.hidden=!open;
+      zoFab.setAttribute('aria-expanded',open?'true':'false');
+      zoRoot.classList.toggle('is-open',open);
+      if(open&&!zoWelcomed){
+        zoWelcomed=true;
+        zoBubble("Hi! I'm Zo — your 24/7 Dealzoin guide. Ask me about deals, signing, commission, tracking… anything.",'zo');
+        zoSuggest(['How do I post a deal?','How does signing work?','What is the commission?']);
+      }
+      if(open&&!RM)setTimeout(function(){zoInput.focus();},260);
+    }
+    zoFab.addEventListener('click',function(){zoToggle(!zoOpen);});
+    zoClose.addEventListener('click',function(){zoToggle(false);});
+    document.addEventListener('keydown',function(e){if(e.key==='Escape'&&zoOpen)zoToggle(false);});
+    zoForm.addEventListener('submit',function(e){e.preventDefault();var v=zoInput.value;zoInput.value='';zoSend(v);});
   }
 })();</script>
 </body></html>`;
@@ -2632,6 +2802,14 @@ function requireAdmin(req, res, next) {
 // ============================= PUBLIC ROUTES =============================
 app.get('/', (req, res) => {
   const user = currentUser(req);
+  // Real platform statistics — counted live from the database, never invented.
+  let stCompanies = 0, stDeals = 0, stClosed = 0, stDocs = 0;
+  try {
+    stCompanies = db.prepare("SELECT COUNT(*) AS n FROM companies WHERE status='approved'").get().n;
+    stDeals     = db.prepare("SELECT COUNT(*) AS n FROM deals").get().n;
+    stClosed    = db.prepare("SELECT COUNT(*) AS n FROM deals WHERE contract_state='approved'").get().n;
+    stDocs      = db.prepare("SELECT COUNT(*) AS n FROM documents WHERE authenticity_status='pass'").get().n;
+  } catch (e) { /* stats are decorative — never break the landing page */ }
   const body = `
   <div class="hero">
     <div class="bg-grid" aria-hidden="true"></div>
@@ -2659,10 +2837,10 @@ app.get('/', (req, res) => {
     <div class="card card--cut js-tilt a-enter" data-stage="cards" style="--i:4" data-num="03"><h3>03 The Trust Ledger</h3><p class="muted">Every offer, counter-offer and signature is timestamped to an audit trail your compliance team will actually enjoy.</p></div>
   </div>
   <div class="stats">
-    <div class="stat card--cut rv" style="--i:0" data-num="01"><div class="num gold" data-count="2400">2,400+</div><div class="lbl">Verified companies</div></div>
-    <div class="stat card--cut rv" style="--i:1" data-num="02"><div class="num gold">$1.2B</div><div class="lbl">Signed deal volume</div></div>
-    <div class="stat card--cut rv" style="--i:2" data-num="03"><div class="num gold" data-count="38">38</div><div class="lbl">Countries</div></div>
-    <div class="stat card--cut rv" style="--i:3" data-num="04"><div class="num gold">&lt;4h</div><div class="lbl">Median first response</div></div>
+    <div class="stat card--cut rv" style="--i:0" data-num="01"><div class="num gold" data-count="${stCompanies}">${stCompanies}</div><div class="lbl">Verified companies</div></div>
+    <div class="stat card--cut rv" style="--i:1" data-num="02"><div class="num gold" data-count="${stDeals}">${stDeals}</div><div class="lbl">Deals posted</div></div>
+    <div class="stat card--cut rv" style="--i:2" data-num="03"><div class="num gold" data-count="${stClosed}">${stClosed}</div><div class="lbl">Deals closed</div></div>
+    <div class="stat card--cut rv" style="--i:3" data-num="04"><div class="num gold" data-count="${stDocs}">${stDocs}</div><div class="lbl">Documents verified</div></div>
   </div>`;
   res.send(page('Welcome', body, user, req.query.msg, req.query.err));
 });
@@ -6315,7 +6493,8 @@ app.get('/chat/:id', (req, res) => {
   const body = `
   <div class="card">
     <div class="feed-head"><h2>${convAvatar}${esc(dn)}</h2>
-      <a class="btn btn-sm btn-outline" href="/chats">← All chats</a></div>
+      <span style="display:flex;gap:8px">${!user.isAdmin && member ? `<a class="btn btn-sm btn-green" href="/call/chat-${conv.id}">📹 Call</a>` : ''}
+      <a class="btn btn-sm btn-outline" href="/chats">← All chats</a></span></div>
     <p class="muted">${conv.type === 'group' ? 'Group conversation' : 'Private conversation'} · live updates${user.isAdmin ? '' : ' (SSE)'} · 8s refresh fallback</p>
     <hr class="sep">
     <div class="chat-box" id="chatbox">${bubbles}</div>
@@ -6497,7 +6676,7 @@ app.get('/calendar', requireCompany, (req, res) => {
       <label>Participant companies (they get notified)</label>
       <div style="max-height:200px;overflow:auto">${checks}</div>
       <button class="btn" type="submit" style="margin-top:10px">Create event</button>
-      <p class="muted" style="margin-top:6px">Every event gets a private Jitsi video room — visible to participants and the admin only.</p>
+      <p class="muted" style="margin-top:6px">Every event gets a private in-platform video room (WebRTC — no external provider), visible to participants and the admin only.</p>
     </form>
   </div>`;
   res.send(page('Calendar', body, req.user, req.query.msg, req.query.err, 'calendar'));
@@ -6525,6 +6704,7 @@ app.post('/calendar', requireCompany, (req, res) => {
   const create = db.transaction(() => {
     const evId = db.prepare(`INSERT INTO events (creator_company_id, title, type, event_date, event_time, notes, room, deal_id, created_at)
       VALUES (?,?,?,?,?,?, '', ?, ?)`).run(req.user.id, title, type, date, time, notes, type === 'signing' ? dealId : null, now()).lastInsertRowid;
+    // Legacy slug kept for schema/back-compat; the call itself is a native room at /call/event-<id>.
     const room = `Dealzoin-${evId}-${crypto.randomBytes(4).toString('hex')}`;
     db.prepare('UPDATE events SET room = ? WHERE id = ?').run(room, evId);
     const ins = db.prepare('INSERT OR IGNORE INTO event_participants (event_id, company_id) VALUES (?,?)');
@@ -6550,7 +6730,541 @@ app.get('/calendar/join/:id', (req, res) => {
     return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Private call</h2><p class="muted">Only event participants and the admin can join this call.</p></div>', user));
   }
   audit('CALENDAR AGENT', 'join call', 'pass', `${user.isAdmin ? 'Admin' : user.name} joined the call for event #${ev.id} ("${ev.title.slice(0, 60)}")`);
-  res.redirect(`https://meet.jit.si/${encodeURIComponent(ev.room)}`);
+  // Native in-platform call room (WebRTC) — no external provider. Old /calendar/join/:id links keep working.
+  res.redirect('/call/event-' + ev.id);
+});
+
+// ============================= NATIVE VIDEO CALLS (WebRTC signaling) =============================
+/* In-platform 1:1 / group video calls — no external provider (Jitsi fully replaced).
+ * NOTE: camera/microphone capture (getUserMedia) requires a secure context, so serve Dealzoin
+ * over HTTPS in production — http://localhost is a browser exception and still works for dev.
+ * Signaling state is in-memory (fine for a single dyno); the media itself flows peer-to-peer
+ * (mesh: one RTCPeerConnection per peer, comfortable up to ~6 participants). */
+const callRooms = new Map();        // roomKey -> Map(peerId -> { res, name })
+const CALL_MAX_SIGNAL_DATA = 32 * 1024; // sanity cap on relayed SDP/ICE payloads
+
+/** Resolve "event-<id>" / "chat-<id>" to its backing object plus the join-guard verdict. */
+function resolveCallRoom(roomId, user) {
+  const m = /^(event|chat)-(\d{1,9})$/.exec(String(roomId || ''));
+  if (!m || !user) return null;
+  const id = parseInt(m[2], 10);
+  if (m[1] === 'event') {
+    const ev = db.prepare('SELECT * FROM events WHERE id = ?').get(id);
+    if (!ev) return null;
+    return { key: 'event-' + id, kind: 'event', id, title: ev.title,
+      backUrl: '/calendar#ev-' + id, allowed: canJoinEvent(user, ev) };
+  }
+  const conv = db.prepare('SELECT * FROM conversations WHERE id = ?').get(id);
+  if (!conv) return null;
+  const names = companyNameMap();
+  return { key: 'chat-' + id, kind: 'chat', id, title: convDisplayName(conv, user.isAdmin ? 0 : user.id, names),
+    backUrl: '/chat/' + id, allowed: !!(user.isAdmin || isMember(id, user.id)) };
+}
+/** Names of the companies allowed in a room — rendered as the roster on the call page. */
+function callRoomRoster(room) {
+  try {
+    if (room.kind === 'event') {
+      const names = companyNameMap();
+      const ids = new Set();
+      const ev = db.prepare('SELECT creator_company_id FROM events WHERE id = ?').get(room.id);
+      if (ev) ids.add(ev.creator_company_id);
+      for (const p of db.prepare('SELECT company_id FROM event_participants WHERE event_id = ?').all(room.id)) ids.add(p.company_id);
+      return [...ids].map(cid => names.get(cid) || 'Unknown');
+    }
+    return db.prepare(`SELECT c.name FROM conversation_members cm JOIN companies c ON c.id = cm.company_id
+      WHERE cm.conversation_id = ? ORDER BY c.name`).all(room.id).map(r => r.name);
+  } catch (e) { return []; }
+}
+/** Push a JSON payload to the connected peers of a room (except `exceptPeer` when given). */
+function callBroadcast(roomKey, payload, exceptPeer) {
+  const peers = callRooms.get(roomKey);
+  if (!peers || !peers.size) return;
+  const data = `data: ${JSON.stringify(payload)}\n\n`;
+  for (const [pid, p] of [...peers]) {
+    if (pid === exceptPeer) continue;
+    try { p.res.write(data); } catch (e) { try { p.res.end(); } catch (_) {} peers.delete(pid); }
+  }
+}
+/**
+ * "📹 X started a call — Join": fired once per call (first peer in an empty room).
+ * Chat rooms get a system message in the conversation (+ live SSE push); event rooms notify
+ * participants/creator through the bell with a clickable Join link. Announcement failures
+ * must never break the call itself, so callers wrap this in try/catch.
+ */
+function announceCallStart(room, user) {
+  const link = '/call/' + room.key;
+  const who = (user.name + (user.memberName ? ` (${user.memberName})` : '')).slice(0, 120);
+  if (room.kind === 'chat') {
+    const text = `📹 ${who} started a call — Join: ${link}`;
+    const ts = now();
+    const info = db.prepare('INSERT INTO messages (conversation_id, sender_company_id, body, created_at, author_name) VALUES (?,?,?,?,?)')
+      .run(room.id, user.isAdmin ? 0 : user.id, text, ts, user.memberName || null);
+    sseBroadcast(room.id, {
+      id: Number(info.lastInsertRowid), conversation_id: room.id,
+      sender_company_id: user.isAdmin ? 0 : user.id, sender_name: user.name,
+      author_name: user.memberName || '', body: text, created_at: ts, cid: ''
+    });
+    for (const m of db.prepare('SELECT company_id FROM conversation_members WHERE conversation_id = ?').all(room.id)) {
+      if (user.isAdmin || m.company_id !== user.id) notify(m.company_id, 'call', `📹 ${who} started a call in your chat — tap to join.`, link);
+    }
+  } else {
+    const ev = db.prepare('SELECT * FROM events WHERE id = ?').get(room.id);
+    if (!ev) return;
+    const ids = new Set([ev.creator_company_id]);
+    for (const p of db.prepare('SELECT company_id FROM event_participants WHERE event_id = ?').all(room.id)) ids.add(p.company_id);
+    for (const cid of ids) {
+      if (user.isAdmin || cid !== user.id) notify(cid, 'call', `📹 ${who} started a call for "${ev.title.slice(0, 60)}" — tap to join.`, link);
+    }
+  }
+}
+
+/**
+ * Full-screen dark call UI (Titan Ledger palette) + the entire WebRTC client in vanilla JS.
+ * Defensive throughout: every async step is wrapped, remote names are only ever assigned via
+ * textContent (never innerHTML), and one bad signal/message cannot kill the call.
+ */
+function callPage(room, user) {
+  const roster = callRoomRoster(room);
+  const title = (room.kind === 'event' ? '📅 ' : '💬 ') + room.title;
+  const myName = user.name + (user.memberName ? ' · ' + user.memberName : '');
+  return `<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>📹 ${esc(title)} — Dealzoin Call</title>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0}
+[hidden]{display:none!important}
+html,body{height:100%}
+body{background:#0D1321;color:#F4F1E8;font-family:Inter,system-ui,sans-serif;display:flex;flex-direction:column;height:100vh;overflow:hidden}
+.ctop{display:flex;align-items:center;gap:16px;padding:12px 18px;background:rgba(13,19,33,.92);border-bottom:1px solid #24304A;flex-wrap:wrap}
+.cbrand{display:flex;align-items:center;gap:8px;color:#F4F1E8;text-decoration:none;font-family:'Space Grotesk',Inter,sans-serif;font-weight:700}
+.ccoin{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:50%;background:linear-gradient(120deg,#F08A3C 0%,#FFB37A 45%,#D0611C 100%);color:#160E04;font-size:13px;font-weight:700}
+.clive{background:#C93A56;color:#FFF7F0;font-size:10px;letter-spacing:1.5px;padding:3px 7px;border-radius:5px;margin-left:4px}
+.ctitle{flex:1;min-width:180px;display:flex;flex-direction:column;gap:2px}
+.croster{color:#A3ACC2;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:46vw}
+.cstatus{display:flex;align-items:center;gap:8px;font-size:13px;color:#A3ACC2}
+.dot{width:10px;height:10px;border-radius:50%;display:inline-block}
+.dot-ok{background:#3FE0B0;box-shadow:0 0 8px rgba(63,224,176,.7)}
+.dot-warn{background:#FFB454;animation:dzpulse 1.2s infinite}
+.dot-off{background:#FF6B85}
+@keyframes dzpulse{50%{opacity:.3}}
+.ccount{margin-left:10px}
+.cstage{flex:1;position:relative;overflow:hidden;padding:14px}
+.cgrid{display:grid;gap:14px;height:100%;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));grid-auto-rows:1fr;align-content:center}
+.tile{position:relative;background:#0A0F1C;border:1px solid #24304A;border-radius:14px;overflow:hidden;min-height:180px}
+.tile video{width:100%;height:100%;object-fit:cover;display:block}
+.tile-name{position:absolute;left:10px;bottom:10px;background:rgba(13,19,33,.78);border:1px solid #24304A;padding:3px 10px;border-radius:20px;font-size:12px}
+.cwaiting{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none}
+.cwait-card{display:flex;flex-direction:column;align-items:center;gap:10px;color:#A3ACC2;text-align:center;padding:20px;max-width:420px}
+.cwait-card b{color:#F4F1E8;font-family:'Space Grotesk',Inter,sans-serif;font-size:18px}
+.cwait-card span{font-size:13px}
+.cwait-pulse{width:16px;height:16px;border-radius:50%;background:#F58A3A;animation:dzpulse 1.4s infinite;box-shadow:0 0 14px rgba(245,138,58,.8)}
+.pip{position:fixed;right:18px;bottom:96px;width:220px;max-width:38vw;background:#0A0F1C;border:1px solid rgba(245,138,58,.38);border-radius:14px;overflow:hidden;box-shadow:0 12px 32px rgba(0,0,0,.5);z-index:5}
+.pip video{width:100%;aspect-ratio:4/3;object-fit:cover;display:block;background:#0A0F1C;transform:scaleX(-1)}
+.pip-name{position:absolute;left:8px;bottom:8px;background:rgba(13,19,33,.78);padding:2px 8px;border-radius:16px;font-size:11px}
+.pip-audio{display:flex;align-items:center;justify-content:center;padding:26px 8px;color:#A3ACC2;font-size:13px}
+.ccontrols{display:flex;justify-content:center;gap:14px;padding:14px;background:rgba(13,19,33,.92);border-top:1px solid #24304A}
+.cbtn{width:56px;height:56px;border-radius:50%;border:1px solid #24304A;background:#141D31;color:#F4F1E8;font-size:22px;cursor:pointer;transition:transform .12s,background .12s}
+.cbtn:hover{transform:translateY(-2px);background:#16203A}
+.cbtn.ctl-off{background:#3A1A24;border-color:#C93A56}
+.cbtn-hang{background:#C93A56;border-color:#FF6B85}
+.cbtn-hang:hover{background:#FF6B85}
+.perm{position:fixed;inset:0;background:rgba(9,13,24,.92);display:flex;align-items:center;justify-content:center;z-index:20;padding:16px}
+.perm-card{max-width:460px;background:#141D31;border:1px solid rgba(245,138,58,.38);border-radius:18px;padding:28px;text-align:center}
+.perm-icon{font-size:34px}
+.perm-card h2{font-family:'Space Grotesk',Inter,sans-serif;margin:10px 0 6px}
+.perm-card p{color:#A3ACC2;font-size:14px}
+.perm-steps{text-align:left;color:#A3ACC2;font-size:13px;margin:14px 0 14px 22px;display:flex;flex-direction:column;gap:6px}
+.perm-btns{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:6px}
+.cbtn2{padding:10px 18px;border-radius:12px;border:none;cursor:pointer;font-weight:600;font-size:14px;font-family:Inter,sans-serif}
+.cbtn2-gold{background:linear-gradient(120deg,#F08A3C 0%,#FFB37A 45%,#D0611C 100%);color:#160E04}
+.cbtn2-outline{background:transparent;border:1px solid #24304A;color:#F4F1E8}
+.toasts{position:fixed;top:14px;left:50%;transform:translateX(-50%);display:flex;flex-direction:column;gap:8px;z-index:30;max-width:90vw}
+.toast{background:#141D31;border:1px solid #24304A;color:#F4F1E8;padding:9px 16px;border-radius:12px;font-size:13px;box-shadow:0 8px 24px rgba(0,0,0,.45)}
+.toast-err{border-color:#C93A56}
+@media(max-width:640px){.pip{width:120px;bottom:86px}.cbtn{width:48px;height:48px;font-size:18px}.croster{max-width:60vw}}
+</style></head>
+<body>
+<header class="ctop">
+  <a class="cbrand" href="${esc(room.backUrl)}" title="Back"><span class="ccoin">Dz</span>Dealzoin<span class="clive">CALL</span></a>
+  <div class="ctitle"><b>${esc(title)}</b><span class="croster">👥 ${esc(roster.join(', ') || 'participants only')}</span></div>
+  <div class="cstatus"><span class="dot dot-warn" id="statusDot"></span><span id="statusText">starting…</span><span class="ccount">👤 <span id="peerCount">1</span></span></div>
+</header>
+<main class="cstage">
+  <div class="cgrid" id="grid"></div>
+  <div class="cwaiting" id="waiting">
+    <div class="cwait-card">
+      <div class="cwait-pulse"></div>
+      <b>Waiting for others to join…</b>
+      <span>Participants get a “📹 Join” prompt in their chats and notifications. This room is private to the invited companies.</span>
+    </div>
+  </div>
+</main>
+<div class="pip" id="pipWrap">
+  <video id="localVideo" autoplay muted playsinline></video>
+  <div class="pip-audio" id="pipAudio" hidden>🎙️ audio only</div>
+  <span class="pip-name">${esc(myName)} (you)</span>
+</div>
+<div class="perm" id="permOverlay" hidden>
+  <div class="perm-card">
+    <div class="perm-icon">🎥 🎙️</div>
+    <h2>Camera &amp; microphone needed</h2>
+    <p id="permMsg">Your browser will ask for permission — press <b>Allow</b> to join the call with video.</p>
+    <ol class="perm-steps">
+      <li>Click the lock / tune icon in the browser address bar.</li>
+      <li>Set <b>Camera</b> and <b>Microphone</b> to Allow for this site.</li>
+      <li>Come back here and press <b>Retry</b> (or continue audio-only).</li>
+    </ol>
+    <div class="perm-btns">
+      <button class="cbtn2 cbtn2-gold" id="btnRetry" type="button">↻ Retry</button>
+      <button class="cbtn2 cbtn2-outline" id="btnAudioOnly" type="button">🎙️ Continue audio-only</button>
+    </div>
+  </div>
+</div>
+<div class="ccontrols">
+  <button class="cbtn" id="btnMic" type="button" title="Mute / unmute microphone" aria-label="Mute microphone" aria-pressed="false">🎙️</button>
+  <button class="cbtn" id="btnCam" type="button" title="Camera on / off" aria-label="Toggle camera" aria-pressed="false">🎥</button>
+  <button class="cbtn cbtn-hang" id="btnHang" type="button" title="Hang up" aria-label="Hang up">🔴</button>
+</div>
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<script>(function(){
+'use strict';
+/* Dealzoin native call client — WebRTC mesh with perfect negotiation.
+ * getUserMedia needs a secure context (HTTPS); http://localhost is a browser exception. */
+var ROOM = ${jsonForHtml(room.key)};
+var BACK = ${jsonForHtml(room.backUrl)};
+var ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }];
+var myId = 'p' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+var peers = {};           // peerId -> { pc, name, makingOffer, ignoreOffer, polite, stream, tile, video, restartTimer }
+var localStream = null;
+var es = null;
+var micOn = true, camOn = true, audioOnly = false, hungUp = false;
+
+function $(id){ return document.getElementById(id); }
+function toast(msg, isErr){
+  var box = $('toasts'); if(!box) return;
+  var t = document.createElement('div');
+  t.className = 'toast' + (isErr ? ' toast-err' : '');
+  t.textContent = String(msg);           // textContent only — remote data never becomes HTML
+  box.appendChild(t);
+  setTimeout(function(){ if(t.parentNode) t.parentNode.removeChild(t); }, 5000);
+}
+function setStatus(txt, cls){
+  var dot = $('statusDot'), label = $('statusText');
+  if(dot) dot.className = 'dot ' + (cls || 'dot-warn');
+  if(label) label.textContent = txt;
+}
+function updateConnStatus(){
+  var ids = Object.keys(peers);
+  if(!ids.length){ if(!hungUp) setStatus('in room — waiting for peers', 'dot-warn'); return; }
+  var anyConn = false, anyTrying = false;
+  for(var i = 0; i < ids.length; i++){
+    var s = peers[ids[i]].pc.iceConnectionState;
+    if(s === 'connected' || s === 'completed') anyConn = true;
+    else if(s === 'new' || s === 'checking' || s === 'disconnected') anyTrying = true;
+  }
+  if(anyConn) setStatus('connected', 'dot-ok');
+  else if(anyTrying) setStatus('connecting…', 'dot-warn');
+  else setStatus('connection lost — retrying…', 'dot-off');
+}
+function updateWaiting(){
+  var n = Object.keys(peers).length;
+  var w = $('waiting'); if(w) w.style.display = n ? 'none' : 'flex';
+  var c = $('peerCount'); if(c) c.textContent = String(n + 1);
+}
+function sendSignal(to, data){
+  fetch('/call/' + encodeURIComponent(ROOM) + '/signal', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ to: to, from: myId, data: data })
+  }).then(function(r){ if(!r.ok) toast('Signaling hiccup — the connection will retry automatically.', true); })
+    .catch(function(){ toast('Signaling connection lost — retrying…', true); });
+}
+
+// ----- Media capture (with permission-denied fallback UI) -----
+function showPerm(msg){
+  var o = $('permOverlay'), m = $('permMsg');
+  if(m && msg) m.textContent = msg;
+  if(o) o.hidden = false;
+}
+function hidePerm(){ var o = $('permOverlay'); if(o) o.hidden = true; }
+function startMedia(audioOnlyMode){
+  audioOnly = !!audioOnlyMode;
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    showPerm('Camera and microphone need a secure (HTTPS) page — on http://localhost they work by browser exception.');
+    return;
+  }
+  var constraints = audioOnly
+    ? { audio: { echoCancellation: true, noiseSuppression: true }, video: false }
+    : { audio: { echoCancellation: true, noiseSuppression: true }, video: { width: { ideal: 1280 }, height: { ideal: 720 } } };
+  navigator.mediaDevices.getUserMedia(constraints).then(function(stream){
+    localStream = stream;
+    var lv = $('localVideo');
+    if(lv){ lv.srcObject = stream; lv.style.display = audioOnly ? 'none' : 'block'; }
+    var pa = $('pipAudio'); if(pa) pa.hidden = !audioOnly;
+    var bc = $('btnCam'); if(bc && audioOnly) bc.classList.add('ctl-off');
+    camOn = !audioOnly;
+    hidePerm();
+    connectSignaling();
+  }).catch(function(err){
+    var msg = (err && (err.name === 'NotAllowedError' || err.name === 'SecurityError'))
+      ? 'Permission denied — allow the camera & microphone in the browser address bar, then press Retry (or continue audio-only).'
+      : 'Could not access the camera/microphone' + (err && err.message ? ': ' + err.message : '');
+    showPerm(msg);
+  });
+}
+
+// ----- Signaling channel (SSE) -----
+function connectSignaling(){
+  if(es) return;
+  try { es = new EventSource('/call/' + encodeURIComponent(ROOM) + '/stream?peer=' + encodeURIComponent(myId)); }
+  catch(e){ toast('Live signaling is not supported in this browser.', true); return; }
+  es.onopen = function(){ updateConnStatus(); };
+  es.onerror = function(){ setStatus('reconnecting to room…', 'dot-warn'); }; // EventSource retries automatically
+  es.onmessage = function(ev){
+    var m; try { m = JSON.parse(ev.data); } catch(e){ return; }
+    if(!m || typeof m !== 'object') return;
+    try {
+      if(m.type === 'peers'){
+        var list = m.peers || [];
+        for(var i = 0; i < list.length; i++){ if(list[i] && list[i].id) addPeer(String(list[i].id), String(list[i].name || 'Guest')); }
+      } else if(m.type === 'join' && m.peer && m.peer.id){
+        addPeer(String(m.peer.id), String(m.peer.name || 'Guest'));
+        toast('👋 ' + String(m.peer.name || 'Someone') + ' joined the call');
+      } else if(m.type === 'leave'){
+        removePeer(String(m.id || ''));
+      } else if(m.type === 'signal'){
+        onSignal(String(m.from || ''), m.data);
+      }
+    } catch(e){ /* one bad frame must never kill the call */ }
+  };
+}
+
+// ----- Mesh peer connections (perfect negotiation; polite peer = lower id) -----
+function addPeer(peerId, name){
+  if(peerId === myId || peers[peerId]) return;
+  if(typeof RTCPeerConnection === 'undefined'){ toast('WebRTC is not supported in this browser.', true); return; }
+  var st = { name: name, makingOffer: false, ignoreOffer: false, polite: myId < peerId, stream: null, tile: null, video: null, restartTimer: null, pc: null };
+  var pc;
+  try { pc = new RTCPeerConnection({ iceServers: ICE_SERVERS }); }
+  catch(e){ toast('Could not open a peer connection.', true); return; }
+  st.pc = pc;
+  peers[peerId] = st;
+
+  pc.onnegotiationneeded = function(){
+    st.makingOffer = true;
+    pc.setLocalDescription().then(function(){
+      sendSignal(peerId, { description: pc.localDescription });
+      st.makingOffer = false;
+    }).catch(function(){ st.makingOffer = false; });
+  };
+  pc.onicecandidate = function(ev){ if(ev.candidate) sendSignal(peerId, { candidate: ev.candidate }); };
+  pc.ontrack = function(ev){
+    if(ev.streams && ev.streams[0]) st.stream = ev.streams[0];
+    attachTile(peerId);
+  };
+  pc.oniceconnectionstatechange = function(){
+    var s = pc.iceConnectionState;
+    if(s === 'connected' || s === 'completed'){
+      if(st.restartTimer){ clearTimeout(st.restartTimer); st.restartTimer = null; }
+    } else if(s === 'failed'){
+      toast('Connection to ' + st.name + ' failed — restarting…', true);
+      safeRestart(pc);
+    } else if(s === 'disconnected'){
+      // Auto-reconnect: give ICE a moment to recover on its own, then restart ICE.
+      if(st.restartTimer) clearTimeout(st.restartTimer);
+      st.restartTimer = setTimeout(function(){ if(pc.iceConnectionState === 'disconnected') safeRestart(pc); }, 4000);
+    }
+    updateConnStatus();
+  };
+  if(localStream){
+    localStream.getTracks().forEach(function(t){ try { pc.addTrack(t, localStream); } catch(e){} });
+  }
+  updateWaiting(); updateConnStatus();
+}
+function safeRestart(pc){ try { pc.restartIce(); } catch(e){} }
+
+function onSignal(from, data){
+  if(!from || !data || typeof data !== 'object') return;
+  var st = peers[from];
+  if(!st || !st.pc) return;                    // stale/unknown peer — ignore defensively
+  var pc = st.pc;
+  if(data.description){
+    var desc = data.description;
+    var collision = desc.type === 'offer' && (st.makingOffer || pc.signalingState !== 'stable');
+    st.ignoreOffer = !st.polite && collision;  // impolite peer rolls back on glare
+    if(st.ignoreOffer) return;
+    pc.setRemoteDescription(desc).then(function(){
+      if(desc.type === 'offer'){
+        return pc.setLocalDescription().then(function(){ sendSignal(from, { description: pc.localDescription }); });
+      }
+    }).catch(function(){ toast('Signaling error with ' + st.name, true); });
+  } else if(data.candidate){
+    pc.addIceCandidate(data.candidate).catch(function(err){
+      if(!st.ignoreOffer && window.console && console.error) console.error('ICE candidate error', err);
+    });
+  }
+}
+
+// ----- Remote video tiles -----
+function attachTile(peerId){
+  var st = peers[peerId];
+  if(!st || !st.stream) return;
+  if(!st.tile){
+    var grid = $('grid'); if(!grid) return;
+    var tile = document.createElement('div'); tile.className = 'tile';
+    var v = document.createElement('video');
+    v.autoplay = true; v.playsInline = true; v.setAttribute('playsinline', '');
+    var label = document.createElement('div'); label.className = 'tile-name';
+    label.textContent = st.name;               // textContent only
+    tile.appendChild(v); tile.appendChild(label);
+    grid.appendChild(tile);
+    st.tile = tile; st.video = v;
+  }
+  if(st.video && st.video.srcObject !== st.stream) st.video.srcObject = st.stream;
+  updateWaiting();
+}
+function removePeer(peerId){
+  var st = peers[peerId];
+  if(!st) return;
+  toast('👋 ' + st.name + ' left the call');
+  if(st.restartTimer) clearTimeout(st.restartTimer);
+  try { st.pc.close(); } catch(e){}
+  if(st.tile && st.tile.parentNode) st.tile.parentNode.removeChild(st.tile);
+  delete peers[peerId];
+  updateWaiting(); updateConnStatus();
+}
+
+// ----- Controls -----
+function cleanup(){
+  try { if(es) es.close(); } catch(e){}
+  Object.keys(peers).forEach(function(id){ try { peers[id].pc.close(); } catch(e){} });
+  if(localStream) localStream.getTracks().forEach(function(t){ try { t.stop(); } catch(e){} });
+}
+function hangUp(){
+  if(hungUp) return; hungUp = true;
+  cleanup();
+  setStatus('call ended', 'dot-off');
+  window.location.href = BACK;               // back to the event / chat
+}
+function bindControls(){
+  var bm = $('btnMic'), bc = $('btnCam'), bh = $('btnHang'), br = $('btnRetry'), ba = $('btnAudioOnly');
+  if(bm) bm.addEventListener('click', function(){
+    micOn = !micOn;
+    if(localStream) localStream.getAudioTracks().forEach(function(t){ t.enabled = micOn; });
+    bm.classList.toggle('ctl-off', !micOn);
+    bm.setAttribute('aria-pressed', micOn ? 'false' : 'true');
+  });
+  if(bc) bc.addEventListener('click', function(){
+    camOn = !camOn;
+    if(localStream) localStream.getVideoTracks().forEach(function(t){ t.enabled = camOn; });
+    bc.classList.toggle('ctl-off', !camOn);
+    bc.setAttribute('aria-pressed', camOn ? 'false' : 'true');
+  });
+  if(bh) bh.addEventListener('click', hangUp);
+  if(br) br.addEventListener('click', function(){ startMedia(audioOnly); });
+  if(ba) ba.addEventListener('click', function(){ startMedia(true); });
+  window.addEventListener('pagehide', cleanup);
+}
+
+// ----- Boot -----
+bindControls();
+updateWaiting();
+startMedia(false);
+})();</script>
+</body></html>`;
+}
+
+// Call page (party-guarded): event rooms → participants/creator/admin; chat rooms → members/admin.
+app.get('/call/:room', (req, res) => {
+  const user = currentUser(req);
+  if (!user) return res.redirect('/login?err=' + encodeURIComponent('Please sign in.'));
+  const room = resolveCallRoom(req.params.room, user);
+  if (!room) return res.status(404).send(page('Not found', '<div class="card"><h2>Call not found</h2><p class="muted"><a href="/">Back to home</a></p></div>', user));
+  if (!room.allowed) {
+    audit('CALL AGENT', 'join call guard', 'fail', `Unauthorized call-room attempt on ${room.key} by ${user.isAdmin ? 'admin?' : user.name}`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Private call</h2><p class="muted">Only the invited participants (and the admin) can join this call.</p></div>', user));
+  }
+  res.send(callPage(room, user));
+});
+
+// Per-room SSE signaling channel: presence (join/leave) + WebRTC offer/answer/ICE relay.
+// Same shape as the chat stream (25s heartbeat, in-memory registry, guarded per room).
+app.get('/call/:room/stream', (req, res) => {
+  const user = currentUser(req);
+  if (!user) return res.status(401).send('sign-in required');
+  const room = resolveCallRoom(req.params.room, user);
+  if (!room || !room.allowed) {
+    audit('CALL AGENT', 'stream guard', 'fail', `Blocked call stream on ${String(req.params.room).slice(0, 40)} for ${user.name}`);
+    return res.status(403).send('forbidden');
+  }
+  let peerId = String(req.query.peer || '');
+  if (!/^[a-zA-Z0-9_-]{4,48}$/.test(peerId)) peerId = crypto.randomBytes(8).toString('hex');
+  let peers = callRooms.get(room.key);
+  const wasEmpty = !peers || !peers.size;
+  if (!peers) { peers = new Map(); callRooms.set(room.key, peers); }
+  while (peers.has(peerId)) peerId = (peerId.slice(0, 40) + crypto.randomBytes(2).toString('hex'));
+  const displayName = (user.name + (user.memberName ? ' · ' + user.memberName : '')).slice(0, 80);
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  res.write(': connected\n\n');
+  // Roster of already-connected peers for the newcomer (the newcomer initiates the mesh offers).
+  const roster = [...peers].map(([pid, p]) => ({ id: pid, name: p.name }));
+  res.write(`data: ${JSON.stringify({ type: 'peers', self: { id: peerId, name: displayName }, peers: roster })}\n\n`);
+  peers.set(peerId, { res, name: displayName, owner: readSignedCookie(req, 'dz_session') || '' });
+  callBroadcast(room.key, { type: 'join', peer: { id: peerId, name: displayName } }, peerId);
+  audit('CALL AGENT', 'join call', 'pass', `${displayName} joined ${room.key} (${peers.size} in room)`);
+  // The first peer in an empty room "starts" the call — announce it with a Join link.
+  if (wasEmpty) {
+    try { announceCallStart(room, user); } catch (e) { /* never break the call on announce failure */ }
+    audit('CALL AGENT', 'call started', 'pass', `${displayName} started ${room.key} — participants notified`);
+  }
+  const heartbeat = setInterval(() => { try { res.write(':ping\n\n'); } catch (e) { /* closed */ } }, 25000);
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    const set = callRooms.get(room.key);
+    if (set) { set.delete(peerId); if (!set.size) callRooms.delete(room.key); }
+    callBroadcast(room.key, { type: 'leave', id: peerId, name: displayName });
+    audit('CALL AGENT', 'leave call', 'pass', `${displayName} left ${room.key}`);
+  });
+});
+
+// Signaling relay: JSON {to?, from, data} → targeted peer or broadcast to the room's other peers.
+app.post('/call/:room/signal', (req, res) => {
+  const user = currentUser(req);
+  if (!user) return res.status(401).json({ ok: false, error: 'auth' });
+  const room = resolveCallRoom(req.params.room, user);
+  if (!room || !room.allowed) return res.status(403).json({ ok: false, error: 'forbidden' });
+  const peers = callRooms.get(room.key);
+  if (!peers) return res.status(404).json({ ok: false, error: 'room-not-live' });
+  const body = req.body || {};
+  const to = body.to == null ? null : String(body.to);
+  const data = body.data;
+  // Sender is stamped server-side from the caller's session — the client-supplied "from" is NEVER trusted (anti-spoofing).
+  const myToken = readSignedCookie(req, 'dz_session') || '';
+  const mine = [...peers].find(([, p]) => p.owner === myToken);
+  if (!mine) return res.status(400).json({ ok: false, error: 'unknown-sender' });
+  const from = mine[0];
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return res.status(400).json({ ok: false, error: 'bad-data' });
+  let payload;
+  try { payload = `data: ${JSON.stringify({ type: 'signal', from, data })}\n\n`; } catch (e) { return res.status(400).json({ ok: false, error: 'bad-data' }); }
+  if (payload.length > CALL_MAX_SIGNAL_DATA) return res.status(413).json({ ok: false, error: 'too-large' });
+  if (to) {
+    const target = peers.get(to);
+    if (target) { try { target.res.write(payload); } catch (e) { try { target.res.end(); } catch (_) {} peers.delete(to); } }
+  } else {
+    for (const [pid, p] of [...peers]) {
+      if (pid === from) continue;
+      try { p.res.write(payload); } catch (e) { try { p.res.end(); } catch (_) {} peers.delete(pid); }
+    }
+  }
+  res.json({ ok: true });
 });
 
 // ============================= GLOBAL SHIPMENT TRACKING MAP (/tracking) =============================
@@ -7475,6 +8189,306 @@ app.post('/admin/negotiations/:id/reject', requireAdmin, (req, res) => {
   notify(neg.buyer_id, 'negotiation_rejected', `An admin rejected the contract on "${deal ? deal.title : 'deal #' + neg.deal_id}" at final approval.`, `/negotiation/${neg.id}`);
   notify(neg.seller_id, 'negotiation_rejected', `An admin rejected the contract on "${deal ? deal.title : 'deal #' + neg.deal_id}" at final approval.`, `/negotiation/${neg.id}`);
   res.redirect('/admin/dashboard?msg=' + encodeURIComponent('Negotiation rejected.'));
+});
+
+// ============================= ZO — 24/7 PLATFORM ASSISTANT =============================
+/* "Zo" powers the floating chat widget. Fully self-contained (zero external dependencies,
+ * zero API cost): a curated KNOWLEDGE base + lowercase token-overlap scoring with keyword
+ * weights. Replies are server-authored plain text plus an optional links array
+ * [{label, href}] — the widget renders everything with textContent/createElement, so user
+ * text is never injected as HTML and the message is never reflected back.
+ * Scopes: 'public' (answered for anyone, even logged-out landing visitors) ·
+ * 'user' (company/sub-account sessions only) · 'admin' (admin sessions only). */
+
+const ZO_MATCH_THRESHOLD = 3;  // minimum weighted score before Zo accepts an intent
+const ZO_MAX_MESSAGE = 500;    // hard cap on the incoming question length
+const ZO_STARTERS = ['How do I post a deal?', 'How does signing work?', 'What is the commission?'];
+const zoAuditThrottle = new Map(); // session/IP key -> last audit ts (max 1 agent_audit row per minute)
+
+/** Tiny live counters for account-aware answers — a handful of indexed COUNTs, computed lazily. */
+function zoQuickStats(user) {
+  const s = { openDeals: 0, pendingPayments: 0, contracts: 0, unreadChats: 0, unreadNotifs: 0 };
+  if (!user || user.isAdmin) return s;
+  try { s.openDeals = db.prepare(`SELECT COUNT(*) AS n FROM deals WHERE company_id = ? AND COALESCE(status, 'open') = 'open'`).get(user.id).n; } catch (e) { /* keep 0 */ }
+  try { s.pendingPayments = db.prepare(`SELECT COUNT(*) AS n FROM deals WHERE company_id = ? AND payment_status = 'pending_payment'`).get(user.id).n; } catch (e) { /* keep 0 */ }
+  try { s.contracts = db.prepare('SELECT COUNT(*) AS n FROM contracts WHERE signer_company_id = ? OR owner_company_id = ?').get(user.id, user.id).n; } catch (e) { /* keep 0 */ }
+  try { s.unreadChats = totalUnread(user.id); } catch (e) { /* keep 0 */ }
+  try { s.unreadNotifs = unreadNotifications(user.id); } catch (e) { /* keep 0 */ }
+  return s;
+}
+
+const ZO_KNOWLEDGE = [
+  // ----- General / platform (public scope: safe for logged-out visitors too) -----
+  { id: 'greeting', scope: 'public',
+    kw: [['hello', 3], ['hi', 2], ['hey', 2], ['good morning', 4], ['good afternoon', 4], ['good evening', 4], ['salaam', 3], ['salam', 3], ['greetings', 3], ['hola', 2]],
+    reply: (c) => ({ text: `Hi${c.user && !c.user.isAdmin ? ' ' + c.user.name : ''}! I'm Zo, the Dealzoin assistant — online 24/7. Ask me about posting deals, the LOI pipeline, signing, commission, tracking… anything.`,
+      links: [], sug: ZO_STARTERS }) },
+  { id: 'who_are_you', scope: 'public',
+    kw: [['who are you', 6], ['what are you', 4], ['zo', 2], ['assistant', 2], ['bot', 2], ['robot', 2], ['are you ai', 3]],
+    reply: () => ({ text: "I'm Zo — Dealzoin's built-in platform guide. I run entirely on the platform's own knowledge base: no external services, no waiting, 24/7. I can explain any feature and point you to the right page.",
+      links: [], sug: ['What is Dealzoin?', 'How do I register?', 'What can you help with?'] }) },
+  { id: 'what_is_dealzoin', scope: 'public',
+    kw: [['what is dealzoin', 8], ['dealzoin', 3], ['about', 2], ['what is this', 3], ['this platform', 3], ['b2b', 2]],
+    reply: () => ({ text: 'Dealzoin is a closed B2B deal network for verified companies. Vetted companies post buy/sell opportunities, negotiate in private deal rooms (LOI → offer → PO → signing), and close with OTP-signed contracts — every step on the record and admin-verified.',
+      links: [{ label: 'How it works', href: '/#why' }, { label: 'Register', href: '/signup' }], sug: ['How do I register?', 'What is the commission?'] }) },
+  { id: 'register', scope: 'public',
+    kw: [['register', 4], ['sign up', 5], ['signup', 5], ['join', 3], ['create account', 4], ['registration', 4], ['become a member', 3], ['open an account', 3], ['apply', 2]],
+    reply: () => ({ text: 'Registering takes two steps:\n1) Start at the signup page — enter (or auto-parse) your company profile: name, business email, password and details.\n2) Add your company details + KYC documents (PDF), accept the five pledges and type your legal signature.\nThe Onboarding Agent and an admin then review your application — you can sign in as soon as you are approved.',
+      links: [{ label: 'Register company', href: '/signup' }, { label: 'Sign in', href: '/login' }], sug: ['Which KYC documents do I need?', 'Why is my account pending?'] }) },
+  { id: 'kyc_documents', scope: 'public',
+    kw: [['kyc', 5], ['documents do i need', 5], ['which documents', 4], ['what documents', 4], ['moa', 4], ['bank statement', 3], ['required documents', 4], ['signed terms', 3]],
+    reply: () => ({ text: 'For registration you need real PDF files (max 15 MB each):\n• MOA & authority document (required)\n• Bank account statement / proof of funds (required)\n• Signed Terms & Conditions (required — download, sign, upload)\n• Company profile PDF and activity proof (optional, but they speed up approval).\nEvery file is checked by the Document Authenticity Agent.',
+      links: [{ label: 'Terms & Conditions', href: '/legal/terms' }, { label: 'Register', href: '/signup' }], sug: ['Why is my account pending?', 'How do I register?'] }) },
+  { id: 'pending_approval', scope: 'public',
+    kw: [['pending', 4], ['approval', 3], ['how long', 3], ['waiting', 2], ['approved yet', 3], ['not approved', 3], ['still pending', 4], ['when will', 2]],
+    reply: () => ({ text: "New registrations stay 'pending' while the Onboarding Agent reviews your details and the Document Authenticity Agent checks your KYC PDFs — then an admin gives the final approval. You can sign in the moment you are approved. If it takes unusually long or a document was flagged, email the admin with your company name.",
+      links: [{ label: 'Sign in', href: '/login' }], sug: ['Which KYC documents do I need?', 'How do I contact the admin?'] }) },
+  { id: 'post_deal', scope: 'public',
+    kw: [['post a deal', 6], ['create a deal', 6], ['new deal', 4], ['post deal', 5], ['sell', 2], ['buy', 2], ['listing', 2], ['publish', 3], ['how do i post', 5], ['buy vs sell', 5]],
+    reply: () => ({ text: 'Open the create page (the + in the nav). Choose the deal type: SELL if you offer goods (a product-proof PDF is required) or BUY if you are looking to purchase. Fill in title, description, value & currency, category, origin/destination and the incoterm, attach a photo or video if you like, and publish — your deal gets its official number instantly.',
+      links: [{ label: 'Create a deal', href: '/deals/new' }], sug: ['What are deal numbers?', 'What are incoterms?'] }) },
+  { id: 'deal_numbers', scope: 'public',
+    kw: [['deal number', 6], ['deal numbers', 6], ['numbering', 3], ['reference number', 3], ['dz', 2]],
+    reply: () => ({ text: 'Every deal receives an official number the moment it is published: DZ-<year>-<sequence>, e.g. DZ-2025-0042. Use it in contracts, chats and support requests — it uniquely identifies the deal across the platform.',
+      links: [], sug: ['How do I post a deal?'] }) },
+  { id: 'loi_pipeline', scope: 'public',
+    kw: [['loi', 5], ['letter of intent', 6], ['pipeline', 4], ['negotiation steps', 5], ['deal room', 3], ['how does a deal work', 5], ['process', 3], ['negotiation', 3], ['negotiate', 3]],
+    reply: () => ({ text: 'Deal rooms follow a fixed pipeline:\n1) LOI — the buyer sends a Letter of Intent from the deal page.\n2) Offer / counter-offers — both sides negotiate value & terms.\n3) Buyer approval → PO — the buyer issues a Purchase Order.\n4) Signing — both parties sign with an OTP code.\n5) Owner approval → commission split → admin final approval → DONE.\nYou can follow every step on the negotiation page.',
+      links: [{ label: 'Deals inbox', href: '/deals/inbox' }, { label: 'Explore deals', href: '/explore' }], sug: ['How do counter offers work?', 'How does signing work?'] }) },
+  { id: 'counter_offers', scope: 'public',
+    kw: [['counter offer', 6], ['counter-offer', 6], ['counteroffer', 6], ['counter', 3], ['negotiate price', 4], ['new price', 3], ['make an offer', 4]],
+    reply: () => ({ text: 'On a deal page (or inside a negotiation) you can send a counter offer with a new value, currency and terms. The offer is confirmed with an OTP code, and the other party can accept or refuse it — every round is recorded on the deal timeline.',
+      links: [{ label: 'Explore deals', href: '/explore' }], sug: ['What is the LOI pipeline?', 'How does signing work?'] }) },
+  { id: 'purchase_order', scope: 'public',
+    kw: [['purchase order', 6], ['po', 3], ['send po', 5]],
+    reply: () => ({ text: 'Once the buyer approves the negotiated terms, they issue a Purchase Order from the negotiation room. The PO is downloadable as a .doc document, and sending it moves the deal into the signing stage.',
+      links: [], sug: ['What is the LOI pipeline?', 'How does signing work?'] }) },
+  { id: 'signing_otp', scope: 'public',
+    kw: [['sign', 4], ['signing', 5], ['signature', 4], ['otp', 5], ['sign a contract', 6], ['sign the contract', 6], ['sign contract', 5], ['6-digit', 3]],
+    reply: () => ({ text: 'Contracts are signed inside the deal room after the LOI → offer → PO stages. When it is your turn, open the signing page, review the contract, and confirm with the 6-digit OTP code sent to your business email (valid 10 minutes). Both parties sign, the owner approves, then an admin gives the final approval. Every signature is timestamped and auditable.',
+      links: [{ label: 'Contracts', href: '/contracts' }, { label: 'Deals inbox', href: '/deals/inbox' }], sug: ['What is the LOI pipeline?', 'What is the commission?'] }) },
+  { id: 'commission', scope: 'public',
+    kw: [['commission', 6], ['fee', 3], ['platform fee', 6], ['percent', 3], ['percentage', 3], ['how much', 2], ['payment gate', 5], ['bank details', 4], ['bank transfer', 4], ['pay the commission', 5]],
+    reply: (c) => ({ text: `Dealzoin charges a ${c.pct}% platform commission on finalized deals (the admin can adjust it — right now it is ${c.pct}%). By default it is split 50/50 between buyer and seller, but the parties can agree the buyer or seller pays 100%. Payment is by bank transfer to the admin's account details, shown on the deal's payment card. Once the admin approves the payment, shipment tracking unlocks. The fee is frozen at final-approval time, so later changes never rewrite a closed deal.`,
+      links: [{ label: 'Tracking', href: '/tracking' }], sug: ['How does tracking work?', 'What are incoterms?'] }) },
+  { id: 'tracking', scope: 'public',
+    kw: [['tracking', 5], ['track', 3], ['shipment', 5], ['shipping', 4], ['vessel', 3], ['cargo', 3], ['map', 3], ['where is my', 3]],
+    reply: () => ({ text: 'The Tracking page shows live shipment maps for your finalized CIF/CRF deals once the commission payment is approved (the payment gate). Each deal page also has its own shipment tracking map with origin → destination. FOP deals are not tracked on-platform, because the buyer arranges the carriage.',
+      links: [{ label: 'Shipment tracking', href: '/tracking' }], sug: ['What are incoterms?', 'What is the commission?'] }) },
+  { id: 'incoterms', scope: 'public',
+    kw: [['incoterm', 6], ['incoterms', 6], ['fop', 4], ['cif', 4], ['crf', 4], ['freight', 3], ['insurance', 2]],
+    reply: () => ({ text: 'Deals use three incoterms:\n• FOP — Free on Plane/Point: the buyer arranges & pays main carriage; no platform tracking.\n• CIF — Cost, Insurance & Freight: the seller pays shipping and insurance to the destination port; platform tracking enabled.\n• CRF — Cost & Freight: the seller pays freight to the destination port; insurance is on the buyer; platform tracking enabled.\nYou pick the incoterm when posting the deal.',
+      links: [{ label: 'Create a deal', href: '/deals/new' }], sug: ['How does tracking work?', 'How do I post a deal?'] }) },
+  { id: 'follow', scope: 'public',
+    kw: [['follow', 4], ['unfollow', 4], ['followers', 3], ['following', 3]],
+    reply: () => ({ text: 'Open any company profile and hit Follow — their new deals and posts then appear in your timeline, and following companies in a category also improves your Explorer recommendations. You can unfollow any time from the same button.',
+      links: [{ label: 'Browse companies', href: '/companies' }], sug: ['Timeline vs Explorer?'] }) },
+  { id: 'timeline_explorer', scope: 'public',
+    kw: [['timeline', 4], ['explorer', 4], ['explore', 4], ['feed', 3], ['difference', 3]],
+    reply: () => ({ text: 'The Timeline is your home feed: posts and deals from you and the companies you follow. The Explorer scans ALL open deals on the network and ranks them for you — by the categories you follow and engage with, trending activity, and reputation. Use the timeline to keep up, the explorer to discover.',
+      links: [{ label: 'Timeline', href: '/timeline' }, { label: 'Explorer', href: '/explore' }], sug: ['How do I follow companies?'] }) },
+  { id: 'search', scope: 'public',
+    kw: [['search', 4], ['filter', 4], ['filters', 4], ['find', 2], ['category', 3], ['categories', 3], ['look for', 2]],
+    reply: () => ({ text: 'Use the Search page (magnifier in the nav) to find deals, posts and companies — combine keywords with filters like category and deal type. Deals carry categories, so filtering by category is the fastest way to narrow the floor.',
+      links: [{ label: 'Search', href: '/search' }], sug: ['Timeline vs Explorer?'] }) },
+  { id: 'chats', scope: 'public',
+    kw: [['chat', 4], ['chats', 4], ['message', 3], ['messages', 3], ['group chat', 5], ['conversation', 3], ['dm', 2]],
+    reply: () => ({ text: 'Chats live under the speech-bubble icon: private 1-to-1 conversations and group chats with several companies, streaming live without refresh. Start a private chat from a company profile, or create a group from the Chats page. The nav badge shows your total unread messages.',
+      links: [{ label: 'Open chats', href: '/chats' }], sug: ['What are private contracts?', 'What are my messages?'] }) },
+  { id: 'private_contracts', scope: 'public',
+    kw: [['private contract', 6], ['private contracts', 6], ['mailbox', 4], ['contracts inbox', 4], ['send a contract', 5]],
+    reply: () => ({ text: 'The Contracts mailbox lets you send a private contract directly to another company — title, value and terms. The recipient signs (or declines), you approve, and an admin gives the final approval. Received contracts awaiting your action show a badge on the Contracts nav icon, and every contract is downloadable.',
+      links: [{ label: 'Contracts mailbox', href: '/contracts' }, { label: 'New private contract', href: '/contracts/new' }], sug: ['How does signing work?'] }) },
+  { id: 'notifications', scope: 'public',
+    kw: [['notification', 4], ['notifications', 4], ['bell', 3], ['alert', 3], ['alerts', 3]],
+    reply: () => ({ text: 'The bell icon collects everything that needs your attention: counter offers, LOIs, signing requests, payment updates, document requests and admin decisions. The badge counts unread items — open the page and they mark themselves read.',
+      links: [{ label: 'Notifications', href: '/notifications' }], sug: ['What are my notifications?'] }) },
+  { id: 'sub_accounts', scope: 'public',
+    kw: [['sub-account', 6], ['sub account', 6], ['sub-accounts', 6], ['team member', 5], ['team members', 5], ['staff', 3], ['add user', 3], ['colleague', 3]],
+    reply: () => ({ text: 'From your Profile page you can add team members (sub-accounts) with their own name, email, password and role. They sign in with their own credentials + 2FA code and act on behalf of your company — their actions are attributed to them. You can deactivate a member at any time.',
+      links: [{ label: 'Profile', href: '/profile' }], sug: ['How do I edit my profile?'] }) },
+  { id: 'video_calls', scope: 'public',
+    kw: [['video call', 7], ['video calls', 7], ['video meeting', 7], ['how do i call', 7], ['start a call', 7], ['join call', 6], ['join the call', 6], ['call a company', 6], ['call button', 5], ['online call', 6], ['camera', 4], ['microphone', 4], ['webcam', 4], ['webrtc', 5], ['make a call', 6], ['conference call', 6]],
+    reply: () => ({ text: 'Video calls run natively inside Dealzoin — no external provider, nothing to install. Open any chat and tap the 📹 Call button in the header, or hit "🎥 Join call" on a calendar event: you enter a private full-screen call room. The browser asks for camera & microphone permission — press Allow, or continue audio-only. You can mute 🎙️, toggle the camera 🎥 and hang up 🔴 from the control bar. Rooms are limited to the invited participants (plus the admin), connect peer-to-peer (comfortable up to ~6 people), and need HTTPS — on http://localhost they work by browser exception.',
+      links: [{ label: 'Open chats', href: '/chats' }, { label: 'Calendar', href: '/calendar' }], sug: ['How do I schedule a meeting?', 'How do group chats work?'] }) },
+  { id: 'calendar', scope: 'public',
+    kw: [['calendar', 5], ['meeting', 4], ['meetings', 4], ['schedule', 3], ['event', 3], ['appointment', 4], ['call', 2]],
+    reply: () => ({ text: 'The Calendar lets you schedule meetings and signing events with other companies. Signing events can be linked to a deal, and participants get a Join call button at meeting time — video calls run in a private in-platform room (native WebRTC, no external provider). Month navigation and the upcoming-events list keep everything in view.',
+      links: [{ label: 'Calendar', href: '/calendar' }], sug: ['How do video calls work?', 'How does signing work?'] }) },
+  { id: 'profile', scope: 'public',
+    kw: [['profile', 4], ['avatar', 5], ['bio', 4], ['header image', 4], ['edit profile', 5], ['logo', 3]],
+    reply: () => ({ text: 'Your Profile page is your company identity: upload an avatar and a header image (JPG/PNG/GIF/WEBP), edit your company info and bio, manage team sub-accounts, and see your reputation stars. Profiles are visible to other approved companies.',
+      links: [{ label: 'My profile', href: '/profile' }], sug: ['What are reputation stars?', 'What are sub-accounts?'] }) },
+  { id: 'reputation', scope: 'public',
+    kw: [['reputation', 5], ['stars', 4], ['rating', 4], ['trust', 3], ['score', 2]],
+    reply: () => ({ text: 'Each company has a 0–5 star reputation, shown on profiles and deal cards. Stars are curated by the platform admin based on verified activity — authentic documents, completed deals and clean conduct push it up. Reputation also feeds the Explorer ranking.',
+      links: [], sug: ['How do I edit my profile?'] }) },
+  { id: 'documents_request', scope: 'public',
+    kw: [['request documents', 6], ['deal documents', 5], ['ask for documents', 5], ['document request', 5], ['request docs', 5]],
+    reply: () => ({ text: 'On a deal page you can formally request documents from the other party (certificates, proof of product, etc.). They get a notification and upload PDFs straight to the deal — the files stay private to the two parties and the admin.',
+      links: [], sug: ['What is the LOI pipeline?'] }) },
+  { id: 'theme', scope: 'public',
+    kw: [['dark', 3], ['light', 3], ['theme', 5], ['dark mode', 5], ['light mode', 5], ['night mode', 4], ['colors', 2], ['colours', 2]],
+    reply: () => ({ text: 'Tap the moon/sun button in the top nav to switch between the dark navy theme and the warm-paper light theme. Your choice is remembered on this device.',
+      links: [], sug: ['What can you help with?'] }) },
+  { id: 'media_uploads', scope: 'public',
+    kw: [['upload', 4], ['photo', 3], ['video', 3], ['image', 3], ['picture', 3], ['media', 3], ['attachment', 3], ['file', 2]],
+    reply: () => ({ text: 'Posts and deals support images (JPG, PNG, GIF, WEBP — max 5 MB) and videos (MP4, WEBM — max 25 MB) via the styled attach button. Every file is magic-byte checked, so renamed files are rejected. Documents (KYC, deal docs, product proof) are PDF-only.',
+      links: [], sug: ['How do I post a deal?'] }) },
+  { id: 'login_problems', scope: 'public',
+    kw: [['password', 4], ['forgot', 4], ['cant log in', 5], ["can't log in", 5], ['cannot log in', 5], ['login problem', 5], ['log in problem', 5], ['locked out', 4], ['cant sign in', 5], ["can't sign in", 5], ['code not working', 4], ['wrong password', 4], ['reset password', 4]],
+    reply: () => ({ text: 'Sign-in is two-step: password first, then a 6-digit code valid for 10 minutes. If the code expired, sign in again for a fresh one, and check spam for the email. Pending, rejected or suspended companies cannot sign in until the admin acts. If you forgot your password or are locked out, email the admin to reset it.',
+      links: [{ label: 'Sign in', href: '/login' }], sug: ['How do I contact the admin?', 'Why is my account pending?'] }) },
+  { id: 'contact_admin', scope: 'public',
+    kw: [['contact', 4], ['support', 4], ['help desk', 4], ['human', 3], ['real person', 3], ['email admin', 5], ['admin email', 5], ['reach admin', 4], ['talk to admin', 4], ['contact admin', 6]],
+    reply: () => ({ text: `You can reach the platform administrator at ${ADMIN_EMAIL}. For account issues, include your company name and registered email; for deal issues, include the deal number (DZ-…).`,
+      links: [], sug: ['I have a login problem', 'Why is my account pending?'] }) },
+  { id: 'thanks', scope: 'public',
+    kw: [['thanks', 4], ['thank you', 5], ['thx', 3], ['great', 2], ['awesome', 2], ['bye', 3], ['goodbye', 3], ['perfect', 2]],
+    reply: () => ({ text: "Anytime! I'm here 24/7 whenever you need a hand with the platform. Good luck with your deals 🤝",
+      links: [], sug: ZO_STARTERS }) },
+  { id: 'help', scope: 'public',
+    kw: [['help', 4], ['what can you do', 5], ['options', 3], ['topics', 3], ['assist', 3], ['guide', 2]],
+    reply: () => ({ text: 'I can explain: registration & KYC, posting buy/sell deals, the LOI → PO → signing pipeline, counter offers, commission & the payment gate, shipment tracking & incoterms, chats, private contracts, notifications, calendar & video calls, sub-accounts, reputation, themes and uploads. Just ask in plain words!',
+      links: [], sug: ZO_STARTERS }) },
+  { id: 'account_needed', scope: 'public', // logged-out visitor asks an account-specific question
+    kw: [['my deals', 6], ['my payments', 6], ['my payment', 6], ['my contracts', 6], ['my messages', 6], ['my notifications', 6], ['my account', 5], ['my commission', 6], ['do i owe', 5], ['my unread', 5]],
+    reply: (c) => (c.user ? null : { text: "That's account-specific — please sign in and ask me again, and I'll pull up your live numbers.",
+      links: [{ label: 'Sign in', href: '/login' }, { label: 'Register', href: '/signup' }], sug: ['How do I register?', 'I have a login problem'] }) },
+
+  // ----- Account-aware (company + sub-account sessions) -----
+  { id: 'my_deals', scope: 'user', stats: true,
+    kw: [['my deals', 7], ['my open deals', 7], ['how many deals', 6], ['my listings', 5], ['my posts', 5]],
+    reply: (c) => ({ text: `You currently have ${c.stats.openDeals} open deal${c.stats.openDeals === 1 ? '' : 's'} on the floor${c.stats.pendingPayments ? `, and ${c.stats.pendingPayments} deal${c.stats.pendingPayments === 1 ? ' is' : 's are'} waiting in the commission-payment gate` : ''}. Your Dashboard has the full picture.`,
+      links: [{ label: 'Dashboard', href: '/dashboard' }, { label: 'Create a deal', href: '/deals/new' }], sug: ['What are my payments?', 'How do I post a deal?'] }) },
+  { id: 'my_payments', scope: 'user', stats: true,
+    kw: [['my payments', 7], ['my payment', 7], ['do i owe', 7], ['payment status', 6], ['my commission', 7], ['owe', 3], ['my fees', 6]],
+    reply: (c) => ({ text: c.stats.pendingPayments
+        ? `You have ${c.stats.pendingPayments} finalized deal${c.stats.pendingPayments === 1 ? '' : 's'} in the commission-payment gate. Pay your share of the ${c.pct}% platform fee by bank transfer to the admin details shown on the deal card — shipment tracking unlocks once the admin approves.`
+        : `Nothing is waiting on you right now — no deals in the commission-payment gate. When a deal closes, the ${c.pct}% platform fee (split as agreed) is paid by bank transfer, and tracking unlocks after admin approval.`,
+      links: [{ label: 'Tracking', href: '/tracking' }], sug: ['What is the commission?', 'What are my deals?'] }) },
+  { id: 'my_messages', scope: 'user', stats: true,
+    kw: [['my messages', 7], ['unread messages', 6], ['my chats', 7], ['new messages', 5], ['any messages', 5]],
+    reply: (c) => ({ text: c.stats.unreadChats
+        ? `You have ${c.stats.unreadChats} unread message${c.stats.unreadChats === 1 ? '' : 's'} across your chats.`
+        : 'Your chats are all caught up — no unread messages.',
+      links: [{ label: 'Open chats', href: '/chats' }], sug: ['How do group chats work?'] }) },
+  { id: 'my_notifications', scope: 'user', stats: true,
+    kw: [['my notifications', 7], ['unread notifications', 6], ['any notifications', 5], ['what is new', 4], ['whats new', 4], ['anything new', 5]],
+    reply: (c) => ({ text: c.stats.unreadNotifs
+        ? `You have ${c.stats.unreadNotifs} unread notification${c.stats.unreadNotifs === 1 ? '' : 's'} — the bell page has the details.`
+        : 'No unread notifications right now — the bell page is all caught up.',
+      links: [{ label: 'Notifications', href: '/notifications' }], sug: ['What are my messages?'] }) },
+  { id: 'my_contracts', scope: 'user', stats: true,
+    kw: [['my contracts', 7], ['my mailbox', 6], ['contracts waiting', 5], ['pending contracts', 5]],
+    reply: (c) => ({ text: `You are involved in ${c.stats.contracts} contract${c.stats.contracts === 1 ? '' : 's'} (deal-room signatures and private contracts). The mailbox shows what needs your signature or approval.`,
+      links: [{ label: 'Contracts mailbox', href: '/contracts' }], sug: ['How does signing work?'] }) },
+
+  // ----- Admin-only (never answered to companies/members/visitors) -----
+  { id: 'admin_approvals', scope: 'admin',
+    kw: [['approve companies', 6], ['approve a company', 6], ['company approvals', 6], ['pending companies', 6], ['approve company', 6], ['approvals', 5], ['reject company', 5], ['suspend company', 5], ['reactivate', 4]],
+    reply: () => ({ text: 'The admin dashboard lists pending companies with their details, onboarding-agent flags and KYC documents. Review the documents, then Approve or Reject — approved companies can sign in immediately, rejected ones are blocked. You can also suspend or reactivate companies from the same place.',
+      links: [{ label: 'Admin dashboard', href: '/admin/dashboard' }], sug: ['How do I check document authenticity?', 'How do I research a company?'] }) },
+  { id: 'admin_documents', scope: 'admin',
+    kw: [['document authenticity', 7], ['check documents', 6], ['authenticity', 6], ['verify documents', 6], ['document agent', 5]],
+    reply: () => ({ text: "The Documents page lists every uploaded KYC file with the Document Authenticity Agent's verdict (pass / flag / fail). You can download each PDF for manual review — flagged documents should be checked before approving the company.",
+      links: [{ label: 'Documents', href: '/admin/documents' }], sug: ['How do I approve companies?'] }) },
+  { id: 'admin_payments', scope: 'admin',
+    kw: [['approve payments', 7], ['approve payment', 7], ['payments', 5], ['payment approval', 6], ['commission payment', 6], ['commission payments', 6], ['mark paid', 5]],
+    reply: () => ({ text: 'Commission payments appear in the Payments section of the admin dashboard once a company confirms its bank transfer. Verify the transfer arrived (against your bank details in Settings), then Approve — shipment tracking unlocks for both parties instantly. Rejecting sends the deal back to awaiting payment.',
+      links: [{ label: 'Admin dashboard', href: '/admin/dashboard' }], sug: ['How do I set the commission?', 'How do I set bank details?'] }) },
+  { id: 'admin_commission', scope: 'admin',
+    kw: [['set commission', 7], ['change commission', 7], ['commission setting', 7], ['set the commission', 7], ['fee setting', 6], ['change the fee', 6], ['adjust commission', 6]],
+    reply: (c) => ({ text: `Set the platform commission in the Settings card on the admin dashboard — it is currently ${c.pct}% (allowed range 0.1–20). The new rate applies to deals finalized afterwards; already-finalized deals keep the fee frozen at their approval time.`,
+      links: [{ label: 'Admin dashboard', href: '/admin/dashboard' }], sug: ['How do I approve payments?'] }) },
+  { id: 'admin_bank', scope: 'admin',
+    kw: [['set bank details', 7], ['bank account', 5], ['bank transfer details', 6], ['update bank', 5]],
+    reply: () => ({ text: 'Your bank-transfer details (shown to companies on commission payment cards) are edited in the Settings card on the admin dashboard, right next to the commission setting.',
+      links: [{ label: 'Admin dashboard', href: '/admin/dashboard' }], sug: ['How do I approve payments?'] }) },
+  { id: 'admin_research', scope: 'admin',
+    kw: [['research agent', 7], ['research company', 6], ['research a company', 7], ['research', 4], ['intel', 4], ['background check', 5]],
+    reply: () => ({ text: "The Research Agent runs open-source intel on a company from its admin profile page — it gathers web-presence signals and writes a summary to support your approval decisions. Run it before approving companies you're unsure about.",
+      links: [{ label: 'Admin dashboard', href: '/admin/dashboard' }], sug: ['How do I approve companies?'] }) },
+  { id: 'admin_deletion', scope: 'admin',
+    kw: [['delete company', 7], ['delete a company', 7], ['deletion', 5], ['remove company', 6], ['remove a company', 6], ['delete account', 5]],
+    reply: () => ({ text: 'Company deletion is a protected multi-step flow from the company admin page: review the impact summary, confirm with the OTP code, then execute — the company and its data are removed and the action is audit-logged. It cannot be undone.',
+      links: [{ label: 'Admin dashboard', href: '/admin/dashboard' }], sug: ['How do I approve companies?'] }) }
+];
+
+/** Normalize for matching: lowercase, drop apostrophes ("can't" -> "cant"), keep % and -. */
+function zoClean(s) {
+  return String(s).toLowerCase().replace(/['’]/g, '').replace(/[^a-z0-9%\s-]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+/** Score every in-scope intent against the message; best-first list of [score, intent]. */
+function zoMatch(message, user) {
+  const cleaned = zoClean(message);
+  const msg = ' ' + cleaned + ' ';
+  const tokens = new Set(cleaned.split(' ').filter(Boolean));
+  const inScope = (it) => it.scope === 'public'
+    || (it.scope === 'user' && user && !user.isAdmin)
+    || (it.scope === 'admin' && user && user.isAdmin);
+  const scored = [];
+  for (const it of ZO_KNOWLEDGE) {
+    if (!inScope(it)) continue;
+    let score = 0;
+    for (const [rawKw, w] of it.kw) {
+      const kw = zoClean(rawKw);
+      if (!kw) continue;
+      if (kw.indexOf(' ') !== -1) { if (msg.indexOf(' ' + kw + ' ') !== -1) score += w; }
+      else if (tokens.has(kw)) score += w;
+    }
+    if (score >= ZO_MATCH_THRESHOLD) scored.push([score, it]);
+  }
+  scored.sort((a, b) => b[0] - a[0]);
+  return scored;
+}
+
+/** Zo endpoint: JSON {message} -> {reply, links, suggestions}. Public mode when logged out. */
+app.post('/assistant/ask', (req, res) => {
+  const user = currentUser(req); // null = public mode (landing-page visitors)
+  const message = String((req.body && req.body.message) || '').replace(/\s+/g, ' ').trim().slice(0, ZO_MAX_MESSAGE);
+  res.setHeader('Cache-Control', 'no-store');
+
+  const ctx = { user, pct: platformFeePct(), stats: null };
+  const answer = (payload, intentId) => {
+    // Throttled audit: max 1 Zo row per session (or IP) per minute — no spam.
+    try {
+      const key = readSignedCookie(req, 'dz_session')
+        || String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'anon');
+      const last = zoAuditThrottle.get(key) || 0;
+      if (Date.now() - last >= 60000) {
+        zoAuditThrottle.set(key, Date.now());
+        audit('Zo', 'chat', 'pass', `intent: ${intentId}`);
+      }
+    } catch (e) { /* auditing must never break the assistant */ }
+    res.json(payload);
+  };
+
+  if (!message) {
+    return answer({ reply: "I didn't catch that — type a question and I'll do my best.", links: [], suggestions: ZO_STARTERS }, 'empty');
+  }
+
+  for (const [, intent] of zoMatch(message, user)) {
+    if (intent.stats && !ctx.stats) ctx.stats = zoQuickStats(user);
+    const r = intent.reply(ctx);
+    if (!r) continue; // intent deferred (e.g. account question asked while logged out)
+    return answer({
+      reply: r.text,
+      links: (r.links || []).filter(l => l && typeof l.href === 'string' && l.href.charAt(0) === '/'),
+      suggestions: (r.sug || []).slice(0, 4)
+    }, intent.id);
+  }
+
+  // TODO: LLM BRAIN — if process.env.OPENAI_API_KEY, forward unmatched questions to an LLM before falling back
+  const sug = (user && user.isAdmin)
+    ? ['How do I approve payments?', 'How do I set the commission?', 'How do I check documents?']
+    : user ? ZO_STARTERS : ['What is Dealzoin?', 'How do I register?', 'What is the commission?'];
+  return answer({
+    reply: `Hmm, I'm not sure about that one — I'm best at Dealzoin platform questions. Try one of these, or email the admin at ${ADMIN_EMAIL} for anything else.`,
+    links: [],
+    suggestions: sug
+  }, 'fallback');
 });
 
 // ============================= 404 & SERVER START =============================
