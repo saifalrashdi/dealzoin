@@ -353,11 +353,45 @@ try { db.exec('ALTER TABLE posts ADD COLUMN is_system INTEGER DEFAULT 0'); } cat
 try { db.exec('ALTER TABLE contracts ADD COLUMN negotiation_id INTEGER'); } catch (e) { /* column already exists */ }
 try { db.exec('ALTER TABLE negotiations ADD COLUMN split_proposed_by INTEGER'); } catch (e) { /* column already exists */ }
 
+// Batch A upgrades (old databases keep booting):
+// T&C versioning + re-agreement, cargo capacity on deals, LOI response deadlines,
+// seller-chosen offer incoterm, per-company palette choice.
+try { db.exec('ALTER TABLE companies ADD COLUMN agreed_terms_version INTEGER DEFAULT 0'); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE companies ADD COLUMN agreed_at TEXT'); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE companies ADD COLUMN theme_choice TEXT DEFAULT 'titan'"); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE deals ADD COLUMN cargo_qty REAL'); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE deals ADD COLUMN cargo_unit TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE negotiations ADD COLUMN loi_expires_at TEXT'); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE negotiations ADD COLUMN offer_incoterm TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+// Incoterm typo migration: historical 'CRF' values were meant to be CFR (Cost & Freight).
+try { db.exec("UPDATE deals SET incoterm = 'CFR' WHERE incoterm = 'CRF'"); } catch (e) { /* best-effort */ }
+try { db.exec("UPDATE negotiations SET offer_incoterm = 'CFR' WHERE offer_incoterm = 'CRF'"); } catch (e) { /* best-effort */ }
+
 // Commission payment gate (old databases keep booting; finalized legacy deals stay 'none' = unaffected).
 try { db.exec("ALTER TABLE deals ADD COLUMN payment_status TEXT DEFAULT 'none'"); } catch (e) { /* column already exists */ }
 try { db.exec('ALTER TABLE deals ADD COLUMN payment_split TEXT'); } catch (e) { /* column already exists */ }
 try { db.exec('ALTER TABLE deals ADD COLUMN payment_fee REAL'); } catch (e) { /* column already exists */ }
 try { db.exec("ALTER TABLE deals ADD COLUMN payment_currency TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+
+// ============================= BATCH B — payments flow design =============================
+// (3)+(4) Escrow flow design: the buyer's receipt confirmation is REAL data (timestamp on the deal),
+// only the money movement is simulated. escrow_dispute_at records an open dispute flag.
+try { db.exec('ALTER TABLE deals ADD COLUMN buyer_received_confirmed_at TEXT'); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE deals ADD COLUMN escrow_dispute_at TEXT'); } catch (e) { /* column already exists */ }
+// (5) Split-payment milestones agreed during SPLIT_NEGO — JSON array on the finalized deal,
+// proposal parked on the negotiation while the parties negotiate.
+try { db.exec('ALTER TABLE deals ADD COLUMN payment_milestones TEXT'); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE negotiations ADD COLUMN milestone_proposal TEXT'); } catch (e) { /* column already exists */ }
+// (6) Receiving-country shipment agent: JSON nomination on the deal + a updates log table.
+try { db.exec('ALTER TABLE deals ADD COLUMN receiving_agent TEXT'); } catch (e) { /* column already exists */ }
+db.exec(`CREATE TABLE IF NOT EXISTS receiving_updates (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  deal_id    INTEGER NOT NULL,
+  company_id INTEGER,               -- who logged the update (nominating party or NULL for admin)
+  note       TEXT NOT NULL,
+  created_at TEXT NOT NULL
+)`);
+
 // Manual commission-payment confirmations (party → admin review). deal_id is NULL for private-contract
 // payments (private contracts have no deal row); private_contract_id is NULL for deal payments.
 db.exec(`CREATE TABLE IF NOT EXISTS commission_payments (
@@ -372,6 +406,112 @@ db.exec(`CREATE TABLE IF NOT EXISTS commission_payments (
   created_at          TEXT NOT NULL,
   decided_at          TEXT
 )`);
+// Batch B (1): payment-proof PDFs attached to commission_payments rows. NOTE: these ALTERs must run
+// AFTER the CREATE TABLE above — on a fresh database the table does not exist before this point.
+try { db.exec('ALTER TABLE commission_payments ADD COLUMN proof_media_id INTEGER'); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE commission_payments ADD COLUMN proof_filename TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+
+// ============================= BATCH C SCHEMA =============================
+// (7) Interface language on companies; (3) company bank details + BANK RESEARCH AGENT verdict.
+try { db.exec("ALTER TABLE companies ADD COLUMN lang TEXT DEFAULT 'en'"); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE companies ADD COLUMN bank_name TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE companies ADD COLUMN bank_swift TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE companies ADD COLUMN bank_iban TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE companies ADD COLUMN bank_country TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE companies ADD COLUMN bank_holder TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE companies ADD COLUMN bank_kyc_status TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE companies ADD COLUMN bank_kyc_notes TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE companies ADD COLUMN bank_kyc_at TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+// (6) Promotional posts published by the ADVERTISING AGENT get a subtle marker.
+try { db.exec('ALTER TABLE posts ADD COLUMN is_promo INTEGER DEFAULT 0'); } catch (e) { /* column already exists */ }
+
+// (2) Direct translator — persistent cache keyed by sha256(text + target language).
+db.exec(`CREATE TABLE IF NOT EXISTS translation_cache (
+  cache_key  TEXT PRIMARY KEY,
+  target     TEXT NOT NULL,
+  result     TEXT NOT NULL,
+  created_at TEXT NOT NULL
+)`);
+
+// Per-company agent insight feed (ACCOUNTING / WAREHOUSE AGENTS) — distinct from agent_audit,
+// which is the admin-facing global log. Insights are scoped to the owning company.
+db.exec(`CREATE TABLE IF NOT EXISTS agent_insights (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  company_id INTEGER NOT NULL,
+  agent      TEXT NOT NULL,
+  level      TEXT NOT NULL DEFAULT 'info',  -- info | warn
+  text       TEXT NOT NULL,
+  created_at TEXT NOT NULL
+)`);
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_agent_insights_company ON agent_insights(company_id, id)'); } catch (e) { /* index may already exist */ }
+
+// (4) ACCOUNTING AGENT — invoices & expenses (lite Odoo).
+db.exec(`CREATE TABLE IF NOT EXISTS invoices (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  company_id INTEGER NOT NULL,
+  client     TEXT NOT NULL,
+  amount     REAL NOT NULL DEFAULT 0,
+  currency   TEXT NOT NULL DEFAULT 'USD',
+  due_date   TEXT DEFAULT '',
+  notes      TEXT DEFAULT '',
+  deal_id    INTEGER,
+  status     TEXT NOT NULL DEFAULT 'draft', -- draft | sent | paid | overdue (overdue is derived)
+  created_at TEXT NOT NULL
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS expenses (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  company_id INTEGER NOT NULL,
+  category   TEXT NOT NULL,
+  amount     REAL NOT NULL DEFAULT 0,
+  currency   TEXT NOT NULL DEFAULT 'USD',
+  spent_on   TEXT DEFAULT '',
+  notes      TEXT DEFAULT '',
+  created_at TEXT NOT NULL
+)`);
+
+// (5) WAREHOUSE AGENT — items + stock movements (lite Zoho).
+db.exec(`CREATE TABLE IF NOT EXISTS warehouse_items (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  company_id    INTEGER NOT NULL,
+  sku           TEXT NOT NULL,
+  name          TEXT NOT NULL,
+  unit          TEXT NOT NULL DEFAULT 'units',
+  quantity      REAL NOT NULL DEFAULT 0,
+  reorder_level REAL NOT NULL DEFAULT 0,
+  location      TEXT DEFAULT '',
+  created_at    TEXT NOT NULL,
+  UNIQUE(company_id, sku)
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS warehouse_movements (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  item_id    INTEGER NOT NULL,
+  company_id INTEGER NOT NULL,
+  direction  TEXT NOT NULL,                  -- IN | OUT
+  quantity   REAL NOT NULL,
+  note       TEXT DEFAULT '',
+  deal_id    INTEGER,
+  created_at TEXT NOT NULL
+)`);
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_wh_movements_item ON warehouse_movements(item_id, id)'); } catch (e) { /* index may already exist */ }
+
+/** Next warehouse SKU for a company: DZ-<companyId>-<zero-padded seq> (per-company counter in settings). */
+function nextSku(companyId) {
+  const key = `sku_seq_${companyId}`;
+  const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
+  const seq = (row ? parseInt(row.value, 10) || 0 : 0) + 1;
+  db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, String(seq));
+  return `DZ-${companyId}-${String(seq).padStart(4, '0')}`;
+}
+
+/** Record a scoped agent insight (company-visible) + mirror to the global agent_audit log. */
+function agentInsight(companyId, agent, level, text) {
+  const t = String(text || '').slice(0, 300);
+  try {
+    db.prepare('INSERT INTO agent_insights (company_id, agent, level, text, created_at) VALUES (?,?,?,?,?)')
+      .run(companyId, agent, level === 'warn' ? 'warn' : 'info', t, now());
+  } catch (e) { /* insights must never break the main flow */ }
+  audit(agent, level === 'warn' ? 'insight (flag)' : 'insight', level === 'warn' ? 'flag' : 'pass', `Company #${companyId}: ${t}`);
+}
 
 /** Next unique deal number for the current year: DZ-<year>-<zero-padded seq> (counter in settings). */
 function nextDealNumber(year) {
@@ -538,6 +678,320 @@ function maybeCompletePcPayment(pcId) {
   audit('PAYMENT AGENT', 'private contract payment complete', 'pass', `Private contract #${pc.id} "${pc.title}" commission fully settled`);
   return true;
 }
+
+// ============================= BATCH B — PAYMENTS FLOW DESIGN (no real money moves) =============================
+/** Badge marking every surface where the money movement is a designed flow, not a live charge. */
+const FLOW_PREVIEW_BADGE = '<span class="badge badge-flow">🧪 Flow preview — payments go live when Dealzoin activates its payment processor</span>';
+/** One-per-page delegated copy-button handler: navigator.clipboard with a textarea fallback. */
+const COPY_BTN_SCRIPT = `<script>(function(){
+  if(window.__dzCopyInit)return;window.__dzCopyInit=1;
+  document.addEventListener('click',function(e){
+    var b=e.target&&e.target.closest?e.target.closest('.copy-btn'):null;if(!b)return;
+    var v=b.getAttribute('data-copy')||'';
+    function done(){if(b.dataset.busy)return;b.dataset.busy='1';var t=b.textContent;b.textContent='Copied \\u2713';b.classList.add('copied');setTimeout(function(){b.textContent=t;b.classList.remove('copied');delete b.dataset.busy;},1400);}
+    function fallback(){var ta=document.createElement('textarea');ta.value=v;ta.setAttribute('readonly','');ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();try{document.execCommand('copy');}catch(_){/* clipboard unavailable */}document.body.removeChild(ta);done();}
+    if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(v).then(done,fallback);}else fallback();
+  });
+})();</script>`;
+
+/** (2) Structured "Dealzoin receiving bank details" from the settings table; null when nothing is configured. */
+function bankDetails() {
+  const out = {};
+  let any = false;
+  for (const k of ['bank_name', 'bank_account', 'bank_iban', 'bank_swift', 'bank_currency', 'bank_ref']) {
+    const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(k);
+    out[k] = row ? String(row.value).trim() : '';
+    if (out[k]) any = true;
+  }
+  return any ? out : null;
+}
+/** One bank-detail row with its own one-click Copy button. */
+function bankFieldRow(label, value) {
+  return `<div class="bank-row">
+    <div class="bank-row__meta"><span class="bank-row__label">${esc(label)}</span><span class="bank-row__value">${esc(value)}</span></div>
+    <button type="button" class="copy-btn" data-copy="${esc(value)}" aria-label="Copy ${esc(label)}">Copy</button>
+  </div>`;
+}
+/** Elegant receiving-bank-details card. reference = payment reference incl. the deal/contract number. */
+function bankDetailsCardHtml(reference) {
+  const b = bankDetails();
+  let inner;
+  if (b) {
+    const rows = [
+      b.bank_name && bankFieldRow('Bank name', b.bank_name),
+      b.bank_account && bankFieldRow('Account name', b.bank_account),
+      b.bank_iban && bankFieldRow('IBAN', b.bank_iban),
+      b.bank_swift && bankFieldRow('SWIFT / BIC', b.bank_swift),
+      b.bank_currency && bankFieldRow('Currency', b.bank_currency),
+      reference && bankFieldRow('Payment reference', reference),
+      b.bank_ref && bankFieldRow('Reference instructions', b.bank_ref)
+    ].filter(Boolean).join('');
+    inner = `<div class="bank-card">${rows}</div>`;
+  } else {
+    inner = `<p class="muted" style="white-space:pre-wrap">${esc(adminBankDetails())}</p>
+      ${reference ? bankFieldRow('Payment reference', reference) : ''}`;
+  }
+  return `<h4 style="margin:12px 0 6px">🏦 Dealzoin receiving bank details</h4>
+    ${inner}
+    <p class="muted" style="margin-top:6px">Use the payment reference exactly as shown so the administrator can match your transfer.</p>
+    ${COPY_BTN_SCRIPT}`;
+}
+/** (1b) Apple Pay preview button (black, Apple-style) + explanatory modal. No real Apple Pay JS anywhere. */
+function applePayHtml() {
+  return `
+  <button type="button" class="apple-pay-btn" onclick="document.getElementById('dz-applepay-modal').classList.add('is-open')" aria-haspopup="dialog"><svg viewBox="0 0 384 512" width="15" height="15" aria-hidden="true" style="fill:currentColor;margin-right:2px"><path d="M318.7 268.7c-.2-36.7 16.4-64.4 50-84.8-18.8-26.9-47.2-41.7-84.7-44.6-35.5-2.8-74.3 20.7-88.5 20.7-15 0-49.4-19.7-76.4-19.7C63.3 141.2 4 184.8 4 273.5q0 39.3 14.4 81.2c12.8 36.7 59 126.7 107.2 125.2 25.2-.6 43-17.9 75.8-17.9 31.8 0 48.3 17.9 76.4 17.9 48.6-.7 90.4-82.5 102.6-119.3-65.2-30.7-61.7-90-61.7-91.9zm-56.6-164.2c27.3-32.4 24.8-61.9 24-72.5-24.1 1.4-52 16.4-67.9 34.9-17.5 19.8-27.8 44.3-25.6 71.9 26.1 2 49.9-11.4 69.5-34.3z"/></svg>Pay with Apple&nbsp;Pay</button>
+  <div class="dz-modal" id="dz-applepay-modal" role="dialog" aria-modal="true" aria-labelledby="dz-applepay-title" onclick="if(event.target===this)this.classList.remove('is-open')">
+    <div class="dz-modal__box card vault">
+      <h3 id="dz-applepay-title" style="margin-top:0"> Pay with Apple&nbsp;Pay</h3>
+      <p style="margin:8px 0">${FLOW_PREVIEW_BADGE}</p>
+      <p class="muted">Apple&nbsp;Pay activates when Dealzoin's payment processor goes live. No real payment is processed today — this button previews the checkout experience.</p>
+      <h4 style="margin:12px 0 6px">How to pay today — bank transfer</h4>
+      <ol class="muted" style="margin:0;padding-left:18px;line-height:1.7">
+        <li>Transfer your commission share to the Dealzoin receiving account (bank-details card — every field has its own Copy button).</li>
+        <li>Use the deal number as your payment reference.</li>
+        <li>Upload the bank-transfer receipt (PDF) with your confirmation.</li>
+        <li>The administrator verifies the transfer and approves — the deal unlocks.</li>
+      </ol>
+      <div class="feed-actions" style="margin-top:14px"><button type="button" class="btn" onclick="document.getElementById('dz-applepay-modal').classList.remove('is-open')">Got it — pay by bank transfer</button></div>
+    </div>
+  </div>`;
+}
+/** (1a) Payment-proof cell for a commission_payments row: download link (admin/payer) + upload form (payer, while pending). */
+function paymentProofHtml(r, user) {
+  if (!r) return '';
+  let out = '';
+  if (r.proof_media_id) {
+    out += (user.isAdmin || user.id === r.company_id)
+      ? `<br>📄 Proof: <a href="/payments/${r.id}/proof"><b>${esc(r.proof_filename || 'receipt.pdf')}</b></a>`
+      : `<br>📄 <span class="muted">Payment proof on file (${esc(r.proof_filename || 'receipt.pdf')})</span>`;
+  }
+  // Upload / re-upload replaces — only the paying party, and only while the row awaits admin review.
+  if (!user.isAdmin && user.id === r.company_id && r.status === 'pending') {
+    out += `<form method="POST" action="/payments/${r.id}/proof" enctype="multipart/form-data" style="margin-top:6px">
+      <label class="file-btn file-btn-sm"><span class="file-btn-text" data-default="📎 ${r.proof_media_id ? 'Replace payment proof (PDF)' : 'Upload payment proof (PDF)'}">📎 ${r.proof_media_id ? 'Replace payment proof (PDF)' : 'Upload payment proof (PDF)'}</span>
+        <input type="file" class="file-input" name="proof" accept="application/pdf,.pdf" required></label>
+      <button class="btn btn-sm btn-outline" type="submit">Upload</button>
+    </form>`;
+  }
+  return out;
+}
+
+// ----- (5) Split-payment milestones: preset label → the shipment status that unlocks the release -----
+const MILESTONE_PRESETS = {
+  'before-loading': { label: 'Before loading', status: 'production' },
+  'after-loading':  { label: 'After loading',  status: 'dispatched' },
+  'on-dispatch':    { label: 'On dispatch',    status: 'shipped' },
+  'on-delivery':    { label: 'On delivery',    status: 'delivered' },
+  'custom':         { label: 'Custom',         status: '' }
+};
+/** Sensible prefill for the milestone form: 10 / 20 / 70. */
+const DEFAULT_MILESTONES = [
+  { label: 'Before loading', status: 'production', pct: 10 },
+  { label: 'After loading',  status: 'dispatched', pct: 20 },
+  { label: 'On delivery',    status: 'delivered',  pct: 70 }
+];
+/** Parse a stored milestone JSON array; returns null when missing/invalid. */
+function parseMilestoneJson(raw) {
+  try {
+    const a = JSON.parse(raw || '');
+    if (!Array.isArray(a) || !a.length || a.length > 4) return null;
+    const out = [];
+    for (const m of a) {
+      const pct = Number(m && m.pct);
+      if (!m || typeof m.label !== 'string' || !m.label || !Number.isInteger(pct) || pct < 1 || pct > 100) return null;
+      const st = DEAL_STATUSES.includes(m.status) ? m.status : 'delivered';
+      out.push({ label: String(m.label).slice(0, 60), status: st, pct });
+    }
+    if (out.reduce((s, m) => s + m.pct, 0) !== 100) return null;
+    return out;
+  } catch (e) { return null; }
+}
+/** Validate the 4 milestone form rows from POST /negotiation/:id/split. Returns { milestones } or { error }. */
+function parseMilestonesInput(body) {
+  const out = [];
+  for (let i = 1; i <= 4; i++) {
+    const pctRaw = String(body['ms_pct_' + i] || '').trim();
+    const labelKey = String(body['ms_label_' + i] || '');
+    if (!pctRaw) continue; // empty row — ignored
+    const pct = Number(pctRaw);
+    if (!Number.isInteger(pct) || pct < 1 || pct > 100) {
+      return { error: `Milestone ${i}: percentage must be a whole number between 1 and 100.` };
+    }
+    const preset = MILESTONE_PRESETS[labelKey];
+    let label, status;
+    if (preset && labelKey !== 'custom') {
+      label = preset.label; status = preset.status;
+    } else {
+      label = String(body['ms_custom_' + i] || '').trim().slice(0, 60);
+      if (!label) return { error: `Milestone ${i}: a custom milestone needs a label.` };
+      status = DEAL_STATUSES.includes(body['ms_status_' + i]) ? body['ms_status_' + i] : 'delivered';
+    }
+    out.push({ label, status, pct });
+  }
+  if (!out.length) return { error: 'Define at least one payment milestone (percentages must sum to 100).' };
+  const sum = out.reduce((s, m) => s + m.pct, 0);
+  if (sum !== 100) return { error: `Milestone percentages must sum to exactly 100 — currently ${sum}.` };
+  return { milestones: out };
+}
+/** One-line human summary of a milestone schedule (timeline events, notifications, admin queue). */
+function milestoneSummaryText(ms) {
+  return (ms || []).map(m => `${m.pct}% ${m.label} → ${m.status}`).join(' · ');
+}
+/** Read-only milestone rows with live unlock state (escrow panel). */
+function milestoneRowsHtml(ms, effIdx, confirmed) {
+  return ms.map((m, i) => {
+    const stIdx = DEAL_STATUSES.indexOf(m.status);
+    let unlocked = effIdx >= 0 && stIdx >= 0 && effIdx >= stIdx;
+    // A delivery-gated release only lands once the buyer has confirmed receipt.
+    if (m.status === 'delivered' && !confirmed) unlocked = false;
+    return `<div class="ms-row ${unlocked ? 'is-unlocked' : ''}">
+      <span class="ms-pct">${m.pct}%</span>
+      <span class="ms-body"><b>${esc(m.label)}</b><br><span class="muted">Unlocks at status: <b>${esc(m.status.toUpperCase())}</b>${m.status === 'delivered' ? ' + buyer receipt confirmation' : ''}</span></span>
+      <span class="badge ${unlocked ? 'badge-contract' : ''}">${unlocked ? '🔓 released (flow)' : '⏳ locked'}</span>
+    </div>`;
+  }).join('');
+}
+
+/** (3)+(4) Escrow & payment protection panel — parties + admin only, clearly badged as a flow preview. */
+function escrowPanelHtml(deal, user, isOwner, isBuyer) {
+  if (!user.isAdmin && !isOwner && !isBuyer) return '';
+  const buyerId = dealBuyerId(deal);
+  if (!buyerId && !paymentGateApplies(deal) && deal.contract_state !== 'approved') return ''; // no counterparty yet
+  const names = companyNameMap();
+  const gated = paymentGateApplies(deal);
+  const paid = deal.payment_status === 'paid' || (deal.contract_state === 'approved' && !gated);
+  const ms = parseMilestoneJson(deal.payment_milestones) || DEFAULT_MILESTONES;
+  const agreedMs = !!parseMilestoneJson(deal.payment_milestones);
+  const legacyDone = deal.contract_state === 'approved' && !gated;
+  const stIdx = DEAL_STATUSES.indexOf(deal.status);
+  const effIdx = legacyDone ? DEAL_STATUSES.length - 1 : stIdx;
+  const delivered = effIdx >= DEAL_STATUSES.indexOf('delivered');
+  const confirmed = !!deal.buyer_received_confirmed_at;
+  const anyMsUnlocked = paid && ms.some(m => DEAL_STATUSES.indexOf(m.status) <= effIdx && effIdx >= 0);
+
+  // 4-stage pipeline: Buyer pays → Funds held → Milestones release → Seller paid.
+  const stages = [
+    { icon: '💳', label: 'Buyer pays',          done: paid,      current: !paid },
+    { icon: '🏦', label: 'Funds held by Dealzoin escrow', done: paid && (anyMsUnlocked || delivered), current: paid && !anyMsUnlocked && !delivered },
+    { icon: '📊', label: 'Milestones release',  done: delivered, current: paid && !delivered },
+    { icon: '💰', label: 'Seller paid',         done: confirmed, current: delivered && !confirmed }
+  ];
+  const pipeline = `<div class="stepper escrow-stepper" role="list" aria-label="Escrow pipeline">${stages.map((s, i) =>
+    `<div class="step-node ${s.done ? 'done' : s.current ? 'current done' : ''}" style="--i:${i}">
+      <span class="step-dot">${s.done ? '✓' : s.icon}</span><span class="step-lbl">${esc(s.label)}</span>
+    </div>`).join('')}</div>`;
+
+  // (4) Buyer receipt confirmation — REAL data: only the buyer, only once the deal is delivered.
+  let confirmHtml = '';
+  if (deal.escrow_dispute_at) {
+    confirmHtml = `<p style="margin-top:10px"><span class="badge badge-sealed">⚠️ Dispute raised ${esc(deal.escrow_dispute_at.slice(0, 16).replace('T', ' '))} UTC</span>
+      <span class="muted">— the platform team has been alerted and will mediate between the parties.</span></p>`;
+  } else if (confirmed) {
+    confirmHtml = `<p style="margin-top:10px"><span class="badge badge-contract">✅ Buyer confirmed receipt of goods — ${esc(deal.buyer_received_confirmed_at.slice(0, 16).replace('T', ' '))} UTC</span>
+      <span class="muted">· final milestone released (flow preview)</span></p>`;
+  } else if (delivered) {
+    confirmHtml = `<div style="margin-top:10px">
+      ${isBuyer ? `<form method="POST" action="/deal/${deal.id}/confirm-receipt" style="display:inline" onsubmit="return confirm('Confirm you have received the goods in good order? This releases the final escrow milestone and is audit-logged.')">
+        <button class="btn btn-green" type="submit">✅ Confirm receipt of goods</button>
+      </form>` : `<p class="muted">Waiting for <b>${esc(names.get(buyerId) || 'the buyer')}</b> to confirm receipt of goods.</p>`}
+      <form method="POST" action="/deal/${deal.id}/escrow-dispute" style="display:inline;margin-left:8px" onsubmit="return confirm('Raise a dispute on this deal? The platform team is alerted and the release is paused.')">
+        <button class="btn btn-sm btn-danger" type="submit">⚠️ Dispute</button>
+      </form>
+    </div>`;
+  } else {
+    confirmHtml = `<p class="muted" style="margin-top:10px">The "Confirm receipt of goods" step activates for the buyer once the deal status reaches <b>delivered</b>.</p>`;
+  }
+
+  return `<div class="card vault" data-reveal>
+    <div class="feed-head" style="margin:0"><h3>🛡️ Escrow &amp; payment protection</h3>${FLOW_PREVIEW_BADGE}</div>
+    <p class="muted" style="margin-top:6px">Dealzoin holds the buyer's funds and releases them only when the buyer confirms receipt.</p>
+    ${pipeline}
+    <h4 style="margin:14px 0 6px">📊 Release milestones ${agreedMs ? '<span class="muted" style="font-weight:400">(agreed during the commission-split step)</span>' : '<span class="muted" style="font-weight:400">(default schedule — none agreed yet)</span>'}</h4>
+    ${milestoneRowsHtml(ms, effIdx, confirmed)}
+    ${confirmHtml}
+  </div>`;
+}
+
+// ----- (6) Receiving-country shipment agent -----
+/** Parse the receiving-agent JSON nomination on a deal; null when unset/invalid. */
+function parseReceivingAgent(deal) {
+  try {
+    const a = JSON.parse(deal.receiving_agent || '');
+    if (a && typeof a.name === 'string' && a.name.trim()) return a;
+  } catch (e) { /* invalid JSON — treated as unset */ }
+  return null;
+}
+/** Receiving-agent card: nomination form (parties), update log (nominating party / admin), timeline for all parties. */
+function receivingAgentCardHtml(deal, user, isOwner, isBuyer) {
+  if (!user.isAdmin && !isOwner && !isBuyer) return '';
+  const agent = parseReceivingAgent(deal);
+  const names = companyNameMap();
+  const updates = db.prepare('SELECT * FROM receiving_updates WHERE deal_id = ? ORDER BY id DESC LIMIT 50').all(deal.id);
+  const updatesHtml = updates.length ? `<div class="tl" style="margin-top:10px">${updates.map((u, i) => `
+    <div class="tl-item" data-reveal style="--i:${Math.min(i, 8)}">
+      <div class="tl-dot"></div>
+      <div class="tl-body">
+        <div class="feed-head" style="margin:0"><b>${esc(u.note)}</b>
+          <span class="muted">${esc(u.company_id ? (names.get(u.company_id) || 'Unknown') : 'Admin')} · ${esc(u.created_at.slice(0, 16).replace('T', ' '))} UTC</span></div>
+        <span class="badge badge-agent">🛳️ Receiving agent · ${esc(agent && agent.country ? agent.country : 'receiving country')}</span>
+      </div>
+    </div>`).join('')}</div>` : '<p class="muted" style="margin-top:8px">No receiving-side updates logged yet.</p>';
+
+  let agentBody;
+  if (agent) {
+    agentBody = `<div class="bank-card" style="margin-top:8px">
+      ${bankFieldRow('Agent company', agent.name)}
+      ${agent.contact ? bankFieldRow('Contact person', agent.contact) : ''}
+      ${agent.phone ? bankFieldRow('Phone', agent.phone) : ''}
+      ${agent.email ? bankFieldRow('Email', agent.email) : ''}
+      ${agent.country ? bankFieldRow('Country', agent.country) : ''}
+    </div>
+    <p class="muted" style="margin-top:6px">Nominated by <b>${esc(names.get(agent.nominated_by) || 'the platform')}</b> · ${esc(String(agent.nominated_at || '').slice(0, 16).replace('T', ' '))} UTC</p>`;
+  } else {
+    agentBody = '<p class="muted" style="margin-top:8px">No receiving-country agent nominated yet. Either party can nominate the shipment agent who handles the goods at destination.</p>';
+  }
+
+  // Nominate / edit form — either party (and admin); editing or removing is audit-logged (SHIPMENT AGENT).
+  const canNominate = user.isAdmin || isOwner || isBuyer;
+  const nominateHtml = canNominate ? `
+    <hr class="sep">
+    <h4 style="margin-bottom:8px">${agent ? '✏️ Edit receiving agent' : '➕ Nominate the receiving agent'}</h4>
+    <form method="POST" action="/deal/${deal.id}/receiving-agent">
+      <div class="grid2" style="gap:10px">
+        <div><label>Agent company name *</label><input type="text" name="agent_name" required maxlength="160" value="${agent ? esc(agent.name) : ''}" placeholder="e.g. Gulf Gateway Shipping LLC"></div>
+        <div><label>Contact person</label><input type="text" name="agent_contact" maxlength="120" value="${agent ? esc(agent.contact || '') : ''}" placeholder="e.g. Sara Haddad"></div>
+      </div>
+      <div class="grid2" style="gap:10px">
+        <div><label>Phone</label><input type="text" name="agent_phone" maxlength="60" value="${agent ? esc(agent.phone || '') : ''}" placeholder="e.g. +971 4 000 0000"></div>
+        <div><label>Email</label><input type="email" name="agent_email" maxlength="160" value="${agent ? esc(agent.email || '') : ''}" placeholder="agent@example.com"></div>
+      </div>
+      <label>Receiving country *</label><input type="text" name="agent_country" required maxlength="120" value="${agent ? esc(agent.country || '') : ''}" placeholder="e.g. United Arab Emirates">
+      <button class="btn btn-sm" type="submit">${agent ? 'Save changes' : 'Nominate agent'}</button>
+      ${agent ? `<button class="btn btn-sm btn-danger" type="submit" formaction="/deal/${deal.id}/receiving-agent/remove" formmethod="POST" onclick="return confirm('Remove the receiving-agent nomination? This is audit-logged.')">Remove</button>` : ''}
+      <p class="muted" style="margin-top:6px">Changes are audit-logged by the Shipment Agent and the other party is notified.</p>
+    </form>` : '';
+
+  // Receiving-side update form — the nominating party (or admin) logs port/customs updates.
+  const canLog = agent && (user.isAdmin || (agent.nominated_by && user.id === agent.nominated_by));
+  const updateForm = canLog ? `
+    <hr class="sep">
+    <h4 style="margin-bottom:8px">📮 Log a receiving-side update</h4>
+    <form method="POST" action="/deal/${deal.id}/receiving-update">
+      <label>Status update *</label>
+      <input type="text" name="note" required maxlength="300" placeholder="e.g. Arrived at Jebel Ali port · Customs clearance started">
+      <button class="btn btn-sm" type="submit">Log update</button>
+      <p class="muted" style="margin-top:6px">Posted to the shipment timeline, badged "Receiving agent · ${esc(agent.country || 'receiving country')}", visible to both parties and the admin.</p>
+    </form>` : (agent ? '<p class="muted" style="margin-top:10px">Receiving-side updates are logged by the nominating party or the admin.</p>' : '');
+
+  return `<div class="card" data-reveal>
+    <h3>🛳️ Receiving-country shipment agent</h3>
+    ${agentBody}
+    ${(agent && updates.length) || canLog ? `<h4 style="margin:14px 0 4px">Shipment timeline — receiving side</h4>${updatesHtml}` : ''}
+    ${updateForm}
+    ${nominateHtml}
+  </div>`;
+}
+
 /** Gold commission-payment card for a finalized private contract (parties + admin; 50 / 50 split). */
 function pcPaymentCardHtml(pc, user) {
   if (!pc || pc.status !== 'approved' || !(Number(pc.value) > 0)) return '';
@@ -552,7 +1006,7 @@ function pcPaymentCardHtml(pc, user) {
   const partyRow = (cid, label, share) => {
     const r = latestBy[cid];
     const st = r ? paymentBadge(r.status) : '<span class="badge">— no confirmation yet</span>';
-    const meta = r ? `<br><span class="muted">${r.note ? `“${esc(r.note)}” · ` : ''}${esc(r.created_at.slice(0, 16).replace('T', ' '))} UTC</span>` : '';
+    const meta = r ? `<br><span class="muted">${r.note ? `“${esc(r.note)}” · ` : ''}${esc(r.created_at.slice(0, 16).replace('T', ' '))} UTC</span>${paymentProofHtml(r, user)}` : '';
     return `<div style="padding:6px 0;border-top:1px dashed var(--border-soft)">${label} <b>${esc(names.get(cid) || 'Unknown')}</b> — ${isFinite(share) ? `${fmtAmount(share)} ${esc(pcb.cur)}` : 'amount per instructions'} ${st}${meta}</div>`;
   };
   let confirmHtml = '';
@@ -565,21 +1019,22 @@ function pcPaymentCardHtml(pc, user) {
       confirmHtml = `<hr class="sep">
       <h4 style="margin-bottom:8px">Confirm your payment (${isFinite(myShare) ? `${fmtAmount(myShare)} ${esc(pcb.cur)}` : 'amount per instructions'})</h4>
       ${mine && mine.status === 'rejected' ? '<p class="flag-note">Your previous confirmation was rejected by the administrator. You can re-confirm once the transfer is made.</p>' : ''}
+      <div class="feed-actions" style="margin:0 0 10px">${applePayHtml()}</div>
       <form method="POST" action="/contracts/${pc.id}/payment-confirm">
         <label>Payment reference / note (optional)</label>
         <input type="text" name="note" maxlength="300" placeholder="e.g. Bank transfer ref #TRX-12345, sent today">
         <button class="btn btn-sm btn-green" type="submit">Confirm payment sent</button>
+        <p class="muted" style="margin-top:6px">After confirming you can attach the bank-transfer receipt (PDF) as payment proof for the admin.</p>
       </form>`;
     }
   }
   return `<div class="card vault" data-reveal>
-    <h3>💰 Commission payment ${settled ? '<span class="badge badge-contract">settled ✓</span>' : '<span class="badge badge-sealed">awaiting payment</span>'}</h3>
+    <h3>💰 Commission payment ${settled ? '<span class="badge badge-contract">settled ✓</span>' : '<span class="badge badge-sealed">awaiting payment</span>'} ${FLOW_PREVIEW_BADGE}</h3>
     <p style="margin-top:6px">Total commission: <span class="deal-value" style="font-size:1rem">${isFinite(pcb.fee) ? `${fmtAmount(pcb.fee)} ${esc(pcb.cur)}` : `${pcb.pct}% of contract value`}</span>
       <span class="muted">(${pcb.pct}% of contract value · split: <b>${esc(NEG_SPLITS['50-50'])}</b>)</span></p>
     ${partyRow(pc.sender_company_id, '✉️ Sender', pcb.senderShare)}
     ${partyRow(pc.recipient_company_id, '📬 Recipient', pcb.recipientShare)}
-    <h4 style="margin:12px 0 6px">🏦 Payment instructions (bank transfer)</h4>
-    <p class="muted" style="white-space:pre-wrap">${esc(adminBankDetails())}</p>
+    ${bankDetailsCardHtml(`DZ-PC-${pc.id} commission`)}
     ${settled ? '<p style="margin-top:10px"><span class="badge badge-contract">Commission fully settled ✓</span></p>' : confirmHtml}
   </div>`;
 }
@@ -990,6 +1445,302 @@ function unreadPrivateContracts(companyId) {
   return db.prepare(`SELECT COUNT(*) AS n FROM private_contracts WHERE recipient_company_id = ? AND status = 'pending_recipient'`).get(companyId).n;
 }
 
+// ============================= BATCH C (7) — i18n EN / AR / 中文 =============================
+const SUPPORTED_LANGS = ['en', 'ar', 'zh'];
+const LANG_LABELS = { en: 'English', ar: 'العربية', zh: '中文' };
+/**
+ * Core UI dictionary. English is the fallback for ANY missing key — t() never crashes,
+ * never returns undefined. Deep legacy strings intentionally stay English (see report).
+ */
+const I18N = {
+  en: {
+    'nav.home': 'Home', 'nav.chats': 'Chats', 'nav.contracts': 'Contracts', 'nav.calendar': 'Calendar',
+    'nav.tracking': 'Tracking', 'nav.notifications': 'Notifications', 'nav.search': 'Search',
+    'nav.profile': 'Profile', 'nav.dashboard': 'Dashboard', 'nav.create': 'Create', 'nav.logout': 'Log out',
+    'nav.signin': 'Sign in', 'nav.register': 'Register company', 'nav.theme': 'Toggle light/dark theme',
+    'nav.language': 'Interface language',
+    'common.save': 'Save', 'common.cancel': 'Cancel', 'common.send': 'Send', 'common.post': 'Post',
+    'common.delete': 'Delete', 'common.edit': 'Edit', 'common.back': 'Back', 'common.close': 'Close',
+    'common.submit': 'Submit', 'common.status': 'Status', 'common.date': 'Date', 'common.notes': 'Notes',
+    'common.amount': 'Amount', 'common.currency': 'Currency', 'common.category': 'Category',
+    'common.optional': 'optional', 'common.none': 'None yet.',
+    'auth.welcome': 'Welcome back', 'auth.email': 'Email', 'auth.password': 'Password',
+    'auth.signin': 'Sign in', 'auth.register': 'Register company', 'auth.noaccount': "Don't have a company account?",
+    'ticker.markets': 'Markets', 'ticker.dealsdone': 'Deals done', 'ticker.dealclosed': 'closed',
+    'dash.title': 'Company dashboard', 'dash.inbox': 'Deal inbox', 'dash.openinbox': 'Open inbox',
+    'dash.mydeals': 'My deals', 'dash.myposts': 'My posts', 'dash.followers': 'Followers',
+    'dash.likes': 'Likes received', 'dash.comments': 'Comments received',
+    'dash.contractssigned': 'Contracts I signed', 'dash.contractsonmine': 'Contracts on my deals',
+    'dash.accounting': 'Accounting', 'dash.warehouse': 'Warehouse', 'dash.lowstock': 'low stock',
+    'dash.items': 'items',
+    'feed.postupdate': 'Post update', 'feed.postdeal': 'Post a deal', 'feed.like': 'Like',
+    'feed.liked': 'Liked', 'feed.comment': 'Comment', 'feed.writecomment': 'Write a comment…',
+    'feed.repost': 'Repost', 'feed.loi': 'Express interest (LOI)', 'feed.promoted': 'Promoted',
+    'feed.shareupdate': 'Share an update with the network…',
+    'tr.translate': 'Translate', 'tr.translated': 'Translated', 'tr.showorig': 'Show original',
+    'tr.unavailable': 'Translation unavailable right now', 'tr.to': 'Translate to',
+    'bank.title': 'Bank details', 'bank.name': 'Bank name', 'bank.swift': 'SWIFT / BIC',
+    'bank.iban': 'IBAN / account number', 'bank.country': 'Bank country', 'bank.holder': 'Account holder',
+    'bank.save': 'Save bank details', 'bank.verified': 'Bank verified', 'bank.warnings': 'checks with warnings',
+    'bank.passed': 'checks passed', 'bank.notset': 'not provided', 'bank.rejected': 'rejected by admin',
+    'acct.title': 'Accounting', 'acct.invoices': 'Invoices', 'acct.expenses': 'Expenses',
+    'acct.ledger': 'Ledger', 'acct.newinvoice': 'New invoice', 'acct.recordexpense': 'Record expense',
+    'acct.client': 'Client name', 'acct.duedate': 'Due date', 'acct.linkeddeal': 'Linked deal',
+    'acct.export': 'Export CSV', 'acct.insights': 'Agent insights', 'acct.receivables': 'Receivables',
+    'acct.paid': 'Paid', 'acct.overdue': 'Overdue', 'acct.net': 'Net cash flow',
+    'acct.spenton': 'Spent on', 'acct.balance': 'Running balance', 'acct.mark': 'Mark as',
+    'wh.title': 'Warehouse', 'wh.items': 'Items', 'wh.additem': 'Add item', 'wh.movement': 'Record movement',
+    'wh.in': 'Stock IN', 'wh.out': 'Stock OUT', 'wh.lowstock': 'Low stock', 'wh.quantity': 'Quantity',
+    'wh.reorder': 'Reorder level', 'wh.location': 'Location note', 'wh.history': 'Movement history',
+    'wh.unit': 'Unit', 'wh.name': 'Item name', 'wh.current': 'In stock',
+    'promo.title': 'Promote', 'promo.product': 'Product / service name', 'promo.market': 'Target market',
+    'promo.benefits': 'Key benefits', 'promo.tone': 'Tone', 'promo.generate': 'Generate post',
+    'promo.publish': 'Publish to feed', 'promo.preview': 'Preview — edit before publishing',
+    'promo.regenerate': 'Regenerate', 'promo.besttime': 'Best posting time',
+    'settings.title': 'Settings', 'settings.language': 'Interface language'
+  },
+  ar: {
+    'nav.home': 'الرئيسية', 'nav.chats': 'المحادثات', 'nav.contracts': 'العقود', 'nav.calendar': 'التقويم',
+    'nav.tracking': 'التتبع', 'nav.notifications': 'الإشعارات', 'nav.search': 'بحث',
+    'nav.profile': 'الملف الشخصي', 'nav.dashboard': 'لوحة التحكم', 'nav.create': 'إنشاء', 'nav.logout': 'تسجيل الخروج',
+    'nav.signin': 'تسجيل الدخول', 'nav.register': 'تسجيل شركة', 'nav.theme': 'تبديل المظهر الفاتح/الداكن',
+    'nav.language': 'لغة الواجهة',
+    'common.save': 'حفظ', 'common.cancel': 'إلغاء', 'common.send': 'إرسال', 'common.post': 'نشر',
+    'common.delete': 'حذف', 'common.edit': 'تعديل', 'common.back': 'رجوع', 'common.close': 'إغلاق',
+    'common.submit': 'إرسال', 'common.status': 'الحالة', 'common.date': 'التاريخ', 'common.notes': 'ملاحظات',
+    'common.amount': 'المبلغ', 'common.currency': 'العملة', 'common.category': 'الفئة',
+    'common.optional': 'اختياري', 'common.none': 'لا يوجد بعد.',
+    'auth.welcome': 'مرحباً بعودتك', 'auth.email': 'البريد الإلكتروني', 'auth.password': 'كلمة المرور',
+    'auth.signin': 'تسجيل الدخول', 'auth.register': 'تسجيل شركة', 'auth.noaccount': 'ليس لديك حساب شركة؟',
+    'ticker.markets': 'الأسواق', 'ticker.dealsdone': 'صفقات منجزة', 'ticker.dealclosed': 'أُغلقت',
+    'dash.title': 'لوحة تحكم الشركة', 'dash.inbox': 'صندوق الصفقات', 'dash.openinbox': 'فتح الصندوق',
+    'dash.mydeals': 'صفقاتي', 'dash.myposts': 'منشوراتي', 'dash.followers': 'المتابعون',
+    'dash.likes': 'الإعجابات المستلمة', 'dash.comments': 'التعليقات المستلمة',
+    'dash.contractssigned': 'العقود التي وقعتها', 'dash.contractsonmine': 'العقود على صفقاتي',
+    'dash.accounting': 'المحاسبة', 'dash.warehouse': 'المستودع', 'dash.lowstock': 'مخزون منخفض',
+    'dash.items': 'أصناف',
+    'feed.postupdate': 'نشر تحديث', 'feed.postdeal': 'نشر صفقة', 'feed.like': 'إعجاب',
+    'feed.liked': 'أعجبني', 'feed.comment': 'تعليق', 'feed.writecomment': 'اكتب تعليقاً…',
+    'feed.repost': 'إعادة نشر', 'feed.loi': 'إبداء الاهتمام (LOI)', 'feed.promoted': 'مروَّج',
+    'feed.shareupdate': 'شارك تحديثاً مع الشبكة…',
+    'tr.translate': 'ترجمة', 'tr.translated': 'مُترجَم', 'tr.showorig': 'إظهار الأصل',
+    'tr.unavailable': 'الترجمة غير متاحة حالياً', 'tr.to': 'ترجمة إلى',
+    'bank.title': 'البيانات البنكية', 'bank.name': 'اسم البنك', 'bank.swift': 'سويفت / BIC',
+    'bank.iban': 'IBAN / رقم الحساب', 'bank.country': 'بلد البنك', 'bank.holder': 'صاحب الحساب',
+    'bank.save': 'حفظ البيانات البنكية', 'bank.verified': 'بنك موثّق', 'bank.warnings': 'فحوصات مع تحذيرات',
+    'bank.passed': 'الفحوصات ناجحة', 'bank.notset': 'غير مقدَّمة', 'bank.rejected': 'مرفوضة من الإدارة',
+    'acct.title': 'المحاسبة', 'acct.invoices': 'الفواتير', 'acct.expenses': 'المصروفات',
+    'acct.ledger': 'دفتر الأستاذ', 'acct.newinvoice': 'فاتورة جديدة', 'acct.recordexpense': 'تسجيل مصروف',
+    'acct.client': 'اسم العميل', 'acct.duedate': 'تاريخ الاستحقاق', 'acct.linkeddeal': 'صفقة مرتبطة',
+    'acct.export': 'تصدير CSV', 'acct.insights': 'رؤى الوكيل', 'acct.receivables': 'المستحقات',
+    'acct.paid': 'المدفوع', 'acct.overdue': 'المتأخر', 'acct.net': 'صافي التدفق النقدي',
+    'acct.spenton': 'تاريخ الصرف', 'acct.balance': 'الرصيد الجاري', 'acct.mark': 'تحديد كـ',
+    'wh.title': 'المستودع', 'wh.items': 'الأصناف', 'wh.additem': 'إضافة صنف', 'wh.movement': 'تسجيل حركة',
+    'wh.in': 'إدخال مخزون', 'wh.out': 'إخراج مخزون', 'wh.lowstock': 'مخزون منخفض', 'wh.quantity': 'الكمية',
+    'wh.reorder': 'حد إعادة الطلب', 'wh.location': 'ملاحظة الموقع', 'wh.history': 'سجل الحركات',
+    'wh.unit': 'الوحدة', 'wh.name': 'اسم الصنف', 'wh.current': 'في المخزون',
+    'promo.title': 'الترويج', 'promo.product': 'اسم المنتج / الخدمة', 'promo.market': 'السوق المستهدف',
+    'promo.benefits': 'الفوائد الرئيسية', 'promo.tone': 'النبرة', 'promo.generate': 'توليد المنشور',
+    'promo.publish': 'نشر في الخلاصة', 'promo.preview': 'معاينة — عدّل قبل النشر',
+    'promo.regenerate': 'إعادة التوليد', 'promo.besttime': 'أفضل وقت للنشر',
+    'settings.title': 'الإعدادات', 'settings.language': 'لغة الواجهة'
+  },
+  zh: {
+    'nav.home': '首页', 'nav.chats': '聊天', 'nav.contracts': '合同', 'nav.calendar': '日历',
+    'nav.tracking': '追踪', 'nav.notifications': '通知', 'nav.search': '搜索',
+    'nav.profile': '个人资料', 'nav.dashboard': '仪表盘', 'nav.create': '创建', 'nav.logout': '退出登录',
+    'nav.signin': '登录', 'nav.register': '注册公司', 'nav.theme': '切换明/暗主题',
+    'nav.language': '界面语言',
+    'common.save': '保存', 'common.cancel': '取消', 'common.send': '发送', 'common.post': '发布',
+    'common.delete': '删除', 'common.edit': '编辑', 'common.back': '返回', 'common.close': '关闭',
+    'common.submit': '提交', 'common.status': '状态', 'common.date': '日期', 'common.notes': '备注',
+    'common.amount': '金额', 'common.currency': '货币', 'common.category': '类别',
+    'common.optional': '可选', 'common.none': '暂无。',
+    'auth.welcome': '欢迎回来', 'auth.email': '电子邮箱', 'auth.password': '密码',
+    'auth.signin': '登录', 'auth.register': '注册公司', 'auth.noaccount': '还没有公司账户？',
+    'ticker.markets': '市场行情', 'ticker.dealsdone': '已完成交易', 'ticker.dealclosed': '已成交',
+    'dash.title': '公司仪表盘', 'dash.inbox': '交易收件箱', 'dash.openinbox': '打开收件箱',
+    'dash.mydeals': '我的交易', 'dash.myposts': '我的帖子', 'dash.followers': '关注者',
+    'dash.likes': '收到的赞', 'dash.comments': '收到的评论',
+    'dash.contractssigned': '我签署的合同', 'dash.contractsonmine': '我交易的合同',
+    'dash.accounting': '会计', 'dash.warehouse': '仓库', 'dash.lowstock': '库存不足',
+    'dash.items': '个品类',
+    'feed.postupdate': '发布动态', 'feed.postdeal': '发布交易', 'feed.like': '赞',
+    'feed.liked': '已赞', 'feed.comment': '评论', 'feed.writecomment': '写评论…',
+    'feed.repost': '转发', 'feed.loi': '表达意向 (LOI)', 'feed.promoted': '推广',
+    'feed.shareupdate': '与网络分享动态…',
+    'tr.translate': '翻译', 'tr.translated': '已翻译', 'tr.showorig': '显示原文',
+    'tr.unavailable': '翻译暂时不可用', 'tr.to': '翻译为',
+    'bank.title': '银行信息', 'bank.name': '银行名称', 'bank.swift': 'SWIFT / BIC',
+    'bank.iban': 'IBAN / 账号', 'bank.country': '银行所在国', 'bank.holder': '账户持有人',
+    'bank.save': '保存银行信息', 'bank.verified': '银行已验证', 'bank.warnings': '检查有警告',
+    'bank.passed': '检查通过', 'bank.notset': '未提供', 'bank.rejected': '被管理员拒绝',
+    'acct.title': '会计', 'acct.invoices': '发票', 'acct.expenses': '费用',
+    'acct.ledger': '总账', 'acct.newinvoice': '新建发票', 'acct.recordexpense': '记录费用',
+    'acct.client': '客户名称', 'acct.duedate': '到期日', 'acct.linkeddeal': '关联交易',
+    'acct.export': '导出 CSV', 'acct.insights': '代理洞察', 'acct.receivables': '应收款',
+    'acct.paid': '已付款', 'acct.overdue': '逾期', 'acct.net': '净现金流',
+    'acct.spenton': '支出日期', 'acct.balance': '累计余额', 'acct.mark': '标记为',
+    'wh.title': '仓库', 'wh.items': '物品', 'wh.additem': '添加物品', 'wh.movement': '记录出入库',
+    'wh.in': '入库', 'wh.out': '出库', 'wh.lowstock': '库存不足', 'wh.quantity': '数量',
+    'wh.reorder': '补货水平', 'wh.location': '位置备注', 'wh.history': '出入库历史',
+    'wh.unit': '单位', 'wh.name': '物品名称', 'wh.current': '库存',
+    'promo.title': '推广', 'promo.product': '产品/服务名称', 'promo.market': '目标市场',
+    'promo.benefits': '核心优势', 'promo.tone': '语气', 'promo.generate': '生成帖子',
+    'promo.publish': '发布到动态', 'promo.preview': '预览 — 发布前可编辑',
+    'promo.regenerate': '重新生成', 'promo.besttime': '最佳发布时间',
+    'settings.title': '设置', 'settings.language': '界面语言'
+  }
+};
+/** Translate a UI key. English fallback for any missing key; never throws, never returns undefined. */
+function t(lang, key) {
+  const l = SUPPORTED_LANGS.includes(lang) ? lang : 'en';
+  const hit = I18N[l] && I18N[l][key];
+  if (hit != null) return hit;
+  const en = I18N.en[key];
+  return en != null ? en : key;
+}
+/** Resolve the request language: company preference > signed cookie > 'en'. */
+function reqLang(req) {
+  try {
+    const u = currentUser(req);
+    if (u && !u.isAdmin && u.lang && SUPPORTED_LANGS.includes(u.lang)) return u.lang;
+  } catch (e) { /* fall through to cookie */ }
+  const c = parseCookies(req).dz_lang;
+  return SUPPORTED_LANGS.includes(c) ? c : 'en';
+}
+/** Small globe language selector for the nav (submits POST /lang, reloads current page). */
+function langSelectorHtml(lang) {
+  const opts = SUPPORTED_LANGS.map(l => `<option value="${l}"${l === lang ? ' selected' : ''}>${esc(LANG_LABELS[l])}</option>`).join('');
+  return `<form method="POST" action="/lang" class="lang-form" title="${esc(t(lang, 'nav.language'))}" aria-label="${esc(t(lang, 'nav.language'))}">
+    <span aria-hidden="true" style="align-self:center;font-size:14px">🌐</span><select name="lang" onchange="this.form.submit()" aria-label="${esc(t(lang, 'nav.language'))}">${opts}</select>
+  </form>`;
+}
+
+// ============================= BATCH C (1) — MARKET TICKER (stooq CSV) =============================
+/**
+ * Liquid symbols incl. UAE names. NOTE: verified against stooq's documented free CSV quote API
+ * (https://stooq.com/q/l/?s=…&f=sd2t2ohlcv&h&e=csv). Symbols that return no row ("N/D") are
+ * skipped at render time, so a delisted/renamed symbol degrades silently.
+ */
+const MARKET_SYMBOLS = ['^spx', '^ndq', 'aapl.us', 'msft.us', 'amzn.us', 'googl.us', 'tsla.us', 'nvda.us', 'qcom.us', 'emaar.ae'];
+const MARKET_LABELS = { '^spx': 'S&P 500', '^ndq': 'NASDAQ 100', 'aapl.us': 'AAPL', 'msft.us': 'MSFT', 'amzn.us': 'AMZN', 'googl.us': 'GOOGL', 'tsla.us': 'TSLA', 'nvda.us': 'NVDA', 'qcom.us': 'QCOM', 'emaar.ae': 'EMAAR' };
+const MARKET_TTL_MS = 5 * 60 * 1000; // 5-minute in-memory cache
+const marketCache = { at: 0, quotes: [], inflight: null };
+
+/**
+ * Parse stooq CSV ("Symbol,Date,Time,Open,High,Low,Close,Volume") into quote chips.
+ * Change% is computed vs the row's Open (the free endpoint's same-day reference).
+ * Rows with N/D or unparseable closes are skipped. Exported-ish for unit testing.
+ */
+function parseStooqCsv(csv) {
+  const out = [];
+  for (const line of String(csv || '').split(/\r?\n/)) {
+    const row = line.trim();
+    if (!row || /^symbol,/i.test(row)) continue;
+    const cells = row.split(',');
+    if (cells.length < 8) continue;
+    const sym = String(cells[0] || '').toLowerCase().trim();
+    const open = parseFloat(cells[3]);
+    const close = parseFloat(cells[6]);
+    if (!sym || !isFinite(open) || !isFinite(close) || open <= 0) continue;
+    const pct = ((close - open) / open) * 100;
+    out.push({ sym, label: MARKET_LABELS[sym] || sym.toUpperCase(), close, pct });
+  }
+  return out;
+}
+/**
+ * Fire-and-forget market refresh: never awaited by page renders. On ANY failure
+ * (offline, timeout, anti-bot page, HTTP error) the cache keeps its previous value —
+ * if there has never been a success the market segment simply hides (tickerMarketItemsHtml).
+ */
+async function refreshMarketCache() {
+  if (marketCache.inflight) return marketCache.inflight;
+  marketCache.inflight = (async () => {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => { try { ctrl.abort(); } catch (e) { /* settled */ } }, 5000);
+      let text = '';
+      try {
+        const url = 'https://stooq.com/q/l/?s=' + MARKET_SYMBOLS.join(',') + '&f=sd2t2ohlcv&h&e=csv';
+        const resp = await fetch(url, {
+          signal: ctrl.signal,
+          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Dealzoin/1.0)', 'Accept': 'text/csv,*/*' }
+        });
+        if (resp && resp.ok) text = await resp.text();
+      } finally {
+        clearTimeout(timer);
+      }
+      const quotes = parseStooqCsv(text);
+      // A bot-wall HTML page parses to zero rows — only accept real data.
+      if (quotes.length) {
+        marketCache.quotes = quotes;
+        marketCache.at = Date.now();
+      }
+    } catch (e) { /* graceful: keep stale cache / stay hidden */ }
+    finally { marketCache.inflight = null; }
+  })();
+  return marketCache.inflight;
+}
+/** Kick a refresh when the cache is stale; returns the CURRENT (possibly empty) quotes synchronously. */
+function marketQuotes() {
+  if (Date.now() - marketCache.at > MARKET_TTL_MS && !marketCache.inflight) {
+    refreshMarketCache().catch(() => {});
+  }
+  return marketCache.quotes;
+}
+// Warm the cache shortly after boot (never blocks startup).
+setTimeout(() => { refreshMarketCache().catch(() => {}); }, 1500);
+
+/** Market chips HTML for the ticker — empty string when no data (silent hide). */
+function tickerMarketItemsHtml(lang) {
+  const q = marketQuotes();
+  if (!q.length) return '';
+  const chips = q.map(x => {
+    const up = x.pct >= 0;
+    return `<span class="ticker__item"><b>${esc(x.label)}</b> ${fmtAmount(Math.round(x.close * 100) / 100)} <span class="${up ? 'up' : 'dn'}">${up ? '▲' : '▼'} ${Math.abs(x.pct).toFixed(2)}%</span></span>`;
+  }).join('');
+  return `<span class="ticker__seg">📈 ${esc(t(lang, 'ticker.markets'))}</span>${chips}`;
+}
+/** "Deals done" chips: latest 10 finalized deals — number + category + incoterm ONLY
+ *  (privacy: never values, never company names). Pure DB query, always available. */
+function dealsDoneRows() {
+  try {
+    return db.prepare(`SELECT deal_number, category, incoterm FROM deals
+      WHERE contract_state = 'approved' OR status = 'closed'
+      ORDER BY created_at DESC LIMIT 10`).all();
+  } catch (e) { return []; }
+}
+function tickerDealsDoneItemsHtml(lang) {
+  const rows = dealsDoneRows();
+  if (!rows.length) return '';
+  const chips = rows.map(d =>
+    `<span class="ticker__item"><b>${esc(d.deal_number || '—')}</b> ${esc(t(lang, 'ticker.dealclosed'))} · ${esc(d.category || '—')} · ${esc(d.incoterm || 'CIF')}</span>`
+  ).join('');
+  return `<span class="ticker__seg">🤝 ${esc(t(lang, 'ticker.dealsdone'))}</span>${chips}`;
+}
+/** All ticker segments as one HTML string: markets (cached, hidden on failure) + deals done +
+ *  the Deal Floor open-deals items. Shared by page() and the /api/ticker polling endpoint. */
+function tickerSegmentsHtml(lang) {
+  const segments = [tickerMarketItemsHtml(lang), tickerDealsDoneItemsHtml(lang)];
+  let tDeals = [];
+  try {
+    tDeals = db.prepare(`SELECT deal_number, category, deal_type FROM deals
+      WHERE COALESCE(status, 'open') = 'open' AND COALESCE(contract_state, '') != 'approved'
+      ORDER BY created_at DESC LIMIT 5`).all();
+  } catch (e) { tDeals = []; }
+  if (tDeals.length) {
+    segments.push(tDeals.map(d => `<span class="ticker__item"><b>№ ${esc(d.deal_number || '—')}</b> · ${esc(d.category || (d.deal_type === 'buy' ? 'Buying' : 'Selling'))} <span class="up new">▲ NEW</span></span>`).join(''));
+  }
+  return segments.filter(Boolean).join('');
+}
+/** Combined ticker HTML for the authenticated layout (and landing): market chips + deals done. */
+function newsTickerHtml(lang) {
+  const inner = tickerSegmentsHtml(lang);
+  if (!inner) return '';
+  return `<div class="ticker a-enter" data-stage="nav" style="--i:1" role="marquee" aria-label="${esc(t(lang, 'ticker.markets'))} & ${esc(t(lang, 'ticker.dealsdone'))}" id="dz-ticker"><div class="ticker__track" id="dz-ticker-track">${inner}${inner}</div></div>`;
+}
+
 // ============================= SYSTEM ANNOUNCEMENT POSTS =============================
 /**
  * Congratulations auto-post: inserted when a deal negotiation (or private contract) is finalized.
@@ -1290,6 +2041,176 @@ const CSS = `
     --ghost-num:     rgba(16,26,46,0.07);
     --hero-ink:      #F4F1E8;
   }
+
+  /* ==================== BATCH A — Per-company palettes ====================
+     Each palette re-themes the design tokens. Dark variants apply whenever
+     data-palette is set (they follow the base dark :root block); light variants
+     use the two-attribute selector so they beat the base [data-theme="light"].
+     All light variants stay on warm paper — never pure white. */
+  [data-palette="desert-gold"] {
+    --bg-void: #181008; --bg-elevated: #221709; --bg-spotlight: #2B1D0C;
+    --surface-card: #20150A; --surface-deal: linear-gradient(165deg, #241809 0%, #1B1106 60%, #201507 100%);
+    --gold: #E3B04B; --gold-deep: #C08E2E; --gold-bright: #F2C56B; --gold-glow: rgba(227,176,75,0.14);
+    --mint: #5EC9A0; --mint-deep: #3FA582;
+    --ink-primary: #F2E8D4; --ink-muted: #B7A687; --ink-faint: #8B7B5E;
+    --border-soft: #3A2C15; --border-gold: rgba(227,176,75,0.42);
+    --gradient-coin: linear-gradient(120deg, #C08E2E 0%, #E3B04B 45%, #96691A 100%);
+    --nav-bg: rgba(24,16,8,0.82);
+    --bg-glow: radial-gradient(1200px 600px at 50% -10%, rgba(227,176,75,0.09), transparent 60%);
+    --bubble-mine-bg: linear-gradient(160deg, #3A2A10 0%, #2C1F0B 100%);
+    --bubble-theirs-bg: #1E1409;
+    --gold-shadow-sm: 0 2px 12px rgba(227,176,75,0.20); --gold-shadow-md: 0 4px 18px rgba(227,176,75,0.16);
+    --gold-shadow-lg: 0 8px 26px rgba(227,176,75,0.26); --gold-shadow-plus: 0 4px 18px rgba(227,176,75,0.20);
+    --gold-shadow-plus-hover: 0 8px 26px rgba(227,176,75,0.32); --shadow-gold: 0 6px 22px rgba(227,176,75,0.24);
+  }
+  [data-palette="desert-gold"][data-theme="light"] {
+    --bg-void: #F6ECD6; --bg-elevated: #EDE0C4; --bg-spotlight: #FAF3E2;
+    --surface-card: #FCF6E8; --surface-deal: linear-gradient(165deg, #FDF7EA 0%, #F4E7C9 55%, #F8EEDC 100%);
+    --gold: #8A5A13; --gold-deep: #6F470C; --gold-bright: #6F470C; --gold-glow: rgba(138,90,19,0.14);
+    --mint: #0B7A58; --mint-deep: #0B6B4E;
+    --ink-primary: #241808; --ink-muted: #6E5C3C; --ink-faint: #8D7B5B;
+    --border-soft: #DCCBA2; --border-gold: rgba(138,90,19,0.45);
+    --gradient-coin: linear-gradient(120deg, #B07E21 0%, #D9A441 45%, #8A5A13 100%);
+    --nav-bg: rgba(252,246,232,0.88);
+    --bg-glow: radial-gradient(1200px 600px at 50% -10%, rgba(217,164,65,0.10), transparent 60%);
+    --bubble-mine-bg: linear-gradient(160deg, #F6E3BC 0%, #EED49E 100%);
+    --bubble-theirs-bg: #F9F2E0;
+    --gold-shadow-sm: 0 2px 12px rgba(138,90,19,0.22); --gold-shadow-md: 0 4px 18px rgba(138,90,19,0.18);
+    --gold-shadow-lg: 0 8px 26px rgba(138,90,19,0.28); --gold-shadow-plus: 0 4px 18px rgba(138,90,19,0.22);
+    --gold-shadow-plus-hover: 0 8px 26px rgba(138,90,19,0.34); --shadow-gold: 0 6px 22px rgba(138,90,19,0.26);
+  }
+  [data-palette="midnight-mint"] {
+    --bg-void: #081615; --bg-elevated: #0C1F1D; --bg-spotlight: #102826;
+    --surface-card: #0E211F; --surface-deal: linear-gradient(165deg, #102423 0%, #0A1A19 60%, #0D201E 100%);
+    --gold: #2FD6A5; --gold-deep: #1FAD85; --gold-bright: #57E4B8; --gold-glow: rgba(47,214,165,0.13);
+    --mint: #2FD6A5; --mint-deep: #1FAD85;
+    --ink-primary: #E4F2EC; --ink-muted: #8FB3A8; --ink-faint: #6B8E84;
+    --border-soft: #1E3B35; --border-gold: rgba(47,214,165,0.40);
+    --gradient-coin: linear-gradient(120deg, #1FAD85 0%, #2FD6A5 45%, #158064 100%);
+    --nav-bg: rgba(8,22,21,0.82);
+    --bg-glow: radial-gradient(1200px 600px at 50% -10%, rgba(47,214,165,0.08), transparent 60%);
+    --bubble-mine-bg: linear-gradient(160deg, #123B31 0%, #0E2C25 100%);
+    --bubble-theirs-bg: #0E211F;
+    --gold-shadow-sm: 0 2px 12px rgba(47,214,165,0.18); --gold-shadow-md: 0 4px 18px rgba(47,214,165,0.15);
+    --gold-shadow-lg: 0 8px 26px rgba(47,214,165,0.24); --gold-shadow-plus: 0 4px 18px rgba(47,214,165,0.18);
+    --gold-shadow-plus-hover: 0 8px 26px rgba(47,214,165,0.30); --shadow-gold: 0 6px 22px rgba(47,214,165,0.22);
+  }
+  [data-palette="midnight-mint"][data-theme="light"] {
+    --bg-void: #EAF3EC; --bg-elevated: #DDEAE0; --bg-spotlight: #F3F9F4;
+    --surface-card: #F6FAF5; --surface-deal: linear-gradient(165deg, #F7FBF6 0%, #E4F0E5 55%, #EDF5EC 100%);
+    --gold: #0E6B54; --gold-deep: #0A563F; --gold-bright: #0A563F; --gold-glow: rgba(14,107,84,0.14);
+    --mint: #0E6B54; --mint-deep: #0A563F;
+    --ink-primary: #0C2018; --ink-muted: #47685B; --ink-faint: #6E8A7E;
+    --border-soft: #C4DACB; --border-gold: rgba(14,107,84,0.45);
+    --gradient-coin: linear-gradient(120deg, #0E6B54 0%, #1FAD85 45%, #0A563F 100%);
+    --nav-bg: rgba(246,250,245,0.88);
+    --bg-glow: radial-gradient(1200px 600px at 50% -10%, rgba(47,214,165,0.10), transparent 60%);
+    --bubble-mine-bg: linear-gradient(160deg, #CFEBD9 0%, #BDE0C8 100%);
+    --bubble-theirs-bg: #F1F7F0;
+    --gold-shadow-sm: 0 2px 12px rgba(14,107,84,0.20); --gold-shadow-md: 0 4px 18px rgba(14,107,84,0.17);
+    --gold-shadow-lg: 0 8px 26px rgba(14,107,84,0.26); --gold-shadow-plus: 0 4px 18px rgba(14,107,84,0.20);
+    --gold-shadow-plus-hover: 0 8px 26px rgba(14,107,84,0.32); --shadow-gold: 0 6px 22px rgba(14,107,84,0.24);
+  }
+  [data-palette="royal-dune"] {
+    --bg-void: #090F22; --bg-elevated: #0E1630; --bg-spotlight: #131C3C;
+    --surface-card: #101831; --surface-deal: linear-gradient(165deg, #121A38 0%, #0B1228 60%, #101831 100%);
+    --gold: #D08A52; --gold-deep: #B26C39; --gold-bright: #E3A471; --gold-glow: rgba(208,138,82,0.14);
+    --mint: #5FA8D3; --mint-deep: #4585AF;
+    --ink-primary: #E9E4D8; --ink-muted: #A29CA8; --ink-faint: #7B7690;
+    --border-soft: #26304F; --border-gold: rgba(208,138,82,0.42);
+    --gradient-coin: linear-gradient(120deg, #B26C39 0%, #D08A52 45%, #8F5427 100%);
+    --nav-bg: rgba(9,15,34,0.82);
+    --bg-glow: radial-gradient(1200px 600px at 50% -10%, rgba(208,138,82,0.09), transparent 60%);
+    --bubble-mine-bg: linear-gradient(160deg, #3A2A1A 0%, #2B1F13 100%);
+    --bubble-theirs-bg: #101831;
+    --gold-shadow-sm: 0 2px 12px rgba(208,138,82,0.20); --gold-shadow-md: 0 4px 18px rgba(208,138,82,0.16);
+    --gold-shadow-lg: 0 8px 26px rgba(208,138,82,0.26); --gold-shadow-plus: 0 4px 18px rgba(208,138,82,0.20);
+    --gold-shadow-plus-hover: 0 8px 26px rgba(208,138,82,0.32); --shadow-gold: 0 6px 22px rgba(208,138,82,0.24);
+  }
+  [data-palette="royal-dune"][data-theme="light"] {
+    --bg-void: #F3EDE2; --bg-elevated: #E8DFCE; --bg-spotlight: #F9F4E9;
+    --surface-card: #FBF6EA; --surface-deal: linear-gradient(165deg, #FCF7EB 0%, #EFE5D0 55%, #F5EDDB 100%);
+    --gold: #9A4A1F; --gold-deep: #7E3A14; --gold-bright: #7E3A14; --gold-glow: rgba(154,74,31,0.14);
+    --mint: #1F5F8B; --mint-deep: #174C70;
+    --ink-primary: #101A30; --ink-muted: #52597A; --ink-faint: #797E96;
+    --border-soft: #DACFB6; --border-gold: rgba(154,74,31,0.45);
+    --gradient-coin: linear-gradient(120deg, #B26C39 0%, #C97C4A 45%, #8F5427 100%);
+    --nav-bg: rgba(251,246,234,0.88);
+    --bg-glow: radial-gradient(1200px 600px at 50% -10%, rgba(201,124,74,0.10), transparent 60%);
+    --bubble-mine-bg: linear-gradient(160deg, #F2DCC2 0%, #E9CBA4 100%);
+    --bubble-theirs-bg: #F7F1E4;
+    --gold-shadow-sm: 0 2px 12px rgba(154,74,31,0.22); --gold-shadow-md: 0 4px 18px rgba(154,74,31,0.18);
+    --gold-shadow-lg: 0 8px 26px rgba(154,74,31,0.28); --gold-shadow-plus: 0 4px 18px rgba(154,74,31,0.22);
+    --gold-shadow-plus-hover: 0 8px 26px rgba(154,74,31,0.34); --shadow-gold: 0 6px 22px rgba(154,74,31,0.26);
+  }
+
+  /* ==================== BATCH A — Loading logo overlay ====================
+     Full-screen struck-coin loader: the Dz mark pulses while a gold ring spins
+     around it. Rendered on every page; shown only with JS (.js gate), hidden on
+     window load, re-shown briefly during same-origin navigations (.is-on), and
+     fully suppressed under prefers-reduced-motion. */
+  .dz-loader { display: none; position: fixed; inset: 0; z-index: 200; align-items: center; justify-content: center;
+    background: var(--bg-void); background-image: var(--bg-glow); }
+  /* gated on html.dz-js (set by the head script) so the overlay covers the whole page load,
+     and never renders at all when JS is disabled */
+  .dz-js .dz-loader.is-on { display: flex; }
+  .dz-loader__stage { position: relative; width: 96px; height: 96px; display: grid; place-items: center; }
+  .dz-loader__ring { position: absolute; inset: 0; border-radius: 50%;
+    border: 3px solid transparent; border-top-color: var(--gold); border-right-color: var(--border-gold);
+    animation: kf-loader-spin .9s linear infinite; }
+  .dz-loader__coin { width: 62px; height: 62px; border-radius: 50%; display: grid; place-items: center;
+    background: var(--gradient-coin); color: var(--on-gold); font: 700 1.35rem var(--font-display);
+    box-shadow: inset 0 0 0 3px rgba(0,0,0,.18), inset 0 2px 4px rgba(255,255,255,.4), var(--shadow-gold);
+    animation: kf-loader-pulse 1.4s var(--ez-drift) infinite; }
+  .dz-loader__tag { position: absolute; top: calc(100% + 14px); left: 50%; transform: translateX(-50%); white-space: nowrap;
+    font: 600 .75rem var(--font-body); letter-spacing: .16em; text-transform: uppercase; color: var(--ink-muted); }
+  @keyframes kf-loader-spin { to { transform: rotate(360deg); } }
+  @keyframes kf-loader-pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.08); } }
+  @media (prefers-reduced-motion: reduce) { .dz-loader { display: none !important; } }
+
+  /* ==================== BATCH A — Terms & Conditions modal ====================
+     Scroll-gated agreement modal: the Agree button unlocks only after the terms
+     body is scrolled to the bottom. No Esc / backdrop dismissal — agreement must
+     be explicit. mode=gate (post-login re-agreement) is a blocking full overlay. */
+  .terms-gate { position: fixed; inset: 0; z-index: 150; display: none; align-items: center; justify-content: center;
+    background: rgba(8,10,18,0.72); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); padding: 20px; }
+  .terms-gate.is-open { display: flex; }
+  .js .terms-gate--force { display: flex; } /* login re-agreement: always on for JS sessions */
+  .terms-modal { width: 640px; max-width: 100%; max-height: 86vh; display: flex; flex-direction: column;
+    background: var(--guilloche), var(--surface-card); border: 1px solid var(--border-gold); border-radius: 16px;
+    box-shadow: var(--card-shadow-hover), var(--shadow-gold); overflow: hidden; }
+  .terms-modal__head { padding: 16px 20px 12px; border-bottom: 1px solid var(--border-soft);
+    background: linear-gradient(90deg, var(--gold-glow), transparent 70%); }
+  .terms-modal__head .kicker { color: var(--gold); }
+  .terms-modal__head h3 { margin: 4px 0 2px; }
+  .terms-modal__body { flex: 1; overflow-y: auto; padding: 14px 20px; font-size: 14px; line-height: 1.6;
+    border-bottom: 1px solid var(--border-soft); scrollbar-width: thin; scrollbar-color: var(--gold) var(--bg-elevated); }
+  .terms-modal__body p { margin-bottom: 10px; }
+  .terms-modal__foot { padding: 14px 20px 18px; display: flex; flex-direction: column; gap: 10px; }
+  .terms-scroll-hint { font-size: 12px; color: var(--warning); display: flex; align-items: center; gap: 6px; }
+  .terms-scroll-hint.done { color: var(--mint); }
+  .terms-agree-btn[disabled] { opacity: .45; cursor: not-allowed; filter: grayscale(.4); }
+  .terms-agree-btn[disabled]:hover { transform: none; box-shadow: var(--gold-shadow-md), inset 0 1px 0 rgba(255,255,255,0.35); }
+
+  /* Batch A — cargo capacity chip (authorized viewers only; never public) */
+  .chip-cargo { color: var(--mint); border-color: var(--ok-border); background: var(--ok-badge-bg); text-transform: none; }
+  /* LOI countdown pill on negotiation views */
+  .loi-countdown { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 0.3rem 0.9rem;
+    font: 600 0.8rem var(--font-body); border: 1px solid var(--warn-badge-border); color: var(--warning); background: var(--warn-bg);
+    font-variant-numeric: tabular-nums; }
+  .loi-countdown.loi-expired { border-color: var(--err-badge-border); color: var(--danger); background: var(--err-bg); }
+  /* Palette picker swatches on /profile */
+  .palette-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 10px 0 14px; }
+  .palette-opt { position: relative; display: block; cursor: pointer; }
+  .palette-opt input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+  .palette-opt .palette-card { border: 2px solid var(--border-soft); border-radius: 12px; padding: 10px 12px;
+    background: var(--bg-elevated); transition: border-color .18s ease, box-shadow .18s ease; }
+  .palette-opt:hover .palette-card { border-color: var(--border-gold); }
+  .palette-opt input:checked + .palette-card { border-color: var(--gold); box-shadow: 0 0 0 3px var(--gold-glow); }
+  .palette-swatch { display: flex; height: 26px; border-radius: 7px; overflow: hidden; border: 1px solid var(--border-soft); margin-bottom: 8px; }
+  .palette-swatch span { flex: 1; }
+  .palette-name { font-weight: 700; font-size: 13px; color: var(--ink-primary); }
+  .palette-hint { font-size: 11px; color: var(--ink-muted); }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background-color: var(--bg-void); background-image: var(--bg-glow); background-attachment: fixed; background-repeat: no-repeat; color: var(--ink-primary); font-family: var(--font-body); font-size: 16px; line-height: 1.6; min-height: 100vh; overflow-x: hidden; }
   a { color: var(--gold); text-decoration: none; }
@@ -1841,6 +2762,42 @@ const CSS = `
   @keyframes kf-ticker { to { transform: translateX(-50%); } }
   @keyframes kf-newpulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
 
+  /* ==================== BATCH C — ticker segments, i18n, translator, agents ==================== */
+  /* Segment label chip inside the news ticker (Markets / Deals done). */
+  .ticker__seg { white-space: nowrap; color: var(--gold); font-weight: 700; letter-spacing: .08em; text-transform: uppercase; font-size: .72rem; align-self: center; }
+  /* RTL: the marquee travels the same way; flip the translate direction so the seamless loop holds. */
+  html[dir="rtl"] .ticker__track { animation-name: kf-ticker-rtl; }
+  @keyframes kf-ticker-rtl { to { transform: translateX(50%); } }
+  /* Nav language selector (globe) — compact, themed. */
+  .lang-form { display: inline-flex; margin: 0 2px; }
+  .lang-form select { appearance: none; background: var(--bg-elevated); color: var(--ink-muted); border: 1px solid var(--border-soft);
+    border-radius: var(--radius-ctl); font: 600 .75rem var(--font-body); padding: 4px 8px; cursor: pointer; max-width: 96px; }
+  .lang-form select:hover, .lang-form select:focus { color: var(--gold); border-color: var(--border-gold); outline: none; }
+  /* Global toast stack (translate failures, agent notices). */
+  .dz-toasts { position: fixed; top: 14px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: 8px; z-index: 300; max-width: 92vw; }
+  .dz-toast { background: var(--surface-card); border: 1px solid var(--border-soft); color: var(--ink-primary);
+    padding: 9px 16px; border-radius: 12px; font-size: 13px; font-weight: 600; box-shadow: var(--gold-shadow-md, 0 8px 24px rgba(0,0,0,.35));
+    transition: opacity .35s ease; }
+  .dz-toast--err { border-color: var(--danger); color: var(--danger); }
+  /* Translate button under messages/posts/descriptions. */
+  .dz-tr-btn { background: none; border: none; color: var(--ink-faint); font: 600 .72rem var(--font-body); cursor: pointer; padding: 2px 0; }
+  .dz-tr-btn:hover { color: var(--gold); }
+  .dz-tr-btn:disabled { opacity: .5; cursor: wait; }
+  /* Subtle "promoted" badge on advertising-agent posts. */
+  .badge-promo { background: var(--warn-bg, transparent); color: var(--warning); border: 1px solid var(--warn-badge-border, var(--border-soft));
+    font-weight: 600; text-transform: none; letter-spacing: 0; }
+  /* Pragmatic RTL adjustments (Arabic): logical flow flips via dir=rtl; these cover the leftovers. */
+  html[dir="rtl"] .nav-icons, html[dir="rtl"] .feed-head, html[dir="rtl"] .feed-actions { direction: rtl; }
+  html[dir="rtl"] .ticker__track { direction: ltr; } /* marquee math stays LTR */
+  html[dir="rtl"] .bubble.mine { margin-left: 0; margin-right: auto; }
+  html[dir="rtl"] .bubble.theirs { margin-right: 0; margin-left: auto; }
+  /* Low-stock warehouse rows. */
+  .row-lowstock td { color: var(--warning); }
+  .row-lowstock .qty { font-weight: 700; }
+  /* Agent insights box. */
+  .agent-insights { border-inline-start: 3px solid var(--gold); }
+  .agent-insights li { margin: 4px 0; }
+
   /* ==================== KINETIC — Reactive surfaces: tilt, glare, magnet, ripple ==================== */
   /* Bullion shimmer: cursor-tracked gold glare, driven by --gx/--gy (child div inside .card-deal / .stat) */
   .card__glare { position: absolute; inset: -45%; pointer-events: none; opacity: 0; transition: opacity .35s var(--ez-out);
@@ -2027,6 +2984,57 @@ const CSS = `
     .orb, .bg-grid, .ticker__track, .pin::after, .dropzone, .coin-hero, .coin-hero::after, .feed-in, .hero h1 .w>span, .card--cut::after { animation: none !important; }
     .js body { animation: none !important; }
   }
+
+  /* ==================== BATCH B — payments flow design UI ==================== */
+  /* "Flow preview" badge: marks every surface where money movement is simulated (all palettes). */
+  .badge-flow { background: var(--warn-bg); color: var(--warning); border: 1px solid var(--warn-badge-border);
+    font-weight: 600; text-transform: none; letter-spacing: 0; }
+  /* Receiving-agent timeline badge: mint, clearly distinct from platform status updates. */
+  .badge-agent { background: var(--ok-badge-bg); color: var(--mint); border: 1px solid var(--ok-badge-border);
+    font-weight: 600; text-transform: none; letter-spacing: 0; }
+  /* Apple Pay — branded black button (stays black across palettes, like the real thing). */
+  .apple-pay-btn { display: inline-flex; align-items: center; gap: 7px; background: #000; color: #fff;
+    border: 1px solid #000; border-radius: 8px; padding: 9px 20px; font: 600 0.95rem var(--font-body);
+    cursor: pointer; box-shadow: var(--card-shadow); transition: transform .12s var(--ez-press), box-shadow .18s ease; }
+  .apple-pay-btn:hover { box-shadow: var(--card-shadow-hover); transform: translateY(-1px); }
+  .apple-pay-btn:active { transform: scale(.97); }
+  /* Lightweight modal (Apple Pay explainer). */
+  .dz-modal { position: fixed; inset: 0; z-index: 140; display: none; align-items: center; justify-content: center;
+    background: rgba(5,8,16,.72); backdrop-filter: blur(6px); padding: 20px; }
+  .dz-modal.is-open { display: flex; }
+  .dz-modal__box { max-width: 480px; width: 100%; margin: 0; max-height: 84vh; overflow-y: auto; }
+  /* Bank-details card: one row per field, mono value, per-field Copy button. */
+  .bank-card { border: 1px solid var(--border-gold); border-radius: 12px; overflow: hidden; background: var(--bg-elevated); }
+  .bank-row { display: flex; align-items: center; gap: 10px; padding: 8px 12px; }
+  .bank-row + .bank-row { border-top: 1px dashed var(--border-soft); }
+  .bank-row__meta { flex: 1; min-width: 0; }
+  .bank-row__label { display: block; font-size: 0.68rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-faint); }
+  .bank-row__value { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.9rem; color: var(--ink-primary); overflow-wrap: anywhere; }
+  .copy-btn { flex: none; background: transparent; color: var(--gold); border: 1px solid var(--border-gold);
+    border-radius: 8px; padding: 4px 12px; font: 600 0.72rem var(--font-body); text-transform: uppercase;
+    letter-spacing: 0.06em; cursor: pointer; transition: all .15s ease; }
+  .copy-btn:hover { background: var(--gold-glow); }
+  .copy-btn.copied { background: var(--ok-badge-bg); color: var(--mint); border-color: var(--ok-badge-border); }
+  /* Escrow pipeline: reuse the shipment stepper, slightly roomier labels. */
+  .escrow-stepper .step-lbl { text-transform: none; font-size: 0.74rem; }
+  .escrow-stepper .step-dot { font-size: 14px; }
+  /* Milestone rows (read-only in the escrow panel) + the SPLIT_NEGO editor grid. */
+  .ms-row { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-top: 1px dashed var(--border-soft); }
+  .ms-row .ms-pct { flex: none; min-width: 52px; text-align: center; font: 700 0.95rem var(--font-display);
+    color: var(--ink-muted); border: 1px solid var(--border-soft); border-radius: 10px; padding: 6px 4px; }
+  .ms-row.is-unlocked .ms-pct { color: var(--mint); border-color: var(--ok-border); background: var(--ok-badge-bg); }
+  .ms-row .ms-body { flex: 1; min-width: 0; }
+  .ms-edit-head, .ms-edit-row { display: grid; grid-template-columns: 1.1fr 1fr 0.9fr 86px; gap: 8px; align-items: center; }
+  .ms-edit-head { font-size: 0.66rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--ink-faint); margin-bottom: 4px; }
+  .ms-edit-row { margin-bottom: 8px; }
+  .ms-edit-row input, .ms-edit-row select { margin-bottom: 0; }
+  @media (max-width: 560px) {
+    .ms-edit-head { display: none; }
+    .ms-edit-row { grid-template-columns: 1fr 1fr; }
+  }
+  .file-btn-sm { padding: 0.35rem 0.8rem; font-size: 0.78rem; margin-bottom: 6px; }
 `;
 
 /** Inline SVG icons for the company nav (no emoji in the nav bar). */
@@ -2060,50 +3068,64 @@ function totalUnread(companyId) {
 const THEME_TOGGLE_BTN = '<button class="nav-ic theme-toggle btn-theme js-theme" id="theme-toggle" type="button" title="Toggle light/dark theme" aria-label="Toggle light/dark theme"><span class="ic">🌙</span></button>';
 
 /** Render the full HTML page shell. */
-function page(title, body, user, msg, err, active, headExtra) {
+function page(title, body, user, msg, err, active, headExtra, opts) {
   const unread = (user && !user.isAdmin) ? totalUnread(user.id) : 0;
   const notifUnread = (user && !user.isAdmin) ? unreadNotifications(user.id) : 0;
   const contractsUnread = (user && !user.isAdmin) ? unreadPrivateContracts(user.id) : 0;
+  // Per-company palette (admin sessions always see the default Titan look).
+  const palette = companyPalette(user);
+  // Batch C (7): interface language — company preference wins; anonymous pages may pass opts.lang
+  // (resolved from the dz_lang cookie by the route). Arabic flips the whole page to RTL.
+  const lang = (user && !user.isAdmin && SUPPORTED_LANGS.includes(user.lang)) ? user.lang
+    : (opts && SUPPORTED_LANGS.includes(opts.lang)) ? opts.lang : 'en';
+  const isRtl = lang === 'ar';
+  const tt = (k) => t(lang, k);
+  // Terms re-agreement gate: a logged-in company on an outdated terms version gets the
+  // blocking modal on every page until it explicitly agrees (POST /terms/agree).
+  let termsGate = '';
+  if (user && !user.isAdmin) {
+    try {
+      const tv = db.prepare('SELECT agreed_terms_version FROM companies WHERE id = ?').get(user.id);
+      if (!tv || (tv.agreed_terms_version || 0) < TERMS_VERSION) termsGate = termsGateHtml('gate');
+    } catch (e) { termsGate = ''; }
+  }
   const navLinks = user && user.isAdmin
-    ? `${THEME_TOGGLE_BTN}
-       <a class="navlink" href="/admin">Dashboard</a>
-       <form method="POST" action="/admin/logout" style="display:inline"><button class="btn btn-sm btn-outline">Log out</button></form>`
+    ? `${langSelectorHtml(lang)}${THEME_TOGGLE_BTN}
+       <a class="navlink" href="/admin">${tt('nav.dashboard')}</a>
+       <form method="POST" action="/admin/logout" style="display:inline"><button class="btn btn-sm btn-outline">${tt('nav.logout')}</button></form>`
     : user
     ? `<span class="nav-icons">
-         ${navIcon('home', '/timeline', 'Home', active)}
-         ${navIcon('chats', '/chats', 'Chats', active, unread)}
-         ${navIcon('contracts', '/contracts', 'Contracts', active, contractsUnread)}
-         ${navIcon('calendar', '/calendar', 'Calendar', active)}
-         ${navIcon('globe', '/tracking', 'Tracking', active)}
-         ${navIcon('bell', '/notifications', 'Notifications', active, notifUnread)}
-         ${navIcon('search', '/search', 'Search', active)}
-         ${navIcon('profile', '/profile', 'Profile', active)}
-         ${navIcon('dashboard', '/dashboard', 'Dashboard', active)}
-         <a class="nav-plus" href="/new" title="Create" aria-label="Create">${NAV_ICONS.plus}</a>
+         ${navIcon('home', '/timeline', tt('nav.home'), active)}
+         ${navIcon('chats', '/chats', tt('nav.chats'), active, unread)}
+         ${navIcon('contracts', '/contracts', tt('nav.contracts'), active, contractsUnread)}
+         ${navIcon('calendar', '/calendar', tt('nav.calendar'), active)}
+         ${navIcon('globe', '/tracking', tt('nav.tracking'), active)}
+         ${navIcon('bell', '/notifications', tt('nav.notifications'), active, notifUnread)}
+         ${navIcon('search', '/search', tt('nav.search'), active)}
+         ${navIcon('profile', '/profile', tt('nav.profile'), active)}
+         ${navIcon('dashboard', '/dashboard', tt('nav.dashboard'), active)}
+         <a class="nav-plus" href="/new" title="${tt('nav.create')}" aria-label="${tt('nav.create')}">${NAV_ICONS.plus}</a>
        </span>
+       ${langSelectorHtml(lang)}
        ${THEME_TOGGLE_BTN}
-       <form method="POST" action="/logout" style="display:inline"><button class="btn btn-sm btn-outline">Log out</button></form>`
-    : `${THEME_TOGGLE_BTN}
-       <a class="navlink" href="/login">Sign in</a>
-       <a class="navlink" href="/signup">Register company</a>`;
-  // KINETIC — Deal Floor ticker: latest 5 open deals, server-rendered (deal numbers + categories
-  // only; values are NEVER shown). The item list is printed twice for a seamless marquee loop.
-  // Logged-in pages only; pauses on hover (CSS) and when off-screen (JS below).
+       <form method="POST" action="/logout" style="display:inline"><button class="btn btn-sm btn-outline">${tt('nav.logout')}</button></form>`
+    : `${langSelectorHtml(lang)}${THEME_TOGGLE_BTN}
+       <a class="navlink" href="/login">${tt('nav.signin')}</a>
+       <a class="navlink" href="/signup">${tt('nav.register')}</a>`;
+  // Batch C (1) news ticker stripe: live market chips (5-min cached stooq CSV, hidden silently on
+  // failure) + "deals done" chips (latest finalized deals — numbers/categories/incoterms ONLY,
+  // never values or company names) + the KINETIC Deal Floor open-deals items from earlier batches.
+  // The item list is printed twice for a seamless marquee loop; pauses on hover (CSS) and when
+  // off-screen (JS below); fully static under prefers-reduced-motion.
   let ticker = '';
-  if (user) {
-    let tDeals = [];
-    try {
-      tDeals = db.prepare(`SELECT deal_number, category, deal_type FROM deals
-        WHERE COALESCE(status, 'open') = 'open' AND COALESCE(contract_state, '') != 'approved'
-        ORDER BY created_at DESC LIMIT 5`).all();
-    } catch (e) { tDeals = []; }
-    if (tDeals.length) {
-      const items = tDeals.map(d => `<span class="ticker__item"><b>№ ${esc(d.deal_number || '—')}</b> · ${esc(d.category || (d.deal_type === 'buy' ? 'Buying' : 'Selling'))} <span class="up new">▲ NEW</span></span>`).join('');
-      ticker = `<div class="ticker a-enter" data-stage="nav" style="--i:1" role="marquee" aria-label="Deal floor — latest open deals"><div class="ticker__track">${items}${items}</div></div>`;
+  {
+    const inner = tickerSegmentsHtml(lang);
+    if (inner) {
+      ticker = `<div class="ticker a-enter" data-stage="nav" style="--i:1" role="marquee" aria-label="Dealzoin news ticker" id="dz-ticker"><div class="ticker__track" id="dz-ticker-track">${inner}${inner}</div></div>`;
     }
   }
   return `<!DOCTYPE html>
-<html lang="en" class="no-js"><head>
+<html lang="${lang}"${isRtl ? ' dir="rtl"' : ''} class="no-js" data-palette="${esc(palette)}"><head>
 <script>try{if(localStorage.getItem('dz-theme')==='light'){document.documentElement.dataset.theme='light';}}catch(e){}document.documentElement.classList.add('dz-js');</script>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)} — Dealzoin</title>
@@ -2112,6 +3134,7 @@ function page(title, body, user, msg, err, active, headExtra) {
 <style>${CSS}</style>
 ${headExtra || ''}
 </head><body>
+<div class="dz-loader is-on" id="dz-loader" aria-hidden="true"><div class="dz-loader__stage"><div class="dz-loader__ring"></div><div class="dz-loader__coin">Dz</div><div class="dz-loader__tag">Dealzoin</div></div></div>
 <div class="bg-fx" aria-hidden="true"><div class="bg-grid"></div><div class="orb orb--gold"></div><div class="orb orb--mint"></div></div>
 <nav class="nav a-enter" data-stage="nav" style="--i:0">
   <a href="/" class="brand"><span class="coin">Dz</span>Dealzoin</a>
@@ -2126,6 +3149,12 @@ ${ticker}
 </main>
 <div class="footer">Dealzoin — the B2B deal network. Companies only. 🪙</div>
 <button class="back-to-top" id="back-to-top" type="button" aria-label="Back to top" title="Back to top">&uarr;</button>
+${termsGate}
+${termsGate ? `<noscript><div class="card" style="position:fixed;left:16px;right:16px;bottom:16px;z-index:150;border-color:var(--border-gold)">
+  <b>Our Terms &amp; Conditions have been updated (v${TERMS_VERSION}).</b>
+  <p class="muted" style="margin:6px 0 10px">Please <a href="/legal/terms">read the updated Terms &amp; Conditions</a>, then confirm your agreement to continue.</p>
+  <form method="POST" action="/terms/agree"><button class="btn" type="submit">I have read and agree to the Terms &amp; Conditions</button></form>
+</div></noscript>` : ''}
 <!-- ZO — 24/7 assistant widget (hidden until JS reveals it; no-JS visitors simply never see it) -->
 <div class="zo" id="zo" hidden>
   <button class="zo-fab" id="zo-fab" type="button" aria-label="Chat with Zo, the Dealzoin assistant" aria-expanded="false" title="Zo — ask me anything">
@@ -2164,6 +3193,119 @@ ${ticker}
   }
   // Flash messages: auto-dismiss after 5s (matches the CSS countdown bar).
   setTimeout(function(){document.querySelectorAll('.flash-ok,.flash-err').forEach(function(e){e.style.transition='opacity .4s';e.style.opacity='0';setTimeout(function(){e.remove();},400);});},5000);
+  /* ===== BATCH C — shared toasts + direct translator + ticker polling ===== */
+  window.dzToast=function(msg,isErr){
+    var box=document.getElementById('dz-toasts');
+    if(!box){box=document.createElement('div');box.id='dz-toasts';box.className='dz-toasts';box.setAttribute('aria-live','polite');document.body.appendChild(box);}
+    var el=document.createElement('div');el.className='dz-toast'+(isErr?' dz-toast--err':'');el.textContent=msg;box.appendChild(el);
+    setTimeout(function(){el.style.opacity='0';setTimeout(function(){el.remove();},350);},4200);
+  };
+  /* Direct translator: any element with [data-dz-tr] wrapping text + a .dz-tr-btn button.
+     Click → POST /api/translate → swap bubble text + "Translated · show original" toggle. */
+  var DZ_TR={
+    btnLabel:${jsJson(tt('tr.translate'))},
+    translated:${jsJson(tt('tr.translated'))},
+    showOrig:${jsJson(tt('tr.showorig'))},
+    failMsg:${jsJson(tt('tr.unavailable'))},
+    target:${jsJson(lang)}
+  };
+  function dzTrAttach(scope){ /* no-op placeholder for symmetry; delegation handles everything */ }
+  document.addEventListener('click',function(ev){
+    var btn=ev.target&&ev.target.closest?ev.target.closest('.dz-tr-btn'):null;
+    if(!btn)return;
+    var wrap=btn.closest('[data-dz-tr]');
+    if(!wrap)return;
+    ev.preventDefault();
+    var body=wrap.querySelector('.dz-tr-text');
+    if(!body)return;
+    if(!body.dataset.orig)body.dataset.orig=body.textContent;
+    /* Toggle back to the original. */
+    if(body.dataset.translated==='1'){body.textContent=body.dataset.orig;body.dataset.translated='';btn.textContent='🌐 '+DZ_TR.btnLabel;return;}
+    btn.disabled=true;
+    fetch('/api/translate',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({text:body.dataset.orig,target:btn.dataset.target||DZ_TR.target})})
+      .then(function(r){return r.json().then(function(j){return{ok:r.ok,j:j};});})
+      .then(function(res){
+        btn.disabled=false;
+        if(res.ok&&res.j&&res.j.ok&&res.j.text){
+          body.textContent=res.j.text;body.dataset.translated='1';
+          btn.textContent='✓ '+DZ_TR.translated+' · '+DZ_TR.showOrig;
+        }else{window.dzToast(DZ_TR.failMsg,true);}
+      })
+      .catch(function(){btn.disabled=false;window.dzToast(DZ_TR.failMsg,true);});
+  });
+  /* Ticker polling: refresh the news ticker every 60s from /api/ticker (cheap, cached server-side). */
+  var tkTrack=document.getElementById('dz-ticker-track');
+  if(tkTrack){
+    setInterval(function(){
+      fetch('/api/ticker',{headers:{'Accept':'application/json'}})
+        .then(function(r){return r.ok?r.json():null;})
+        .then(function(j){
+          if(!j||!j.ok||!j.html)return;
+          var tk=document.getElementById('dz-ticker');
+          if(!tk)return;
+          tkTrack.innerHTML=j.html+j.html;
+        }).catch(function(){/* keep the stale ticker */});
+    },60000);
+  }
+  /* Loading logo overlay — hidden on window load, re-shown on same-origin navigation
+     (see the MPA page-out handler below), fully suppressed under reduced motion. */
+  var dzLoader=document.getElementById('dz-loader');
+  function dzLoaderOff(){if(dzLoader)dzLoader.classList.remove('is-on');}
+  if(dzLoader){
+    if(RM){dzLoaderOff();}
+    else{
+      addEventListener('load',function(){setTimeout(dzLoaderOff,140);});
+      setTimeout(dzLoaderOff,9000); /* failsafe if the load event stalls */
+    }
+  }
+  /* Terms & Conditions modal — the Agree button unlocks only after the terms body has
+     been scrolled to the bottom. Intentionally NO Esc/backdrop dismissal: agreement
+     must be explicit. mode=signup checks the pledge boxes; mode=gate posts /terms/agree. */
+  document.querySelectorAll('.terms-gate').forEach(function(g){
+    var tBody=g.querySelector('.terms-modal__body'), agreeBtn=g.querySelector('.terms-agree-btn'), hint=g.querySelector('.terms-scroll-hint');
+    function syncTerms(){
+      if(!tBody||!agreeBtn)return;
+      var done=tBody.scrollHeight-tBody.clientHeight<=2||tBody.scrollTop+tBody.clientHeight>=tBody.scrollHeight-10;
+      agreeBtn.disabled=!done;
+      if(hint){hint.classList.toggle('done',done);
+        hint.textContent=done?'✓ You have reached the end — you may now agree below.':'↓ Scroll to the end of the Terms & Conditions to enable agreement';}
+    }
+    if(tBody){tBody.addEventListener('scroll',syncTerms,{passive:true});syncTerms();}
+    if(g.getAttribute('data-mode')==='signup'&&agreeBtn){
+      agreeBtn.addEventListener('click',function(){
+        if(agreeBtn.disabled)return;
+        document.querySelectorAll('input[type=checkbox][name^="pledge_"]').forEach(function(c){c.checked=true;});
+        g.classList.remove('is-open');
+        var st=document.getElementById('terms-status');
+        if(st){st.textContent='✓ Terms & Conditions (v'+g.getAttribute('data-version')+') read and accepted — the five pledges below are checked for you.';st.style.color='var(--mint)';}
+      });
+    }
+  });
+  document.querySelectorAll('.js-terms-open').forEach(function(opener){
+    opener.addEventListener('click',function(e){
+      e.preventDefault();
+      var g=document.getElementById(opener.getAttribute('data-target')||'terms-signup');
+      if(!g)return;
+      g.classList.add('is-open');
+      var tBody=g.querySelector('.terms-modal__body');if(tBody){tBody.scrollTop=0;tBody.dispatchEvent(new Event('scroll'));}
+    });
+  });
+  /* LOI response-deadline countdown — live tick on negotiation views ("Seller must respond within Xd Yh"). */
+  var loiPills=document.querySelectorAll('[data-loi-expires]');
+  if(loiPills.length){
+    var tickLoi=function(){
+      var nowMs=Date.now();
+      loiPills.forEach(function(p){
+        var ms=new Date(p.getAttribute('data-loi-expires')).getTime()-nowMs;
+        if(!isFinite(ms))return;
+        if(ms<=0){p.textContent='⏰ LOI expired — refresh to see the updated state';p.classList.add('loi-expired');return;}
+        var d=Math.floor(ms/86400000), h=Math.floor((ms%86400000)/3600000), m=Math.floor((ms%3600000)/60000);
+        p.textContent='⏰ Seller must respond within '+(d>0?d+'d ':'')+h+'h'+(d===0?' '+m+'m':'');
+      });
+    };
+    tickLoi();setInterval(tickLoi,30000);
+  }
   // Theme toggle (persists to localStorage); glyph swaps at the 360-degree spin midpoint.
   var btn=document.getElementById('theme-toggle');
   var btnIc=btn?btn.querySelector('.ic'):null;
@@ -2293,11 +3435,12 @@ ${ticker}
       var href=a.getAttribute('href')||'';
       if(href.charAt(0)!=='#'&&new URL(a.href,location.href).origin===location.origin){
         e.preventDefault();document.body.classList.add('is-leaving');
+        if(dzLoader)dzLoader.classList.add('is-on'); /* brief loader flash on internal navigation */
         setTimeout(function(){location.href=a.href;},170);
       }
     }
   });
-  addEventListener('pageshow',function(){document.body.classList.remove('is-leaving');});
+  addEventListener('pageshow',function(){document.body.classList.remove('is-leaving');dzLoaderOff();});
   /* F) Send fly-off — dzFly(lastBubbleEl); auto-wired to the chat form (optimistic bubble). */
   window.dzFly=function(el){if(RM||!el)return;
     var r=el.getBoundingClientRect(),c=el.cloneNode(true);
@@ -2444,12 +3587,34 @@ function optionsHtml(list, selected) {
 
 // ----- Deals 2.0: types, incoterms, status pipeline -----
 const DEAL_TYPES = ['sell', 'buy'];
-const DEAL_INCOTERMS = ['FOP', 'CIF', 'CRF'];
+// Incoterms: CIF / FOB / CFR / FOP. ('CRF' was a historical typo for CFR — migrated at boot.)
+const DEAL_INCOTERMS = ['CIF', 'FOB', 'CFR', 'FOP'];
 const INCOTERM_EXPLAINERS = {
-  FOP: 'FOP — Free on Plane/Point: the buyer arranges & pays main carriage. Shipment tracking is not available on the platform.',
   CIF: 'CIF — Cost, Insurance & Freight: the seller pays shipping and insurance to the destination port. Platform tracking enabled.',
-  CRF: 'CRF — Cost & Freight: the seller pays freight to the destination port; insurance is on the buyer. Platform tracking enabled.'
+  FOB: 'FOB — Free on Board: the seller delivers the goods on board the vessel at the origin port; the buyer takes over from there. Platform tracking enabled.',
+  CFR: 'CFR — Cost & Freight: the seller pays freight to the destination port; insurance is on the buyer. Platform tracking enabled.',
+  FOP: 'FOP — Free on Plane/Point: the buyer arranges & pays main carriage. Shipment tracking is not available on the platform.'
 };
+// Cargo capacity on deal publish (Batch A) — quantity + unit.
+const DEAL_CARGO_UNITS = ['MT', 'kg', 'containers/TEU', 'CBM', 'pallets', 'units', 'barrels'];
+
+// ----- Batch A: per-company platform palettes (composed with the dark/light toggle) -----
+// 'titan' = the default Titan Ledger look; each palette ships dark + light variable overrides
+// in the CSS ([data-palette="…"] and [data-palette="…"][data-theme="light"]).
+const THEME_PALETTES = {
+  titan:           { label: 'Titan',         hint: 'Default — ink navy + struck orange', dark: '#F58A3A', light: '#A8490B' },
+  'desert-gold':   { label: 'Desert Gold',   hint: 'Warm sand & bronze',                 dark: '#E3B04B', light: '#8A5A13' },
+  'midnight-mint': { label: 'Midnight Mint', hint: 'Deep teal-green accent',             dark: '#2FD6A5', light: '#0E6B54' },
+  'royal-dune':    { label: 'Royal Dune',    hint: 'Deep navy + copper',                 dark: '#D08A52', light: '#9A4A1F' }
+};
+/** Validated palette key for a company row ('titan' default; admin sessions always Titan). */
+function companyPalette(user) {
+  if (!user || user.isAdmin || !user.id) return 'titan';
+  try {
+    const row = db.prepare('SELECT theme_choice FROM companies WHERE id = ?').get(user.id);
+    return row && THEME_PALETTES[row.theme_choice] ? row.theme_choice : 'titan';
+  } catch (e) { return 'titan'; }
+}
 const DEAL_STATUSES = ['open', 'production', 'dispatched', 'shipped', 'delivered'];
 /** Small status chip for feed cards and lists. */
 function dealStatusChip(deal) {
@@ -2656,7 +3821,7 @@ const DEAL_MAP_SCRIPT = `<script>(function(){
   }catch(e){fallback('🗺️ Map could not be rendered here.');}
 })();</script>`;
 
-/** Per-deal shipment tracking map section (CIF/CRF only; caller enforces parties + admin guard).
+/** Per-deal shipment tracking map section (CIF/FOB/CFR only; caller enforces parties + admin guard).
  *  Returns { html, needsLeaflet }. When either end lacks coordinates a themed placeholder card is
  *  rendered instead — the deal page never errors on geocoding failures. */
 function dealMapSection(deal, geo) {
@@ -2699,11 +3864,16 @@ function dealFormFieldsHtml() {
         <div><label>Origin location (required)</label><input type="text" name="origin" required maxlength="160" placeholder="e.g. Rotterdam, NL"></div>
       </div>
       <label>Destination (optional)</label><input type="text" name="destination" maxlength="160" placeholder="e.g. Jebel Ali, Dubai">
-      <p class="muted" style="margin:-6px 0 12px">Sell deals: the buyer's port/city — can be set from the buyer's LOI later. Powers the CIF/CRF shipment tracking map.</p>
+      <p class="muted" style="margin:-6px 0 12px">Sell deals: the buyer's port/city — can be set from the buyer's LOI later. Powers the CIF/FOB/CFR shipment tracking map.</p>
       <label>Incoterm</label>
       <select name="incoterm" id="incoterm-select">${optionsHtml(DEAL_INCOTERMS, 'CIF')}</select>
-      <p class="muted" style="margin:-6px 0 12px">${esc(INCOTERM_EXPLAINERS.FOP)}<br>${esc(INCOTERM_EXPLAINERS.CIF)}<br>${esc(INCOTERM_EXPLAINERS.CRF)}</p>
+      <p class="muted" style="margin:-6px 0 12px">${DEAL_INCOTERMS.map(i => esc(INCOTERM_EXPLAINERS[i])).join('<br>')}</p>
       <label>Deal value (e.g. 50,000 / year) — shared privately, never shown on feeds</label><input type="text" name="value" maxlength="80">
+      <div class="grid2" style="gap:10px">
+        <div><label>Cargo quantity (optional)</label><input type="number" name="cargo_qty" min="0" step="any" placeholder="e.g. 12000" inputmode="decimal"></div>
+        <div><label>Cargo unit</label><select name="cargo_unit">${optionsHtml(DEAL_CARGO_UNITS, 'MT')}</select></div>
+      </div>
+      <p class="muted" style="margin:-6px 0 12px">📦 Cargo capacity is shown only to you, negotiating counterparties and the admin — never on the public timeline.</p>
       <div class="grid2" style="gap:10px">
         <div><label>Currency</label><select name="currency">${optionsHtml(DEAL_CURRENCIES, 'USD')}</select></div>
         <div><label>Time period</label><select name="time_period">${optionsHtml(DEAL_TIME_PERIODS, '30 days')}</select></div>
@@ -2774,20 +3944,31 @@ function currentUser(req) {
   const sess = db.prepare('SELECT * FROM sessions WHERE token = ?').get(token);
   if (!sess || sess.expires_at < now()) return null;
   if (sess.is_admin) return { id: 0, name: 'Admin', isAdmin: true };
-  const c = db.prepare('SELECT id, name, status FROM companies WHERE id = ?').get(sess.company_id);
+  const c = db.prepare('SELECT id, name, status, lang FROM companies WHERE id = ?').get(sess.company_id);
   if (!c || c.status !== 'approved') return null;
   // Sub-account session: resolve the member (must still be active) and attach attribution info.
   if (sess.member_id) {
     const m = db.prepare(`SELECT id, name, role, status FROM company_members WHERE id = ? AND company_id = ?`).get(sess.member_id, c.id);
     if (!m || m.status !== 'active') return null;
-    return { id: c.id, name: c.name, isAdmin: false, memberId: m.id, memberName: m.name, memberRole: m.role };
+    return { id: c.id, name: c.name, isAdmin: false, memberId: m.id, memberName: m.name, memberRole: m.role, lang: c.lang || 'en' };
   }
-  return { id: c.id, name: c.name, isAdmin: false };
+  return { id: c.id, name: c.name, isAdmin: false, lang: c.lang || 'en' };
 }
-/** Guard: approved company session required. */
+/** Paths a company may POST to even when their T&C agreement is stale (else they could never re-agree or log out). */
+const TERMS_STALE_POST_WHITELIST = new Set(['/terms/agree', '/logout', '/lang']);
+/** Guard: approved company session required. Stale T&C version blocks ALL mutating actions server-side (the popup is enforced, not cosmetic). */
 function requireCompany(req, res, next) {
   const user = currentUser(req);
   if (!user || user.isAdmin) return res.redirect('/login?err=' + encodeURIComponent('Please sign in with an approved company account.'));
+  if (req.method === 'POST' && !TERMS_STALE_POST_WHITELIST.has(req.path)) {
+    try {
+      const tv = db.prepare('SELECT agreed_terms_version FROM companies WHERE id = ?').get(user.id);
+      if (!tv || (tv.agreed_terms_version || 0) < TERMS_VERSION) {
+        audit('ONBOARDING AGENT', 'terms gate enforcement', 'fail', `Blocked POST ${req.path} — "${user.name}" has not agreed to T&C v${TERMS_VERSION}`);
+        return res.redirect('/profile?err=' + encodeURIComponent(`Please read and agree to the updated Terms & Conditions (v${TERMS_VERSION}) before continuing.`));
+      }
+    } catch (e) { /* column may not exist during first-boot migration — do not block */ }
+  }
   req.user = user;
   next();
 }
@@ -2842,10 +4023,13 @@ app.get('/', (req, res) => {
     <div class="stat card--cut rv" style="--i:2" data-num="03"><div class="num gold" data-count="${stClosed}">${stClosed}</div><div class="lbl">Deals closed</div></div>
     <div class="stat card--cut rv" style="--i:3" data-num="04"><div class="num gold" data-count="${stDocs}">${stDocs}</div><div class="lbl">Documents verified</div></div>
   </div>`;
-  res.send(page('Welcome', body, user, req.query.msg, req.query.err));
+  res.send(page('Welcome', body, user, req.query.msg, req.query.err, undefined, undefined, { lang: reqLang(req) }));
 });
 
 // ============================= TERMS & CONDITIONS (REGISTRATION) =============================
+// Bump TERMS_VERSION whenever the clauses change — companies on an older version must
+// re-agree via the blocking modal (agreed_terms_version + agreed_at on companies).
+const TERMS_VERSION = 2;
 // The commission percentage in clauses 4 is live — it reflects the admin-adjustable platform_fee_pct setting.
 function termsClauses() {
   const pct = platformFeePct();
@@ -2867,6 +4051,38 @@ function signupPledges() {
   ['pledge_commission', `We accept the platform commission (currently ${platformFeePct()}%), due after approvals but before deal processing.`],
   ['pledge_responsibility', 'The signer is fully responsible for the contracts they sign, and all uploaded documents are authentic.']
   ];
+}
+
+/** Terms & Conditions modal markup (Batch A). mode 'signup': opened by a button on the
+ *  registration form, agreeing checks the five pledge boxes. mode 'gate': blocking
+ *  re-agreement overlay for logged-in companies whose agreed version is outdated —
+ *  submits POST /terms/agree. In both modes the Agree button stays disabled until the
+ *  terms body is scrolled to the bottom, and there is no Esc/backdrop dismissal. */
+function termsGateHtml(mode) {
+  const gate = mode === 'gate';
+  const id = gate ? 'terms-gate' : 'terms-signup';
+  const agreeInner = gate
+    ? `<form method="POST" action="/terms/agree" style="margin:0">
+         <button class="btn terms-agree-btn" type="submit" disabled>I have read and agree to the Terms &amp; Conditions</button>
+       </form>`
+    : `<button class="btn terms-agree-btn" type="button" disabled>I have read and agree to the Terms &amp; Conditions</button>`;
+  return `<div class="terms-gate${gate ? ' terms-gate--force' : ''}" id="${id}" data-mode="${gate ? 'gate' : 'signup'}" data-version="${TERMS_VERSION}" role="dialog" aria-modal="true" aria-labelledby="${id}-title">
+  <div class="terms-modal">
+    <div class="terms-modal__head">
+      <div class="kicker">Dealzoin legal · version ${TERMS_VERSION}</div>
+      <h3 id="${id}-title">📜 Terms &amp; Conditions</h3>
+      <p class="muted" style="margin:2px 0 0">${gate ? 'Our Terms & Conditions have been updated. Please read and re-agree to continue using Dealzoin.' : 'Read the full registration agreement. Agreeing here also checks the five pledges in the form.'}</p>
+    </div>
+    <div class="terms-modal__body" tabindex="0" aria-label="Terms and Conditions text">
+      ${termsClauses().map(c => `<p>${esc(c)}</p>`).join('')}
+      <p class="muted">— End of the Terms &amp; Conditions (v${TERMS_VERSION}). The signed copy can be downloaded from the <a href="/legal/terms/download">terms page</a>. —</p>
+    </div>
+    <div class="terms-modal__foot">
+      <span class="terms-scroll-hint">↓ Scroll to the end of the Terms &amp; Conditions to enable agreement</span>
+      ${agreeInner}
+    </div>
+  </div>
+</div>`;
 }
 const COMPANY_CATEGORIES = ['Trading', 'Manufacturing', 'Logistics', 'Technology', 'Agriculture', 'Energy', 'Construction', 'Healthcare', 'Finance', 'Other'];
 
@@ -2946,8 +4162,11 @@ app.get('/signup', (req, res) => {
       ${docInput('moa_authority', 'MOA & authority document — Memorandum of Association / authorization proving you may register this company', true)}
       ${docInput('bank_statement', 'Bank account statement / proof of funds', true)}
       <label>Signed Terms &amp; Conditions (required, PDF)</label>
-      <p class="muted" style="margin-bottom:8px"><a href="/legal/terms">Read the Terms &amp; Conditions</a> — download, print, sign, and upload the signed copy below.
-        <a href="/legal/terms/download">Download the Terms &amp; Conditions (.doc)</a></p>
+      <p class="muted" style="margin-bottom:8px">
+        <button type="button" class="btn btn-sm btn-outline js-terms-open" data-target="terms-signup" style="margin-bottom:8px">📜 Read &amp; accept the Terms &amp; Conditions (v${TERMS_VERSION})</button>
+        <span id="terms-status" class="muted" style="display:block;margin-bottom:6px">Opens a scroll-to-agree popup — accepting also checks the five pledges below.</span>
+        Download, print, sign, and upload the signed copy below.
+        <a href="/legal/terms">View on a page</a> · <a href="/legal/terms/download">Download (.doc)</a></p>
       <label class="file-btn dropzone"><span class="file-btn-text" data-default="📎 Upload signed Terms &amp; Conditions">📎 Upload signed Terms &amp; Conditions</span>
         <input type="file" class="file-input" name="signed_terms" accept="application/pdf,.pdf" required></label>
       ${docInput('activity_proof', 'Activity proof (e.g. portfolio, catalog, past invoices)', false)}
@@ -2963,6 +4182,7 @@ app.get('/signup', (req, res) => {
     <p class="muted" style="margin-top:12px">Already approved? <a href="/login">Sign in</a></p>
     <p class="shield-note">🛡️ Screened by the Onboarding &amp; Document Authenticity agents</p>
   </div>
+  ${termsGateHtml('signup')}
   <script>(function(){
     var inp=document.getElementById('profile-pdf');
     if(!inp)return;
@@ -3048,12 +4268,13 @@ async function signupCompleteHandler(req, res) {
   const salt = newSalt();
   const signatureIp = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim().slice(0, 80);
   const info = db.prepare(`INSERT INTO companies (name, email, password_hash, salt, website, description, status, flagged, flag_reasons, created_at,
-              category, activity, trade_license, signature_name, signature_at, signature_ip)
-              VALUES (?,?,?,?,?,?, 'pending', ?, ?, ?, ?,?,?,?,?,?)`)
+              category, activity, trade_license, signature_name, signature_at, signature_ip, agreed_terms_version, agreed_at)
+              VALUES (?,?,?,?,?,?, 'pending', ?, ?, ?, ?,?,?,?,?,?,?,?)`)
     .run(nm, em, hashPassword(b.password, salt), salt,
          site, String(b.description || '').trim().slice(0, 2000),
          check.flags.length ? 1 : 0, check.flags.join('; '), now(),
-         category, activity, tradeLicense, signatureName, now(), signatureIp);
+         category, activity, tradeLicense, signatureName, now(), signatureIp,
+         TERMS_VERSION, now()); // registration pledges accepted => current terms version recorded
   const companyId = info.lastInsertRowid;
   audit('ONBOARDING AGENT', 'signup decision', check.flags.length ? 'flag' : 'pass',
         `Company "${nm}" registered as pending (category: ${category}, trade license: ${tradeLicense})${check.flags.length ? ' with warnings: ' + check.flags.join('; ') : ''}`);
@@ -3079,19 +4300,20 @@ app.post('/signup', signupDocsUpload, signupCompleteHandler);
 
 // ============================= AUTH ROUTES (login + 2FA + logout) =============================
 app.get('/login', (req, res) => {
+  const lang = reqLang(req);
   const body = `
   <div class="card" style="max-width:440px;margin:0 auto">
-    <h2>Company sign in</h2>
+    <h2>${esc(t(lang, 'auth.welcome'))}</h2>
     <form method="POST" action="/login">
-      <label>Business email</label><input type="email" name="email" required>
-      <label>Password</label><input type="password" name="password" required>
-      <button class="btn" type="submit">Continue</button>
+      <label>${esc(t(lang, 'auth.email'))}</label><input type="email" name="email" required>
+      <label>${esc(t(lang, 'auth.password'))}</label><input type="password" name="password" required>
+      <button class="btn" type="submit">${esc(t(lang, 'auth.signin'))}</button>
     </form>
-    <p class="muted" style="margin-top:12px">No account yet? <a href="/signup">Register your company</a></p>
+    <p class="muted" style="margin-top:12px">${esc(t(lang, 'auth.noaccount'))} <a href="/signup">${esc(t(lang, 'auth.register'))}</a></p>
     <p class="muted">Team member? Sign in with your own member email &amp; password.</p>
     <p class="shield-note">🛡️ Protected by Dealzoin security agents</p>
   </div>`;
-  res.send(page('Sign in', body, null, req.query.msg, req.query.err));
+  res.send(page('Sign in', body, null, req.query.msg, req.query.err, undefined, undefined, { lang }));
 });
 
 app.post('/login', (req, res) => {
@@ -3218,6 +4440,14 @@ app.post('/logout', (req, res) => {
   res.redirect('/?msg=' + encodeURIComponent('Signed out.'));
 });
 
+/** Batch A: record re-agreement to the current Terms & Conditions version (from the
+ *  blocking gate modal shown to companies on an outdated terms version). */
+app.post('/terms/agree', requireCompany, (req, res) => {
+  db.prepare('UPDATE companies SET agreed_terms_version = ?, agreed_at = ? WHERE id = ?').run(TERMS_VERSION, now(), req.user.id);
+  audit('ONBOARDING AGENT', 'terms re-agreement', 'pass', `${req.user.name} agreed to Terms & Conditions v${TERMS_VERSION}`);
+  res.redirect((req.get('referer') || '/timeline').split('?')[0] + '?msg=' + encodeURIComponent(`Thank you — you have agreed to the Terms & Conditions (v${TERMS_VERSION}).`));
+});
+
 // ============================= FEED CARD RENDERING =============================
 function companyNameMap() {
   const map = new Map();
@@ -3247,13 +4477,27 @@ function dealFeedItem(d) {
            contract_state: d.contract_state || null, contract_party: d.contract_party || '',
            deal_number: d.deal_number || '', deal_type: d.deal_type || 'sell', category: d.category || '',
            origin: d.origin || '', incoterm: d.incoterm || 'CIF', status: d.status || 'open',
+           cargo_qty: d.cargo_qty, cargo_unit: d.cargo_unit || '',
            created_at: d.created_at, media_id: d.media_id, author_name: d.author_name || '' };
+}
+/** Cargo capacity chip — PRIVATE: only the owner, companies with a negotiation on the deal,
+ *  and the admin ever see it. Never rendered on public/anonymous surfaces. */
+const _cargoNegStmt = db.prepare('SELECT 1 FROM negotiations WHERE deal_id = ? AND (buyer_id = ? OR seller_id = ?) LIMIT 1');
+function cargoChipHtml(user, item) {
+  const qty = Number(item.cargo_qty);
+  if (!isFinite(qty) || qty <= 0 || !user) return '';
+  const unit = DEAL_CARGO_UNITS.includes(item.cargo_unit) ? item.cargo_unit : 'units';
+  const authorized = user.isAdmin || user.id === item.company_id
+    || (!user.isAdmin && !!_cargoNegStmt.get(item.ref_id, user.id, user.id));
+  if (!authorized) return '';
+  return ` <span class="chip chip-cargo" title="Cargo capacity — visible to deal parties only">📦 ${esc(fmtAmount(qty))} ${esc(unit)}</span>`;
 }
 /** Render one feed card. kind: 'deal' | 'post' | 'repost'. idx = loop index (entrance stagger). */
 function feedCard(item, user, names, idx) {
   const stagger = Math.min(Number.isInteger(idx) ? idx : 0, 8);
   const ownerName = names.get(item.company_id) || 'Unknown';
   const isOwn = user && !user.isAdmin && user.id === item.company_id;
+  const lang = (user && user.lang) || 'en';
   // Member attribution: "— by {member name}" when a sub-account authored the item.
   const byLine = item.author_name ? ` <span class="muted">— by ${esc(item.author_name)}</span>` : '';
 
@@ -3279,13 +4523,16 @@ function feedCard(item, user, names, idx) {
   }
 
   let head, bodyHtml;
+  // Batch C (2): translatable text blocks carry a "🌐 Translate" button (client calls /api/translate).
+  const trBtn = (user && !user.isAdmin) ? `<button type="button" class="dz-tr-btn">🌐 ${esc(t(lang, 'tr.translate'))}</button>` : '';
   if (item.kind === 'post') {
-    head = `${avatarHtml(ownerName, companyAvatarMediaId(item.company_id))} <a href="/company/${item.company_id}"><b>${esc(ownerName)}</b></a> <span class="muted">posted</span>${byLine}`;
-    bodyHtml = `<p style="margin-top:8px;white-space:pre-wrap">${esc(item.body)}</p>`;
+    const promoBadge = item.is_promo ? ` <span class="badge badge-promo" title="Published via the Advertising Agent">📣 ${esc(t(lang, 'feed.promoted'))}</span>` : '';
+    head = `${avatarHtml(ownerName, companyAvatarMediaId(item.company_id))} <a href="/company/${item.company_id}"><b>${esc(ownerName)}</b></a> <span class="muted">posted</span>${promoBadge}${byLine}`;
+    bodyHtml = `<div data-dz-tr><p style="margin-top:8px;white-space:pre-wrap" class="dz-tr-text">${esc(item.body)}</p>${trBtn}</div>`;
   } else if (item.kind === 'deal') {
     head = `${avatarHtml(ownerName, companyAvatarMediaId(item.company_id))} <a href="/company/${item.company_id}"><b>${esc(ownerName)}</b></a> ${starsHtml(companyReputation(item.company_id), true)} <span class="muted">posted a deal</span>${byLine}`;
     bodyHtml = `<h3 style="margin-top:8px"><a href="/deal/${item.ref_id}">${esc(item.title)}</a></h3>
-      <p style="margin-top:6px;white-space:pre-wrap">${esc(item.body)}</p>`;
+      <div data-dz-tr><p style="margin-top:6px;white-space:pre-wrap" class="dz-tr-text">${esc(item.body)}</p>${trBtn}</div>`;
   } else { // repost
     const origName = names.get(item.orig_company) || 'Unknown';
     head = `🔁 Reposted from <a href="/company/${item.orig_company}"><b>${esc(origName)}</b></a> ${starsHtml(companyReputation(item.orig_company), true)}
@@ -3299,7 +4546,7 @@ function feedCard(item, user, names, idx) {
   let headRight;
   if (item.kind !== 'post') {
     const numLine = item.deal_number ? `<div class="deal-num">Deal № ${esc(item.deal_number)}</div>` : '';
-    const chipsLine = `<div style="margin:2px 0">${dealTypeChips(item)} ${dealStatusChip(item)}</div>`;
+    const chipsLine = `<div style="margin:2px 0">${dealTypeChips(item)} ${dealStatusChip(item)}${cargoChipHtml(user, item)}</div>`;
     const valLine = `<div class="private-value-note">💰 Value shared privately</div>`;
     const tpLine = item.time_period ? `<span class="muted">⏳ ${esc(item.time_period)}</span>` : '';
     headRight = `<div style="text-align:right">${numLine}${chipsLine}${valLine}${tpLine}${tpLine ? '<br>' : ''}<span class="muted">${timeStamp}</span></div>`;
@@ -3311,13 +4558,13 @@ function feedCard(item, user, names, idx) {
     ? `<div style="margin-top:10px"><span class="badge badge-contract">Contract approved ✓${item.contract_party ? ' (with ' + esc(item.contract_party) + ')' : ''}</span></div>` : '';
 
   const signBtn = (item.kind !== 'post' && user && !user.isAdmin && !isOwn && item.company_id !== user.id && item.contract_state !== 'approved')
-    ? `<a class="btn btn-sm btn-green" href="/deal/${targetId}/loi">Express interest (LOI)</a>` : '';
+    ? `<a class="btn btn-sm btn-green" href="/deal/${targetId}/loi">${esc(t(lang, 'feed.loi'))}</a>` : '';
   const repostBtn = (item.kind !== 'post' && user && !user.isAdmin && item.orig_company !== user.id && item.company_id !== user.id)
-    ? `<form method="POST" action="/repost/${targetId}"><button class="btn btn-sm btn-outline" type="submit">Repost</button></form>` : '';
+    ? `<form method="POST" action="/repost/${targetId}"><button class="btn btn-sm btn-outline" type="submit">${esc(t(lang, 'feed.repost'))}</button></form>` : '';
   const interact = user && !user.isAdmin ? `
     <div class="feed-actions">
       <form method="POST" action="/like/${targetType}/${targetId}">
-        <button class="btn btn-sm btn-like${soc.liked ? ' liked' : ' btn-outline'}" type="submit" title="Back this deal"><span class="ic">${soc.liked ? 'Liked' : 'Like'} (${soc.likeCount})</span></button>
+        <button class="btn btn-sm btn-like${soc.liked ? ' liked' : ' btn-outline'}" type="submit" title="Back this deal"><span class="ic">${soc.liked ? esc(t(lang, 'feed.liked')) : esc(t(lang, 'feed.like'))} (${soc.likeCount})</span></button>
       </form>
       ${repostBtn}
       ${signBtn}
@@ -3325,8 +4572,8 @@ function feedCard(item, user, names, idx) {
     <div style="margin-top:12px">
       ${commentListHtml(soc.comments, names)}
       <form method="POST" action="/comment/${targetType}/${targetId}" style="margin-top:8px;display:flex;gap:8px">
-        <input type="text" name="body" placeholder="Write a comment…" required maxlength="500" style="margin-bottom:0">
-        <button class="btn btn-sm" type="submit">Comment</button>
+        <input type="text" name="body" placeholder="${esc(t(lang, 'feed.writecomment'))}" required maxlength="500" style="margin-bottom:0">
+        <button class="btn btn-sm" type="submit">${esc(t(lang, 'feed.comment'))}</button>
       </form>
     </div>` : `<p class="muted" style="margin-top:10px">${soc.likeCount} likes · ${soc.comments.length} comments</p>`;
 
@@ -3352,18 +4599,18 @@ function feedQuery(filterSql, ...args) {
              d.value, d.created_at, NULL AS repost_of, NULL AS orig_company, d.media_id,
              d.currency, d.time_period, d.contract_state, d.contract_party,
              d.deal_number, d.deal_type, d.category, d.origin, d.incoterm, d.status,
-             d.author_name, 0 AS is_system
+             d.author_name, 0 AS is_system, d.cargo_qty, d.cargo_unit, 0 AS is_promo
       FROM deals d ${filterSql}
       UNION ALL
       SELECT 'post', p.id, p.company_id, NULL, p.body, NULL, p.created_at, NULL, NULL, p.media_id,
              NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-             p.author_name, COALESCE(p.is_system, 0)
+             p.author_name, COALESCE(p.is_system, 0), NULL, NULL, COALESCE(p.is_promo, 0)
       FROM posts p ${postFilter ? 'WHERE ' + postFilter : ''}
       UNION ALL
       SELECT 'repost', r.id, r.company_id, d.title, d.description, d.value, r.created_at, d.id, d.company_id, d.media_id,
              d.currency, d.time_period, d.contract_state, d.contract_party,
              d.deal_number, d.deal_type, d.category, d.origin, d.incoterm, d.status,
-             d.author_name, 0
+             d.author_name, 0, d.cargo_qty, d.cargo_unit, 0
       FROM reposts r JOIN deals d ON d.id = r.deal_id ${filterSql ? filterSql.replace(/company_id/g, 'r.company_id') : ''}
     ) ORDER BY created_at DESC LIMIT 100`).all(...args, ...args, ...args);
 }
@@ -3414,10 +4661,10 @@ app.get('/timeline', requireCompany, (req, res) => {
       <div><a class="btn btn-sm btn-outline" href="/explore">🧭 Explorer</a>
       <a class="btn btn-sm btn-outline" href="/companies" style="margin-left:6px">🏢 Companies</a></div></div>
     <form method="POST" action="/posts" enctype="multipart/form-data">
-      <textarea name="body" rows="3" maxlength="2000" placeholder="Share an update with the network…" required style="margin-bottom:8px"></textarea>
+      <textarea name="body" rows="3" maxlength="2000" placeholder="${esc(t(req.user.lang || 'en', 'feed.shareupdate'))}" required style="margin-bottom:8px"></textarea>
       ${fileButtonHtml()}
-      <button class="btn btn-sm" type="submit">Post update</button>
-      <a class="btn btn-sm btn-outline" href="/deals/new" style="margin-left:8px">Post a deal</a>
+      <button class="btn btn-sm" type="submit">${esc(t(req.user.lang || 'en', 'feed.postupdate'))}</button>
+      <a class="btn btn-sm btn-outline" href="/deals/new" style="margin-left:8px">${esc(t(req.user.lang || 'en', 'feed.postdeal'))}</a>
     </form>
   </div>
   ${feedHtml}`;
@@ -3461,10 +4708,17 @@ app.post('/deals', requireCompany, dealUpload, async (req, res) => {
   const incoterm = DEAL_INCOTERMS.includes(req.body.incoterm) ? req.body.incoterm : 'CIF';
   const proofMode = req.body.proof_mode === 'manual' ? 'manual' : 'pdf';
   const proofText = String(req.body.product_proof_text || '').trim().slice(0, 2000);
+  // Cargo capacity (optional): a positive number plus a whitelisted unit.
+  const cargoRaw = String(req.body.cargo_qty || '').trim();
+  const cargoQty = cargoRaw === '' ? null : Number(cargoRaw);
+  const cargoUnit = DEAL_CARGO_UNITS.includes(req.body.cargo_unit) ? req.body.cargo_unit : 'MT';
 
   if (!title || !desc) return res.redirect('/deals/new?err=' + encodeURIComponent('Title and description are required.'));
   if (!category) return res.redirect('/deals/new?err=' + encodeURIComponent('Please choose a deal category.'));
   if (!origin) return res.redirect('/deals/new?err=' + encodeURIComponent('Origin location is required.'));
+  if (cargoQty !== null && (!isFinite(cargoQty) || cargoQty <= 0)) {
+    return res.redirect('/deals/new?err=' + encodeURIComponent('Cargo quantity must be a number greater than zero.'));
+  }
 
   const files = req.files || {};
   const mediaFile = files.media && files.media[0];
@@ -3491,12 +4745,13 @@ app.post('/deals', requireCompany, dealUpload, async (req, res) => {
 
   const number = nextDealNumber();
   db.prepare(`INSERT INTO deals (company_id, title, description, value, created_at, media_id, currency, time_period,
-              deal_type, deal_number, category, origin, destination, incoterm, product_proof, product_proof_doc_id, status, author_name)
-              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?)`)
+              deal_type, deal_number, category, origin, destination, incoterm, product_proof, product_proof_doc_id, status, author_name, cargo_qty, cargo_unit)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?, ?, ?)`)
     .run(req.user.id, title.slice(0, 160), desc.slice(0, 4000), value, now(), mediaId, currency, timePeriod,
          dealType, number, category, origin, destination, incoterm,
-         dealType === 'sell' && proofMode === 'manual' ? proofText : '', proofDocId, req.user.memberName || null);
-  audit('DEAL AGENT', 'deal published', 'pass', `${req.user.name} posted ${dealType.toUpperCase()} deal ${number} "${title.slice(0, 60)}" (${category}, ${incoterm}, origin ${origin})`);
+         dealType === 'sell' && proofMode === 'manual' ? proofText : '', proofDocId, req.user.memberName || null,
+         cargoQty, cargoQty !== null ? cargoUnit : '');
+  audit('DEAL AGENT', 'deal published', 'pass', `${req.user.name} posted ${dealType.toUpperCase()} deal ${number} "${title.slice(0, 60)}" (${category}, ${incoterm}, origin ${origin}${cargoQty !== null ? `, cargo ${cargoQty} ${cargoUnit}` : ''})`);
   res.redirect('/timeline?msg=' + encodeURIComponent(`Deal ${number} published to all timelines!`));
 });
 
@@ -3912,7 +5167,7 @@ app.get('/deal/:id', requireCompanyOrAdmin, async (req, res) => {
       if (!cid || !owes) return '';
       const r = latestBy[cid];
       const st = r ? paymentBadge(r.status) : '<span class="badge">— no confirmation yet</span>';
-      const meta = r ? `<br><span class="muted">${r.note ? `“${esc(r.note)}” · ` : ''}${esc(r.created_at.slice(0, 16).replace('T', ' '))} UTC</span>` : '';
+      const meta = r ? `<br><span class="muted">${r.note ? `“${esc(r.note)}” · ` : ''}${esc(r.created_at.slice(0, 16).replace('T', ' '))} UTC</span>${paymentProofHtml(r, req.user)}` : '';
       return `<div style="padding:6px 0;border-top:1px dashed var(--border-soft)">${label} <b>${esc(names.get(cid) || 'Unknown')}</b> — ${isFinite(share) ? `${fmtAmount(share)} ${esc(bd.cur)}` : 'amount per instructions'} ${st}${meta}</div>`;
     };
     const partiesList = partyRow(bd.buyerId, '🧾 Buyer', bd.buyerShare, bd.buyerOwes)
@@ -3930,11 +5185,12 @@ app.get('/deal/:id', requireCompanyOrAdmin, async (req, res) => {
           confirmHtml = `<hr class="sep">
           <h4 style="margin-bottom:8px">Confirm your payment (${isFinite(myShare) ? `${fmtAmount(myShare)} ${esc(bd.cur)}` : 'amount per instructions'})</h4>
           ${mine && mine.status === 'rejected' ? '<p class="flag-note">Your previous confirmation was rejected by the administrator. You can re-confirm once the transfer is made.</p>' : ''}
+          <div class="feed-actions" style="margin:0 0 10px">${applePayHtml()}</div>
           <form method="POST" action="/deal/${deal.id}/payment-confirm">
             <label>Payment reference / note (optional)</label>
             <input type="text" name="note" maxlength="300" placeholder="e.g. Bank transfer ref #TRX-12345, sent today">
             <button class="btn btn-sm btn-green" type="submit">Confirm payment sent</button>
-            <p class="muted" style="margin-top:6px">The administrator verifies the bank transfer and approves — shipment tracking unlocks once all required shares are approved.</p>
+            <p class="muted" style="margin-top:6px">After confirming you can attach the bank-transfer receipt (PDF) as payment proof. The administrator verifies the bank transfer and approves — shipment tracking unlocks once all required shares are approved.</p>
           </form>`;
         }
       } else {
@@ -3942,16 +5198,15 @@ app.get('/deal/:id', requireCompanyOrAdmin, async (req, res) => {
       }
     }
     paymentHtml = `<div class="card vault" data-reveal>
-      <h3>💰 Commission payment ${paid ? '<span class="badge badge-contract">paid ✓</span>' : '<span class="badge badge-sealed">awaiting payment</span>'}</h3>
+      <h3>💰 Commission payment ${paid ? '<span class="badge badge-contract">paid ✓</span>' : '<span class="badge badge-sealed">awaiting payment</span>'} ${FLOW_PREVIEW_BADGE}</h3>
       ${shareLine}
       ${partiesList}
-      <h4 style="margin:12px 0 6px">🏦 Payment instructions (bank transfer)</h4>
-      <p class="muted" style="white-space:pre-wrap">${esc(adminBankDetails())}</p>
+      ${bankDetailsCardHtml(`${deal.deal_number || 'DZ-' + deal.id} commission`)}
       ${paid ? '<p style="margin-top:10px"><span class="badge badge-contract">Commission fully paid ✓ — shipment tracking is live 🚢</span></p>' : confirmHtml}
     </div>`;
   }
 
-  // ---- Status & shipment tracking (CIF/CRF only; FOP has no platform tracking) ----
+  // ---- Status & shipment tracking (CIF/FOB/CFR only; FOP has no platform tracking) ----
   const isFop = (deal.incoterm || 'CIF') === 'FOP';
   let statusHtml;
   if (isFop) {
@@ -3990,7 +5245,7 @@ app.get('/deal/:id', requireCompanyOrAdmin, async (req, res) => {
     </div>`;
   }
 
-  // ---- Shipment tracking map (CIF/CRF only; parties + admin — the deal's insider audience:
+  // ---- Shipment tracking map (CIF/FOB/CFR only; parties + admin — the deal's insider audience:
   // owner, negotiating/contracted buyer, admin — same parties the status stepper controls serve).
   // Coordinates are geocoded lazily here (first map view), never on deal creation; failures render a placeholder.
   let mapHtml = '', mapHead = '';
@@ -4088,23 +5343,27 @@ app.get('/deal/:id', requireCompanyOrAdmin, async (req, res) => {
       ${dealTypeChips(deal)}
       <span class="chip" title="${esc(INCOTERM_EXPLAINERS[deal.incoterm] || INCOTERM_EXPLAINERS.CIF)}">⚓ ${esc(deal.incoterm || 'CIF')}</span>
       ${deal.origin ? ` <span class="chip">📍 ${esc(deal.origin)}</span>` : ''}
+      ${canSeeValue && Number(deal.cargo_qty) > 0 ? ` <span class="chip chip-cargo" title="Cargo capacity — visible to deal parties only">📦 ${esc(fmtAmount(Number(deal.cargo_qty)))} ${esc(DEAL_CARGO_UNITS.includes(deal.cargo_unit) ? deal.cargo_unit : 'units')}</span>` : ''}
     </div>
     <p class="muted">by ${avatarHtml(owner ? owner.name : '?', owner ? owner.avatar_media_id : null)}<a href="/company/${deal.company_id}"><b>${esc(owner ? owner.name : 'Unknown')}</b></a> ${starsHtml(companyReputation(deal.company_id), true)}</p>
-    <p style="margin-top:12px;white-space:pre-wrap">${esc(deal.description)}</p>
+    <div data-dz-tr><p style="margin-top:12px;white-space:pre-wrap" class="dz-tr-text">${esc(deal.description)}</p>
+    ${req.user.isAdmin ? '' : `<button type="button" class="dz-tr-btn">🌐 ${esc(t((req.user.lang || 'en'), 'tr.translate'))}</button>`}</div>
     ${deal.contract_state === 'approved' ? `<div style="margin-top:12px"><span class="badge badge-contract">Contract approved ✓${deal.contract_party ? ' (with ' + esc(deal.contract_party) + ')' : ''}</span></div>` : ''}
     ${mediaHtml(deal.media_id)}
     <div class="feed-actions">${signBtn}</div>
   </div>
   ${paymentHtml}
+  ${escrowPanelHtml(deal, req.user, isOwner, isBuyer)}
   ${statusHtml}
   ${mapHtml}
+  ${receivingAgentCardHtml(deal, req.user, isOwner, isBuyer)}
   ${proofHtml}
   ${contractHtml}
   ${docsHtml}`;
   res.send(page(deal.title, body, req.user, req.query.msg, req.query.err, undefined, mapHead));
 });
 
-// ----- POST /deal/:id/status — owner, contracted buyer or admin advances the pipeline (CIF/CRF only) -----
+// ----- POST /deal/:id/status — owner, contracted buyer or admin advances the pipeline (CIF/FOB/CFR only) -----
 app.post('/deal/:id/status', (req, res) => {
   const user = currentUser(req);
   if (!user) return res.redirect('/login?err=' + encodeURIComponent('Please sign in.'));
@@ -4183,6 +5442,190 @@ app.post('/deal/:id/payment-confirm', requireCompany, (req, res) => {
     .run(deal.id, req.user.id, amount, bd.cur, note, now());
   audit('PAYMENT AGENT', 'payment confirmation submitted', 'pass', `${req.user.name} confirmed a commission payment of ${isFinite(myShare) ? `${fmtAmount(amount)} ${bd.cur}` : 'amount TBC'} on deal ${deal.deal_number || '#' + deal.id}${note ? ` — note: ${note}` : ''}`);
   res.redirect(back + '?msg=' + encodeURIComponent('Payment confirmation submitted — the administrator will verify your transfer and approve it.'));
+});
+
+// ----- BATCH B (1a): payment-proof PDF upload — the paying party attaches a bank-transfer receipt -----
+/** Multer middleware for a single "proof" PDF field (magic bytes checked in the route). */
+function proofUploadMw(req, res, next) {
+  pdfUpload.single('proof')(req, res, (err) => {
+    if (err) {
+      const msg = err.code === 'LIMIT_FILE_SIZE' ? 'Document too large — max 15 MB.' : (err.message || PDF_RULES_MSG);
+      return res.redirect((req.get('referer') || '/timeline').split('?')[0] + '?err=' + encodeURIComponent(msg));
+    }
+    next();
+  });
+}
+/** Back-link for a commission_payment row: its deal page or its private-contract page. */
+function paymentBackLink(p) {
+  return p.deal_id ? `/deal/${p.deal_id}` : `/contracts/${p.private_contract_id}`;
+}
+app.post('/payments/:id/proof', requireCompany, proofUploadMw, (req, res) => {
+  const p = db.prepare('SELECT * FROM commission_payments WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!p) return res.redirect('/timeline?err=' + encodeURIComponent('Payment confirmation not found.'));
+  const back = paymentBackLink(p);
+  if (p.company_id !== req.user.id) {
+    audit('PAYMENT AGENT', 'proof upload guard', 'fail', `${req.user.name} attempted to attach a payment proof to payment #${p.id} owned by company #${p.company_id}`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Parties only</h2><p class="muted">Only the paying company can attach a payment proof to its own confirmation.</p></div>', req.user));
+  }
+  if (p.status !== 'pending') {
+    return res.redirect(back + '?err=' + encodeURIComponent('Proofs can only be attached while the payment awaits admin review.'));
+  }
+  const f = req.file;
+  if (!f) return res.redirect(back + '?err=' + encodeURIComponent('Choose a PDF receipt to upload.'));
+  if (!isPdfBuffer(f.buffer)) {
+    audit('PAYMENT AGENT', 'proof upload check', 'fail', `"${f.originalname || 'file'}" rejected for payment #${p.id} — not a real PDF`);
+    return res.redirect(back + '?err=' + encodeURIComponent('Upload rejected: the payment proof must be a real PDF file.'));
+  }
+  const mediaId = saveMedia(req.user.id, f);
+  if (p.proof_media_id) { try { db.prepare('DELETE FROM media WHERE id = ?').run(p.proof_media_id); } catch (e) { /* best-effort */ } } // re-upload replaces
+  db.prepare('UPDATE commission_payments SET proof_media_id = ?, proof_filename = ? WHERE id = ?')
+    .run(mediaId, String(f.originalname || 'receipt.pdf').slice(0, 200), p.id);
+  audit('PAYMENT AGENT', 'payment proof uploaded', 'pass', `${req.user.name} attached proof "${String(f.originalname || 'receipt.pdf').slice(0, 80)}" to payment #${p.id}`);
+  res.redirect(back + '?msg=' + encodeURIComponent('Payment proof attached — the administrator can review it before approving.'));
+});
+// ----- Admin (or the paying party) downloads the payment-proof PDF -----
+app.get('/payments/:id/proof', (req, res) => {
+  const user = currentUser(req);
+  if (!user) return res.redirect('/login?err=' + encodeURIComponent('Please sign in.'));
+  const p = db.prepare('SELECT * FROM commission_payments WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!p || !p.proof_media_id) return res.status(404).send(page('Not found', '<div class="card"><h2>Payment proof not found</h2></div>', user));
+  if (!user.isAdmin && p.company_id !== user.id) {
+    audit('PAYMENT AGENT', 'proof download guard', 'fail', `Unauthorized proof download attempt on payment #${p.id} by ${user.name}`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Private payment proof</h2><p class="muted">Only the paying company and the admin can download this receipt.</p></div>', user));
+  }
+  const m = db.prepare('SELECT * FROM media WHERE id = ?').get(p.proof_media_id);
+  if (!m) return res.status(404).send(page('Not found', '<div class="card"><h2>Payment proof not found</h2></div>', user));
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Length', m.data.length);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.setHeader('Content-Disposition', `attachment; filename="${String(p.proof_filename || 'receipt.pdf').replace(/[^A-Za-z0-9._-]/g, '_')}"`);
+  res.send(m.data);
+});
+
+// ----- BATCH B (4): the buyer confirms receipt of goods (REAL data — releases the final escrow milestone) -----
+app.post('/deal/:id/confirm-receipt', requireCompany, (req, res) => {
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!deal) return res.redirect('/timeline?err=' + encodeURIComponent('Deal not found.'));
+  const back = `/deal/${deal.id}`;
+  const buyerId = dealBuyerId(deal);
+  if (!buyerId || buyerId !== req.user.id) {
+    audit('ESCROW AGENT', 'receipt confirmation guard', 'fail', `${req.user.name} attempted to confirm receipt on deal ${deal.deal_number || '#' + deal.id} without being the buyer`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Buyer only</h2><p class="muted">Only the contracted buyer can confirm receipt of goods.</p></div>', req.user));
+  }
+  if (deal.status !== 'delivered') {
+    return res.redirect(back + '?err=' + encodeURIComponent('Receipt can only be confirmed once the deal status is "delivered".'));
+  }
+  if (deal.buyer_received_confirmed_at) {
+    return res.redirect(back + '?err=' + encodeURIComponent('Receipt was already confirmed for this deal.'));
+  }
+  const ts = now();
+  db.prepare('UPDATE deals SET buyer_received_confirmed_at = ? WHERE id = ?').run(ts, deal.id);
+  audit('ESCROW AGENT', 'buyer confirmed receipt', 'pass', `${req.user.name} confirmed receipt of goods on deal ${deal.deal_number || '#' + deal.id} at ${ts} — final escrow milestone released (flow preview)`);
+  notify(deal.company_id, 'receipt_confirmed', `${req.user.name} confirmed receipt of goods on deal ${deal.deal_number || '#' + deal.id} ("${deal.title}") — the final escrow milestone is released (flow preview).`, back);
+  res.redirect(back + '?msg=' + encodeURIComponent('Receipt confirmed — thank you! The final escrow milestone is released (flow preview).'));
+});
+// ----- BATCH B (4): either party raises a dispute — pauses the release design and alerts the admin -----
+app.post('/deal/:id/escrow-dispute', requireCompany, (req, res) => {
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!deal) return res.redirect('/timeline?err=' + encodeURIComponent('Deal not found.'));
+  const back = `/deal/${deal.id}`;
+  const buyerId = dealBuyerId(deal);
+  const isOwner = req.user.id === deal.company_id;
+  const isBuyer = !!buyerId && buyerId === req.user.id;
+  if (!isOwner && !isBuyer) {
+    audit('ESCROW AGENT', 'dispute guard', 'fail', `${req.user.name} attempted to dispute deal ${deal.deal_number || '#' + deal.id} without being a party`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Parties only</h2><p class="muted">Only the two deal parties can raise a dispute.</p></div>', req.user));
+  }
+  if (deal.escrow_dispute_at) {
+    return res.redirect(back + '?err=' + encodeURIComponent('A dispute is already open on this deal — the platform team is on it.'));
+  }
+  const ts = now();
+  db.prepare('UPDATE deals SET escrow_dispute_at = ? WHERE id = ?').run(ts, deal.id);
+  audit('ESCROW AGENT', 'dispute raised', 'flag', `${req.user.name} raised a dispute on deal ${deal.deal_number || '#' + deal.id} at ${ts} — escrow release paused (flow preview)`);
+  const other = isOwner ? buyerId : deal.company_id;
+  if (other) notify(other, 'escrow_dispute', `${req.user.name} raised a dispute on deal ${deal.deal_number || '#' + deal.id} ("${deal.title}"). The platform team has been alerted and will mediate.`, back);
+  res.redirect(back + '?msg=' + encodeURIComponent('Dispute raised — the platform team has been alerted (admin dashboard + audit log).'));
+});
+
+// ----- BATCH B (6): receiving-country shipment agent — nominate / remove / log updates -----
+/** Guard helper: load deal + require a party (owner/buyer) or admin. Returns { deal, isOwner, buyerId } or null. */
+function dealPartyGuard(req, res, agentLabel) {
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!deal) { res.redirect('/timeline?err=' + encodeURIComponent('Deal not found.')); return null; }
+  const buyerId = dealBuyerId(deal);
+  const isOwner = !req.user.isAdmin && req.user.id === deal.company_id;
+  const isBuyer = !req.user.isAdmin && !!buyerId && buyerId === req.user.id;
+  if (!req.user.isAdmin && !isOwner && !isBuyer) {
+    audit('SHIPMENT AGENT', agentLabel + ' guard', 'fail', `${req.user.name} attempted a receiving-agent action on deal ${deal.deal_number || '#' + deal.id} without being a party`);
+    res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Parties only</h2><p class="muted">Only the deal parties and the admin can manage the receiving agent.</p></div>', req.user));
+    return null;
+  }
+  return { deal, isOwner, isBuyer, buyerId };
+}
+app.post('/deal/:id/receiving-agent', requireCompanyOrAdmin, (req, res) => {
+  const g = dealPartyGuard(req, res, 'agent nomination');
+  if (!g) return;
+  const { deal, buyerId } = g;
+  const back = `/deal/${deal.id}`;
+  const name = String(req.body.agent_name || '').trim().slice(0, 160);
+  const country = String(req.body.agent_country || '').trim().slice(0, 120);
+  if (!name || !country) return res.redirect(back + '?err=' + encodeURIComponent('Agent company name and receiving country are required.'));
+  const email = String(req.body.agent_email || '').trim().slice(0, 160);
+  if (email && !EMAIL_RE.test(email)) return res.redirect(back + '?err=' + encodeURIComponent('The agent email address looks invalid.'));
+  const prev = parseReceivingAgent(deal);
+  const agent = {
+    name,
+    contact: String(req.body.agent_contact || '').trim().slice(0, 120),
+    phone: String(req.body.agent_phone || '').trim().slice(0, 60),
+    email,
+    country,
+    nominated_by: req.user.isAdmin ? 0 : req.user.id,
+    nominated_at: now()
+  };
+  db.prepare('UPDATE deals SET receiving_agent = ? WHERE id = ?').run(JSON.stringify(agent), deal.id);
+  audit('SHIPMENT AGENT', prev ? 'receiving agent updated' : 'receiving agent nominated', 'pass',
+    `${req.user.isAdmin ? 'Admin' : req.user.name} ${prev ? 'updated' : 'nominated'} receiving agent "${name}" (${country}) on deal ${deal.deal_number || '#' + deal.id}`);
+  const label = `${req.user.isAdmin ? 'The platform' : req.user.name} ${prev ? 'updated' : 'nominated'} the receiving-country agent on deal ${deal.deal_number || '#' + deal.id} ("${deal.title}"): ${name} (${country}).`;
+  if (req.user.isAdmin || g.isBuyer) notify(deal.company_id, 'receiving_agent', label, back);
+  if (req.user.isAdmin || g.isOwner) { if (buyerId) notify(buyerId, 'receiving_agent', label, back); }
+  res.redirect(back + '?msg=' + encodeURIComponent(prev ? 'Receiving agent updated.' : 'Receiving agent nominated.'));
+});
+app.post('/deal/:id/receiving-agent/remove', requireCompanyOrAdmin, (req, res) => {
+  const g = dealPartyGuard(req, res, 'agent removal');
+  if (!g) return;
+  const { deal, buyerId } = g;
+  const back = `/deal/${deal.id}`;
+  const prev = parseReceivingAgent(deal);
+  if (!prev) return res.redirect(back + '?err=' + encodeURIComponent('No receiving agent is nominated on this deal.'));
+  db.prepare('UPDATE deals SET receiving_agent = NULL WHERE id = ?').run(deal.id);
+  audit('SHIPMENT AGENT', 'receiving agent removed', 'flag', `${req.user.isAdmin ? 'Admin' : req.user.name} removed receiving agent "${prev.name}" (${prev.country}) from deal ${deal.deal_number || '#' + deal.id}`);
+  const label = `${req.user.isAdmin ? 'The platform' : req.user.name} removed the receiving-country agent (${prev.name}) from deal ${deal.deal_number || '#' + deal.id} ("${deal.title}").`;
+  if (req.user.isAdmin || g.isBuyer) notify(deal.company_id, 'receiving_agent', label, back);
+  if (req.user.isAdmin || g.isOwner) { if (buyerId) notify(buyerId, 'receiving_agent', label, back); }
+  res.redirect(back + '?msg=' + encodeURIComponent('Receiving-agent nomination removed.'));
+});
+app.post('/deal/:id/receiving-update', requireCompanyOrAdmin, (req, res) => {
+  const g = dealPartyGuard(req, res, 'receiving update');
+  if (!g) return;
+  const { deal, buyerId } = g;
+  const back = `/deal/${deal.id}`;
+  const agent = parseReceivingAgent(deal);
+  if (!agent) return res.redirect(back + '?err=' + encodeURIComponent('Nominate the receiving agent before logging updates.'));
+  // Only the party who nominated the agent (or the admin) logs receiving-side updates.
+  if (!req.user.isAdmin && agent.nominated_by && agent.nominated_by !== req.user.id) {
+    audit('SHIPMENT AGENT', 'receiving update guard', 'fail', `${req.user.name} attempted to log a receiving update on deal ${deal.deal_number || '#' + deal.id} without having nominated the agent`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Nominating party only</h2><p class="muted">Receiving-side updates are logged by the party who nominated the agent, or the admin.</p></div>', req.user));
+  }
+  const note = String(req.body.note || '').trim().slice(0, 300);
+  if (note.length < 2) return res.redirect(back + '?err=' + encodeURIComponent('Please describe the receiving-side update.'));
+  db.prepare('INSERT INTO receiving_updates (deal_id, company_id, note, created_at) VALUES (?,?,?,?)')
+    .run(deal.id, req.user.isAdmin ? null : req.user.id, note, now());
+  audit('SHIPMENT AGENT', 'receiving update logged', 'pass', `${req.user.isAdmin ? 'Admin' : req.user.name} logged a receiving-side update on deal ${deal.deal_number || '#' + deal.id} (agent ${agent.name}, ${agent.country}): "${note.slice(0, 120)}"`);
+  const label = `Receiving agent update (${agent.country}) on deal ${deal.deal_number || '#' + deal.id} ("${deal.title}"): "${note.slice(0, 140)}"`;
+  if (req.user.isAdmin || g.isBuyer) notify(deal.company_id, 'receiving_update', label, back);
+  if (req.user.isAdmin || g.isOwner) { if (buyerId) notify(buyerId, 'receiving_update', label, back); }
+  res.redirect(back + '?msg=' + encodeURIComponent('Receiving-side update logged on the shipment timeline.'));
 });
 
 // ----- POST /deal/:id/request-docs — a non-owner company asks the owner for more documents -----
@@ -4862,7 +6305,9 @@ app.get('/deals/inbox', requireCompany, (req, res) => {
     SELECT n.*, d.title AS deal_title, d.deal_number
     FROM negotiations n LEFT JOIN deals d ON d.id = n.deal_id
     WHERE n.buyer_id = ? OR n.seller_id = ?
-    ORDER BY n.updated_at DESC LIMIT 100`).all(myId, myId);
+    ORDER BY n.updated_at DESC LIMIT 100`).all(myId, myId)
+    // Batch A: lazily flip lapsed LOI deadlines to EXPIRED (keeps the join columns).
+    .map(n => { const r = negExpireIfNeeded(n); return r === n ? n : { ...r, deal_title: n.deal_title, deal_number: n.deal_number }; });
   const negAction = (n) => {
     const open = `/negotiation/${n.id}`;
     if (n.state === 'LOI_SENT') return n.seller_id === myId ? `<a class="btn btn-sm" href="${open}">Send offer</a>` : `<a class="btn btn-sm btn-outline" href="${open}">Open</a>`;
@@ -4885,7 +6330,9 @@ app.get('/deals/inbox', requireCompany, (req, res) => {
       <p class="muted" style="margin-top:6px">You are the <b>${role}</b> · with <a href="/company/${role === 'buyer' ? n.seller_id : n.buyer_id}"><b>${esc(otherName)}</b></a>
         · Deal № ${esc(n.deal_number || String(n.deal_id))} · round ${n.round}
         ${n.offer_value ? ` · offer <b>${esc(n.offer_value)} ${esc(n.offer_currency || 'USD')}</b>` : ''}
+        ${n.offer_incoterm ? ` · incoterm <b>${esc(n.offer_incoterm)}</b>` : ''}
         · updated ${esc(n.updated_at.slice(0, 16).replace('T', ' '))} UTC</p>
+      ${loiCountdownHtml(n)}
       <div class="feed-actions">${negAction(n)}</div>
     </div>`;
   }).join('') : '<div class="card"><p class="muted">No negotiations yet — express interest with an LOI from any deal page.</p></div>';
@@ -4981,9 +6428,45 @@ app.post('/counter/:id/refuse', requireCompany, (req, res) => {
 // State machine: LOI_SENT → OFFER_SENT ⇄ COUNTER_SENT (unlimited rounds) → BUYER_APPROVED
 //   → PO_SENT → SIGNING → SIGNED → OWNER_APPROVED → SPLIT_NEGO → PENDING_ADMIN → DONE / REJECTED.
 const NEG_STATES = ['LOI_SENT', 'OFFER_SENT', 'COUNTER_SENT', 'BUYER_APPROVED', 'PO_SENT', 'SIGNING',
-  'SIGNED', 'OWNER_APPROVED', 'SPLIT_NEGO', 'PENDING_ADMIN', 'DONE', 'REJECTED'];
-const NEG_OPEN_STATES = NEG_STATES.filter(s => s !== 'DONE' && s !== 'REJECTED');
+  'SIGNED', 'OWNER_APPROVED', 'SPLIT_NEGO', 'PENDING_ADMIN', 'DONE', 'REJECTED', 'EXPIRED'];
+const NEG_OPEN_STATES = NEG_STATES.filter(s => s !== 'DONE' && s !== 'REJECTED' && s !== 'EXPIRED');
 const NEG_SPLITS = { '50-50': '50 / 50 shared', 'buyer-pays': 'Buyer pays 100%', 'seller-pays': 'Seller pays 100%' };
+// Batch A: LOI response deadlines. Allowed day counts + the states still governed by the LOI clock
+// (once the PO is issued the LOI phase is over and the deadline no longer applies).
+const LOI_DEADLINE_DAYS = [3, 7, 14, 30];
+const LOI_DEADLINE_STATES = ['LOI_SENT', 'OFFER_SENT', 'COUNTER_SENT', 'BUYER_APPROVED'];
+/** Compute the LOI expiry ISO timestamp N days from now. */
+function loiExpiryFrom(days) {
+  return new Date(Date.now() + days * 86400000).toISOString();
+}
+/** Lazily expire a negotiation whose LOI response deadline has passed (pre-PO states only).
+ *  Transitions to EXPIRED, logs a timeline event + NEGOTIATION AGENT audit entry and notifies
+ *  both parties. Returns the (possibly reloaded) negotiation row. */
+function negExpireIfNeeded(neg) {
+  if (!neg || !neg.loi_expires_at) return neg;
+  if (!LOI_DEADLINE_STATES.includes(neg.state)) return neg;
+  if (neg.loi_expires_at > now()) return neg;
+  negSetState(neg.id, 'EXPIRED');
+  negEvent(neg.id, null, 'expired', { note: `The LOI response deadline (${neg.loi_expires_at.slice(0, 16).replace('T', ' ')} UTC) passed without reaching a Purchase Order.` });
+  audit('NEGOTIATION AGENT', 'LOI expired', 'flag', `Negotiation #${neg.id} expired — LOI deadline ${neg.loi_expires_at} passed in state ${neg.state}; the buyer must re-issue the LOI`);
+  notify(neg.seller_id, 'loi_expired', `Negotiation #${neg.id} expired — the LOI response deadline passed. The buyer can re-issue the LOI.`, `/negotiation/${neg.id}`);
+  notify(neg.buyer_id, 'loi_expired', `Your LOI on negotiation #${neg.id} expired before a Purchase Order was issued. You can re-issue it with a fresh deadline.`, `/negotiation/${neg.id}`);
+  return getNegotiation(neg.id);
+}
+/** Live countdown pill for the LOI response deadline (ticked by the shared page script). */
+function loiCountdownHtml(neg) {
+  if (!neg.loi_expires_at) return '';
+  if (neg.state === 'EXPIRED') {
+    return `<span class="loi-countdown loi-expired">⏰ LOI expired ${esc(neg.loi_expires_at.slice(0, 16).replace('T', ' '))} UTC — the buyer must re-issue</span>`;
+  }
+  if (!LOI_DEADLINE_STATES.includes(neg.state)) return '';
+  return `<span class="loi-countdown" data-loi-expires="${esc(neg.loi_expires_at)}" role="timer">⏰ Seller must respond within …</span>`;
+}
+/** The negotiation's governing incoterm: the seller's offer choice, else the deal's. */
+function negIncoterm(neg, deal) {
+  const v = (neg && neg.offer_incoterm) || (deal && deal.incoterm) || 'CIF';
+  return DEAL_INCOTERMS.includes(v) ? v : 'CIF';
+}
 
 /** Load a negotiation row by id. */
 function getNegotiation(id) {
@@ -5008,7 +6491,7 @@ function negSetState(negId, state) {
 /** The buyer's currently active negotiation on a deal (any non-terminal state), if any. */
 function activeNegotiationFor(dealId, buyerId) {
   return db.prepare(`SELECT * FROM negotiations WHERE deal_id = ? AND buyer_id = ?
-                     AND state NOT IN ('DONE','REJECTED') ORDER BY id DESC LIMIT 1`).get(dealId, buyerId);
+                     AND state NOT IN ('DONE','REJECTED','EXPIRED') ORDER BY id DESC LIMIT 1`).get(dealId, buyerId);
 }
 /** Commission math for a negotiation: total platform fee + per-party share per the agreed split. */
 function negFeeBreakdown(neg) {
@@ -5039,17 +6522,19 @@ function negEventLabel(kind) {
     approve: '✅ Offer approved', decline: '⛔ Negotiation declined', po: '📄 Purchase Order issued',
     signing: '✍️ Signing started', signed: '🖊️ Contract signed', owner_approved: '✅ Signature approved by seller',
     split: '⚖️ Commission split proposed', split_accept: '🤝 Commission split accepted',
-    admin_approved: '🏛️ Final admin approval', admin_rejected: '🏛️ Admin rejected'
+    admin_approved: '🏛️ Final admin approval', admin_rejected: '🏛️ Admin rejected',
+    expired: '⏰ LOI expired', loi_reissued: '📨 LOI re-issued'
   }[kind] || kind;
 }
 /** Timeline-style rounds list (staggered reveal). */
-function negTimelineHtml(negId, names) {
+function negTimelineHtml(negId, names, lang) {
+  const trLang = lang || 'en';
   const events = db.prepare('SELECT * FROM negotiation_events WHERE negotiation_id = ? ORDER BY id ASC LIMIT 200').all(negId);
   if (!events.length) return '<p class="muted">No events yet.</p>';
   return `<div class="tl">${events.map((e, i) => {
     const actor = e.actor_id ? (names.get(e.actor_id) || 'Unknown') : 'Dealzoin';
     const valLine = e.value ? `<div class="deal-value" style="font-size:1rem;margin:4px 0">${esc(e.value)} ${esc(e.currency || '')}</div>` : '';
-    const termsLine = e.terms ? `<p class="muted" style="white-space:pre-wrap;margin-top:4px">${esc(e.terms.slice(0, 600))}</p>` : '';
+    const termsLine = e.terms ? `<div data-dz-tr><p class="muted dz-tr-text" style="white-space:pre-wrap;margin-top:4px">${esc(e.terms.slice(0, 600))}</p><button type="button" class="dz-tr-btn">🌐 ${esc(t(trLang, 'tr.translate'))}</button></div>` : '';
     const noteLine = e.note ? `<p class="muted" style="margin-top:4px">${esc(e.note)}</p>` : '';
     return `<div class="tl-item" data-reveal style="--i:${Math.min(i, 8)}">
       <div class="tl-dot"></div>
@@ -5060,6 +6545,31 @@ function negTimelineHtml(negId, names) {
       </div>
     </div>`;
   }).join('')}</div>`;
+}
+
+/** (5) Four editable milestone rows for the SPLIT_NEGO form — prefilled from the current proposal
+ *  (or the sensible 10/20/70 default). Percentages must sum to exactly 100 (server-validated). */
+function milestoneFormRowsHtml(prefill) {
+  const ms = (prefill && prefill.length ? prefill : DEFAULT_MILESTONES);
+  const presetKeys = Object.keys(MILESTONE_PRESETS);
+  let rows = '';
+  for (let i = 0; i < 4; i++) {
+    const m = ms[i];
+    const presetKey = m
+      ? (presetKeys.find(k => k !== 'custom' && MILESTONE_PRESETS[k].label === m.label && MILESTONE_PRESETS[k].status === m.status) || 'custom')
+      : '';
+    rows += `<div class="ms-edit-row">
+      <select name="ms_label_${i + 1}" aria-label="Milestone ${i + 1} label">
+        <option value="">— unused —</option>
+        ${presetKeys.map(k => `<option value="${k}"${k === presetKey ? ' selected' : ''}>${esc(MILESTONE_PRESETS[k].label)}</option>`).join('')}
+      </select>
+      <input type="text" name="ms_custom_${i + 1}" maxlength="60" placeholder="Custom label" value="${m && presetKey === 'custom' ? esc(m.label) : ''}" aria-label="Milestone ${i + 1} custom label">
+      <select name="ms_status_${i + 1}" aria-label="Milestone ${i + 1} unlock status" title="Unlock status (applies to Custom milestones — presets carry their own)">${optionsHtml(DEAL_STATUSES, m ? m.status : 'delivered')}</select>
+      <input type="number" name="ms_pct_${i + 1}" min="1" max="100" step="1" placeholder="%" value="${m ? m.pct : ''}" aria-label="Milestone ${i + 1} percent" style="max-width:86px">
+    </div>`;
+  }
+  return `<div class="ms-edit-head" aria-hidden="true"><span>Label</span><span>Custom label</span><span>Unlocks at (custom)</span><span>%</span></div>${rows}
+    <p class="muted" style="margin:4px 0 10px">1–4 milestones, each 1–100% — the percentages must sum to exactly 100. Presets carry their own unlock status (Before loading → production, After loading → dispatched, On dispatch → shipped, On delivery → delivered).</p>`;
 }
 
 // ----- LOI (Letter of Intent): the buyer's entry point into the pipeline -----
@@ -5091,6 +6601,9 @@ app.get('/deal/:id/loi', requireCompany, (req, res) => {
       </div>
       <label>Wishes / conditions (optional)</label>
       <textarea name="loi_wishes" rows="3" maxlength="2000" placeholder="Delivery windows, inspection, certificates…"></textarea>
+      <label>Seller response deadline *</label>
+      <select name="loi_deadline_days" required>${optionsHtml(LOI_DEADLINE_DAYS.map(d => String(d)), '7')}</select>
+      <p class="muted" style="margin:-6px 0 12px">Days the seller has to respond (3 / 7 / 14 / 30). If the deadline passes before a Purchase Order, the negotiation expires and you can re-issue the LOI.</p>
       <button class="btn btn-green js-magnet" type="submit">Send Letter of Intent →</button>
       <p class="muted" style="margin-top:8px">Logged by the Deal Agent. The seller sees your company profile and this letter.</p>
     </form>
@@ -5116,24 +6629,28 @@ app.post('/deal/:id/loi', requireCompany, (req, res) => {
   const loiWishes = String(req.body.loi_wishes || '').trim().slice(0, 2000);
   if (!loiText) return res.redirect(`/deal/${deal.id}/loi?err=` + encodeURIComponent('Please describe your intent.'));
   if (!loiLoc) return res.redirect(`/deal/${deal.id}/loi?err=` + encodeURIComponent('Your location is required.'));
+  const loiDays = LOI_DEADLINE_DAYS.includes(Number(req.body.loi_deadline_days)) ? Number(req.body.loi_deadline_days) : 7;
+  const loiExpiresAt = loiExpiryFrom(loiDays);
   const ts = now();
-  const negId = db.prepare(`INSERT INTO negotiations (deal_id, buyer_id, seller_id, state, round, loi_text, loi_location, loi_quantity, loi_wishes, commission_split, created_at, updated_at)
-    VALUES (?,?,?, 'LOI_SENT', 0, ?,?,?,?, '50-50', ?, ?)`)
-    .run(deal.id, req.user.id, deal.company_id, loiText, loiLoc, loiQty, loiWishes, ts, ts).lastInsertRowid;
-  negEvent(negId, req.user.id, 'loi', { note: `Location: ${loiLoc}${loiQty ? ` · Quantity: ${loiQty}` : ''}`, terms: loiText + (loiWishes ? `\nWishes: ${loiWishes}` : '') });
-  audit('DEAL AGENT', 'LOI sent', 'pass', `${req.user.name} sent an LOI on deal ${deal.deal_number || '#' + deal.id} (negotiation #${negId}, location: ${loiLoc})`);
+  const negId = db.prepare(`INSERT INTO negotiations (deal_id, buyer_id, seller_id, state, round, loi_text, loi_location, loi_quantity, loi_wishes, commission_split, loi_expires_at, created_at, updated_at)
+    VALUES (?,?,?, 'LOI_SENT', 0, ?,?,?,?, '50-50', ?, ?, ?)`)
+    .run(deal.id, req.user.id, deal.company_id, loiText, loiLoc, loiQty, loiWishes, loiExpiresAt, ts, ts).lastInsertRowid;
+  negEvent(negId, req.user.id, 'loi', { note: `Location: ${loiLoc}${loiQty ? ` · Quantity: ${loiQty}` : ''} · Response deadline: ${loiDays} days (${loiExpiresAt.slice(0, 16).replace('T', ' ')} UTC)`, terms: loiText + (loiWishes ? `\nWishes: ${loiWishes}` : '') });
+  audit('DEAL AGENT', 'LOI sent', 'pass', `${req.user.name} sent an LOI on deal ${deal.deal_number || '#' + deal.id} (negotiation #${negId}, location: ${loiLoc}, deadline ${loiDays}d)`);
   notify(deal.company_id, 'loi', `${req.user.name} expressed interest in your deal "${deal.title}" (LOI, from ${loiLoc}). Review and send a private offer.`, `/negotiation/${negId}`);
   res.redirect(`/negotiation/${negId}?msg=` + encodeURIComponent('Letter of Intent sent — the seller has been notified.'));
 });
 
 // ----- Unified negotiation thread (role-aware actions for buyer / seller; admin read-only) -----
 app.get('/negotiation/:id', requireCompanyOrAdmin, (req, res) => {
-  const neg = getNegotiation(req.params.id);
+  let neg = getNegotiation(req.params.id);
   if (!neg) return res.status(404).send(page('Not found', '<div class="card"><h2>Negotiation not found</h2></div>', req.user));
   if (!isNegParty(req.user, neg)) {
     audit('DEAL AGENT', 'negotiation access', 'fail', `Unauthorized negotiation #${neg.id} view attempt by ${req.user.isAdmin ? 'admin?' : req.user.name}`);
     return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Private negotiation</h2><p class="muted">Only the two negotiating parties and the admin can view this page.</p></div>', req.user));
   }
+  // Batch A: apply the LOI response deadline before rendering (lazy expiry transition).
+  neg = negExpireIfNeeded(neg);
   const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(neg.deal_id);
   const names = companyNameMap();
   const isBuyer = !req.user.isAdmin && req.user.id === neg.buyer_id;
@@ -5145,6 +6662,13 @@ app.get('/negotiation/:id', requireCompanyOrAdmin, (req, res) => {
   // ---- Role-aware action panel ----
   let actionHtml = '';
   const waiting = (who) => `<div class="card" data-reveal><h3>⏳ Waiting for ${esc(who)}</h3><p class="muted">You'll be notified when the other party acts. Current state: ${statusBadge(st)}</p></div>`;
+  // Batch A: the seller picks the governing incoterm on every (re-)offer — it flows to the
+  // PO, the deal page and the tracking logic (FOP = no platform tracking).
+  const curIncoterm = negIncoterm(neg, deal);
+  const incotermFieldHtml = `
+    <label>Incoterm *</label>
+    <select name="incoterm" required>${optionsHtml(DEAL_INCOTERMS, curIncoterm)}</select>
+    <p class="muted" style="margin:-6px 0 12px">${DEAL_INCOTERMS.map(i => `<b>${esc(i)}</b> — ${esc(INCOTERM_EXPLAINERS[i])}`).join('<br>')}</p>`;
   if (req.user.isAdmin) {
     actionHtml = `<div class="card" data-reveal><h3>Admin view</h3><p class="muted">Negotiations are finalized from the admin dashboard once they reach final approval.</p></div>`;
   } else if (st === 'LOI_SENT' && isSeller) {
@@ -5156,9 +6680,7 @@ app.get('/negotiation/:id', requireCompanyOrAdmin, (req, res) => {
           <div><label>Currency</label><select name="offer_currency">${optionsHtml(DEAL_CURRENCIES, deal ? (deal.currency || 'USD') : 'USD')}</select></div>
         </div>
         <label>Terms *</label><textarea name="offer_terms" rows="4" required maxlength="2000" placeholder="Payment terms, delivery, inspection…"></textarea>
-        <label style="display:flex;gap:8px;align-items:center;margin:10px 0">
-          <input type="checkbox" name="incoterm_ok" value="yes" style="width:auto;margin:0" required>
-          I confirm the deal incoterm (${esc(deal ? (deal.incoterm || 'CIF') : 'CIF')})</label>
+        ${incotermFieldHtml}
         <button class="btn" type="submit">Send offer →</button>
       </form>
       <form method="POST" action="/negotiation/${neg.id}/decline" style="margin-top:8px">
@@ -5168,6 +6690,7 @@ app.get('/negotiation/:id', requireCompanyOrAdmin, (req, res) => {
   } else if (st === 'OFFER_SENT' && isBuyer) {
     actionHtml = `<div class="card" data-reveal>
       <h3>💱 Answer the offer</h3>
+      <p class="muted" style="margin:6px 0 10px">Seller's offer: <b>${esc(neg.offer_value)} ${esc(neg.offer_currency || 'USD')}</b> · Incoterm: <b>${esc(curIncoterm)}</b> — ${esc(INCOTERM_EXPLAINERS[curIncoterm] || '')}</p>
       <div class="feed-actions" style="margin-top:0">
         <form method="POST" action="/negotiation/${neg.id}/approve-offer"><button class="btn btn-green" type="submit">Approve offer</button></form>
       </div>
@@ -5191,9 +6714,7 @@ app.get('/negotiation/:id', requireCompanyOrAdmin, (req, res) => {
           <div><label>Currency</label><select name="offer_currency">${optionsHtml(DEAL_CURRENCIES, neg.offer_currency || 'USD')}</select></div>
         </div>
         <label>New terms *</label><textarea name="offer_terms" rows="4" required maxlength="2000">${esc(neg.offer_terms)}</textarea>
-        <label style="display:flex;gap:8px;align-items:center;margin:10px 0">
-          <input type="checkbox" name="incoterm_ok" value="yes" style="width:auto;margin:0" required>
-          I confirm the deal incoterm (${esc(deal ? (deal.incoterm || 'CIF') : 'CIF')})</label>
+        ${incotermFieldHtml}
         <button class="btn" type="submit">Send new offer →</button>
       </form>
       <form method="POST" action="/negotiation/${neg.id}/decline" style="margin-top:8px">
@@ -5224,32 +6745,59 @@ app.get('/negotiation/:id', requireCompanyOrAdmin, (req, res) => {
   } else if ((st === 'OWNER_APPROVED' || st === 'SPLIT_NEGO') && (isBuyer || isSeller)) {
     const iProposed = st === 'SPLIT_NEGO' && neg.split_proposed_by === req.user.id;
     const current = NEG_SPLITS[neg.commission_split] || NEG_SPLITS['50-50'];
+    const proposedMs = parseMilestoneJson(neg.milestone_proposal);
     const proposeForm = `
       <form method="POST" action="/negotiation/${neg.id}/split">
         <label>Commission split</label>
         <select name="split">${optionsHtml(Object.keys(NEG_SPLITS), NEG_SPLITS[neg.commission_split] ? neg.commission_split : '50-50')}</select>
         <p class="muted" style="margin:4px 0 10px">${Object.entries(NEG_SPLITS).map(([k, v]) => `<b>${esc(k)}</b> = ${esc(v)}`).join(' · ')}</p>
-        <button class="btn" type="submit">${st === 'SPLIT_NEGO' ? 'Counter-propose split' : 'Propose split'} →</button>
+        <label>Payment milestone schedule (escrow release)</label>
+        ${milestoneFormRowsHtml(proposedMs)}
+        <button class="btn" type="submit">${st === 'SPLIT_NEGO' ? 'Counter-propose split &amp; milestones' : 'Propose split &amp; milestones'} →</button>
       </form>`;
+    const msSummary = proposedMs
+      ? `<p class="muted" style="margin:6px 0 10px">Milestones: <b>${esc(milestoneSummaryText(proposedMs))}</b></p>`
+      : '';
     const acceptForm = (st === 'SPLIT_NEGO' && !iProposed) ? `
       <form method="POST" action="/negotiation/${neg.id}/split-accept" style="margin-bottom:10px">
-        <button class="btn btn-green" type="submit">Accept "${esc(current)}" — send to admin for final approval</button>
+        <button class="btn btn-green" type="submit">Accept "${esc(current)}" + the milestone schedule — send to admin for final approval</button>
       </form>` : '';
     actionHtml = `<div class="card" data-reveal>
-      <h3>⚖️ Commission split negotiation</h3>
+      <h3>⚖️ Commission split &amp; payment milestones</h3>
       ${negFeeHtml(neg)}
       ${st === 'SPLIT_NEGO'
-        ? `<p class="muted">Proposed by <b>${esc(names.get(neg.split_proposed_by) || 'the other party')}</b>: <b>${esc(current)}</b>. ${iProposed ? 'Waiting for the other party to accept or counter.' : 'Accept it or counter-propose below.'}</p>`
-        : '<p class="muted">Default split is <b>50-50</b>. Either party may propose how the platform commission is shared before final admin approval.</p>'}
+        ? `<p class="muted">Proposed by <b>${esc(names.get(neg.split_proposed_by) || 'the other party')}</b>: <b>${esc(current)}</b>. ${iProposed ? 'Waiting for the other party to accept or counter.' : 'Accept it or counter-propose below.'}</p>${msSummary}`
+        : '<p class="muted">Default split is <b>50-50</b>. Either party may propose how the platform commission is shared — and the payment milestone schedule the escrow flow will follow — before final admin approval.</p>'}
       ${acceptForm}
       ${iProposed ? '' : proposeForm}
     </div>`;
   } else if (st === 'PENDING_ADMIN') {
-    actionHtml = `<div class="card" data-reveal><h3>🏛️ Awaiting admin final approval</h3>${negFeeHtml(neg)}<p class="muted">The admin sees the agreed split and amounts in the final-approval queue.</p></div>`;
+    const pms = parseMilestoneJson(neg.milestone_proposal);
+    actionHtml = `<div class="card" data-reveal><h3>🏛️ Awaiting admin final approval</h3>${negFeeHtml(neg)}
+      ${pms ? `<p class="muted">Milestones: <b>${esc(milestoneSummaryText(pms))}</b></p>` : ''}
+      <p class="muted">The admin sees the agreed split and amounts in the final-approval queue.</p></div>`;
   } else if (st === 'DONE') {
-    actionHtml = `<div class="card card-announce" data-reveal><h3>🎉 Deal closed</h3>${negFeeHtml(neg)}<p class="muted">The platform commission is due before deal processing. Congratulations to both parties!</p></div>`;
+    const dms = parseMilestoneJson(neg.milestone_proposal);
+    actionHtml = `<div class="card card-announce" data-reveal><h3>🎉 Deal closed</h3>${negFeeHtml(neg)}
+      ${dms ? `<p class="muted">Milestones: <b>${esc(milestoneSummaryText(dms))}</b></p>` : ''}
+      <p class="muted">The platform commission is due before deal processing. Congratulations to both parties!</p></div>`;
   } else if (st === 'REJECTED') {
     actionHtml = `<div class="card" data-reveal><h3>⛔ Negotiation ended</h3><p class="muted">This negotiation was closed without a contract.</p></div>`;
+  } else if (st === 'EXPIRED') {
+    actionHtml = `<div class="card" data-reveal>
+      <h3>⏰ LOI expired</h3>
+      <p class="muted">The LOI response deadline${neg.loi_expires_at ? ` (${esc(neg.loi_expires_at.slice(0, 16).replace('T', ' '))} UTC)` : ''} passed before a Purchase Order was issued.</p>
+      ${isBuyer ? `
+      <hr class="sep">
+      <h4 style="margin-bottom:8px">📨 Re-issue the LOI</h4>
+      <p class="muted" style="margin-bottom:10px">Send a fresh LOI round on the same negotiation — this resets the seller's response deadline.</p>
+      <form method="POST" action="/negotiation/${neg.id}/reissue-loi">
+        <label>New seller response deadline *</label>
+        <select name="loi_deadline_days" required>${optionsHtml(LOI_DEADLINE_DAYS.map(String), '7')}</select>
+        <p class="muted" style="margin:-6px 0 12px">Days the seller has to respond (3 / 7 / 14 / 30).</p>
+        <button class="btn btn-green" type="submit">Re-issue LOI →</button>
+      </form>` : '<p class="muted" style="margin-top:8px">Waiting for the buyer to re-issue the LOI with a fresh deadline.</p>'}
+    </div>`;
   } else {
     actionHtml = waiting(isBuyer ? sellerName : buyerName);
   }
@@ -5257,19 +6805,22 @@ app.get('/negotiation/:id', requireCompanyOrAdmin, (req, res) => {
   const loiCard = `
   <div class="card" data-reveal>
     <h3>📨 Letter of Intent</h3>
-    <p style="margin-top:8px;white-space:pre-wrap">${esc(neg.loi_text)}</p>
+    <div data-dz-tr><p style="margin-top:8px;white-space:pre-wrap" class="dz-tr-text">${esc(neg.loi_text)}</p>
+    ${req.user.isAdmin ? '' : `<button type="button" class="dz-tr-btn">🌐 ${esc(t((req.user.lang || 'en'), 'tr.translate'))}</button>`}</div>
     <p class="muted" style="margin-top:8px">📍 Buyer location: <b>${esc(neg.loi_location)}</b>${neg.loi_quantity ? ` · Quantity: ${esc(neg.loi_quantity)}` : ''}</p>
     ${neg.loi_wishes ? `<p class="muted" style="white-space:pre-wrap">💭 Wishes: ${esc(neg.loi_wishes)}</p>` : ''}
+    ${neg.loi_expires_at ? `<p class="muted" style="margin-top:8px">⏰ Seller response deadline: <b>${esc(neg.loi_expires_at.slice(0, 16).replace('T', ' '))} UTC</b></p>` : ''}
   </div>`;
 
   const stateIdx = NEG_STATES.indexOf(st);
   const pipeline = ['LOI_SENT', 'OFFER_SENT', 'BUYER_APPROVED', 'PO_SENT', 'SIGNED', 'OWNER_APPROVED', 'PENDING_ADMIN', 'DONE'];
-  const curPipe = st === 'REJECTED' ? -1 : pipeline.indexOf(st === 'COUNTER_SENT' ? 'OFFER_SENT' : st === 'SIGNING' ? 'PO_SENT' : st === 'SPLIT_NEGO' ? 'OWNER_APPROVED' : st);
+  const curPipe = (st === 'REJECTED' || st === 'EXPIRED') ? -1 : pipeline.indexOf(st === 'COUNTER_SENT' ? 'OFFER_SENT' : st === 'SIGNING' ? 'PO_SENT' : st === 'SPLIT_NEGO' ? 'OWNER_APPROVED' : st);
   const pipelineHtml = `<div class="stepper" role="list" aria-label="Negotiation pipeline">${pipeline.map((s, i) =>
-    `<div class="step-node ${st === 'REJECTED' ? '' : i < curPipe ? 'done' : i === curPipe ? 'current done' : ''}" style="--i:${i}">
+    `<div class="step-node ${(st === 'REJECTED' || st === 'EXPIRED') ? '' : i < curPipe ? 'done' : i === curPipe ? 'current done' : ''}" style="--i:${i}">
       <span class="step-dot">${i < curPipe ? '✓' : i + 1}</span><span class="step-lbl">${esc(s.replace(/_/g, ' '))}</span>
     </div>`).join('')}</div>
-    ${st === 'REJECTED' ? '<p style="margin-top:8px"><span class="badge badge-rejected">rejected</span></p>' : ''}`;
+    ${st === 'REJECTED' ? '<p style="margin-top:8px"><span class="badge badge-rejected">rejected</span></p>' : ''}
+    ${st === 'EXPIRED' ? '<p style="margin-top:8px"><span class="badge badge-rejected">expired</span></p>' : ''}`;
 
   const body = `
   <div class="feed-head" style="margin-bottom:4px">
@@ -5280,13 +6831,15 @@ app.get('/negotiation/:id', requireCompanyOrAdmin, (req, res) => {
   <p class="muted" style="margin-bottom:14px">
     Buyer: <a href="/company/${neg.buyer_id}"><b>${esc(buyerName)}</b></a> · Seller: <a href="/company/${neg.seller_id}"><b>${esc(sellerName)}</b></a>
     · Deal № ${esc(deal ? (deal.deal_number || String(deal.id)) : String(neg.deal_id))} · ${statusBadge(st)}
+    · Incoterm: <b>${esc(curIncoterm)}</b>
     · <a href="/deal/${neg.deal_id}">view deal</a>
     ${['PO_SENT', 'SIGNING', 'SIGNED', 'OWNER_APPROVED', 'SPLIT_NEGO', 'PENDING_ADMIN', 'DONE'].includes(st) ? ` · <a href="/negotiation/${neg.id}/po.doc">PO (.doc)</a>` : ''}
   </p>
+  <div style="margin-bottom:14px">${loiCountdownHtml(neg)}</div>
   <div class="card" data-reveal><h3>Pipeline</h3>${pipelineHtml}</div>
   ${actionHtml}
   <h3 class="sec-h">Rounds</h3>
-  ${negTimelineHtml(neg.id, names)}
+  ${negTimelineHtml(neg.id, names, req.user.isAdmin ? 'en' : (req.user.lang || 'en'))}
   ${loiCard}`;
   res.send(page(`Negotiation #${neg.id}`, body, req.user, req.query.msg, req.query.err));
 });
@@ -5294,7 +6847,7 @@ app.get('/negotiation/:id', requireCompanyOrAdmin, (req, res) => {
 // ----- Negotiation actions (party-guarded, state-machine enforced) -----
 /** Load neg + check party + expected state; on failure redirects and returns null. */
 function negGuard(req, res, states, role) {
-  const neg = getNegotiation(req.params.id);
+  let neg = getNegotiation(req.params.id);
   const back = neg ? `/negotiation/${neg.id}` : '/deals/inbox';
   if (!neg) { res.redirect('/deals/inbox?err=' + encodeURIComponent('Negotiation not found.')); return null; }
   if (req.user.isAdmin || (req.user.id !== neg.buyer_id && req.user.id !== neg.seller_id)) {
@@ -5303,6 +6856,10 @@ function negGuard(req, res, states, role) {
   }
   if (role === 'seller' && req.user.id !== neg.seller_id) { res.redirect(back + '?err=' + encodeURIComponent('Only the seller can do that.')); return null; }
   if (role === 'buyer' && req.user.id !== neg.buyer_id) { res.redirect(back + '?err=' + encodeURIComponent('Only the buyer can do that.')); return null; }
+  // Batch A: apply the LOI response deadline first — once it lapses the negotiation flips
+  // to EXPIRED and respond/counter/PO actions are refused until the buyer re-issues the LOI.
+  neg = negExpireIfNeeded(neg);
+  if (neg.state === 'EXPIRED') { res.redirect(back + '?err=' + encodeURIComponent('LOI expired — ask the buyer to re-issue.')); return null; }
   if (states && !states.includes(neg.state)) { res.redirect(back + '?err=' + encodeURIComponent(`This action is not available in state ${neg.state.replace(/_/g, ' ')}.`)); return null; }
   return neg;
 }
@@ -5317,13 +6874,16 @@ app.post('/negotiation/:id/offer', requireCompany, (req, res) => {
   const currency = DEAL_CURRENCIES.includes(req.body.offer_currency) ? req.body.offer_currency : 'USD';
   const terms = String(req.body.offer_terms || '').trim().slice(0, 2000);
   if (!terms) return res.redirect(`/negotiation/${neg.id}?err=` + encodeURIComponent('Offer terms are required.'));
-  if (req.body.incoterm_ok !== 'yes') return res.redirect(`/negotiation/${neg.id}?err=` + encodeURIComponent('Please confirm the deal incoterm.'));
+  // Batch A: the seller picks the governing incoterm on the offer (was a mere confirm checkbox).
+  const incoterm = DEAL_INCOTERMS.includes(req.body.incoterm) ? req.body.incoterm : 'CIF';
   const isReoffer = neg.state === 'COUNTER_SENT';
   const round = neg.round + 1; // the initial offer is round 1, the first re-offer after a counter is round 2, …
-  db.prepare(`UPDATE negotiations SET state = 'OFFER_SENT', round = ?, offer_value = ?, offer_currency = ?, offer_terms = ?, updated_at = ? WHERE id = ?`)
-    .run(round, String(num), currency, terms, now(), neg.id);
-  negEvent(neg.id, req.user.id, 'offer', { value: String(num), currency, terms, note: isReoffer ? `Re-offer — round ${round}` : 'Initial offer' });
-  audit('DEAL AGENT', isReoffer ? 're-offer sent' : 'offer sent', 'pass', `${req.user.name} offered ${num} ${currency} on negotiation #${neg.id} (round ${round})`);
+  db.prepare(`UPDATE negotiations SET state = 'OFFER_SENT', round = ?, offer_value = ?, offer_currency = ?, offer_terms = ?, offer_incoterm = ?, updated_at = ? WHERE id = ?`)
+    .run(round, String(num), currency, terms, incoterm, now(), neg.id);
+  // The offer's incoterm governs the deal page + tracking logic (FOP = no platform tracking).
+  try { db.prepare('UPDATE deals SET incoterm = ? WHERE id = ?').run(incoterm, neg.deal_id); } catch (e) { /* incoterm column always present on current schema */ }
+  negEvent(neg.id, req.user.id, 'offer', { value: String(num), currency, terms, note: `${isReoffer ? `Re-offer — round ${round}` : 'Initial offer'} · Incoterm: ${incoterm}${incoterm === 'FOP' ? ' (no platform tracking)' : ''}` });
+  audit('DEAL AGENT', isReoffer ? 're-offer sent' : 'offer sent', 'pass', `${req.user.name} offered ${num} ${currency} on negotiation #${neg.id} (round ${round}, incoterm ${incoterm})`);
   notify(neg.buyer_id, 'offer', `${req.user.name} sent you a private offer (${fmtAmount(num)} ${currency}) on negotiation #${neg.id}. Approve or counter.`, `/negotiation/${neg.id}`);
   res.redirect(`/negotiation/${neg.id}?msg=` + encodeURIComponent('Offer sent to the buyer.'));
 });
@@ -5340,7 +6900,7 @@ app.post('/negotiation/:id/counter', requireCompany, (req, res) => {
   if (!terms) return res.redirect(`/negotiation/${neg.id}?err=` + encodeURIComponent('Counter terms are required.'));
   db.prepare(`UPDATE negotiations SET state = 'COUNTER_SENT', offer_value = ?, offer_currency = ?, offer_terms = ?, updated_at = ? WHERE id = ?`)
     .run(String(num), currency, terms, now(), neg.id);
-  negEvent(neg.id, req.user.id, 'counter', { value: String(num), currency, terms });
+  negEvent(neg.id, req.user.id, 'counter', { value: String(num), currency, terms, note: `Counter — Incoterm unchanged: ${neg.offer_incoterm || 'CIF'}` });
   audit('DEAL AGENT', 'counter offer sent', 'pass', `${req.user.name} countered ${num} ${currency} on negotiation #${neg.id}`);
   notify(neg.seller_id, 'counter', `${req.user.name} countered your offer on negotiation #${neg.id}: ${fmtAmount(num)} ${currency}. Re-offer or decline.`, `/negotiation/${neg.id}`);
   res.redirect(`/negotiation/${neg.id}?msg=` + encodeURIComponent('Counter offer sent to the seller.'));
@@ -5366,6 +6926,28 @@ app.post('/negotiation/:id/decline', requireCompany, (req, res) => {
   audit('DEAL AGENT', 'negotiation declined', 'fail', `${req.user.name} declined negotiation #${neg.id}`);
   notify(neg.buyer_id, 'negotiation_declined', `${req.user.name} declined the negotiation on your LOI (negotiation #${neg.id}).`, `/negotiation/${neg.id}`);
   res.redirect(`/negotiation/${neg.id}?msg=` + encodeURIComponent('Negotiation declined. The buyer has been notified.'));
+});
+
+// Buyer re-issues the LOI after expiry — resets the clock and reopens the negotiation.
+app.post('/negotiation/:id/reissue-loi', requireCompany, (req, res) => {
+  let neg = getNegotiation(req.params.id);
+  if (!neg || req.user.isAdmin || (req.user.id !== neg.buyer_id && req.user.id !== neg.seller_id)) {
+    return res.redirect('/deals/inbox?err=' + encodeURIComponent('Negotiation not found.'));
+  }
+  if (req.user.id !== neg.buyer_id) {
+    return res.redirect(`/negotiation/${neg.id}?err=` + encodeURIComponent('Only the buyer can re-issue the LOI.'));
+  }
+  neg = negExpireIfNeeded(neg); // ensure a stale deadline is honoured even if not yet flipped
+  if (neg.state !== 'EXPIRED') {
+    return res.redirect(`/negotiation/${neg.id}?err=` + encodeURIComponent('The LOI can only be re-issued after it has expired.'));
+  }
+  const days = LOI_DEADLINE_DAYS.includes(Number(req.body.loi_deadline_days)) ? Number(req.body.loi_deadline_days) : 7;
+  const expiresAt = loiExpiryFrom(days);
+  db.prepare(`UPDATE negotiations SET state = 'LOI_SENT', loi_expires_at = ?, updated_at = ? WHERE id = ?`).run(expiresAt, now(), neg.id);
+  negEvent(neg.id, req.user.id, 'loi_reissued', { note: `LOI re-issued — new seller response deadline: ${days} days (${expiresAt.slice(0, 16).replace('T', ' ')} UTC)` });
+  audit('NEGOTIATION AGENT', 'LOI re-issued', 'pass', `${req.user.name} re-issued the LOI on negotiation #${neg.id} with a ${days}-day deadline`);
+  notify(neg.seller_id, 'loi_reissued', `${req.user.name} re-issued the LOI on negotiation #${neg.id} — you have ${days} days to respond.`, `/negotiation/${neg.id}`);
+  res.redirect(`/negotiation/${neg.id}?msg=` + encodeURIComponent(`LOI re-issued — the seller now has ${days} days to respond.`));
 });
 
 // Seller approves & issues the Purchase Order (document generated on demand via /po.doc).
@@ -5414,7 +6996,7 @@ app.get('/negotiation/:id/po.doc', requireCompanyOrAdmin, (req, res) => {
      <b>Seller:</b> ${esc(sellerName)}<br>
      <b>Deal number:</b> ${esc(dealNum)}<br>
      <b>Agreed value:</b> ${esc(neg.offer_value)} ${esc(neg.offer_currency || 'USD')}<br>
-     <b>Incoterm:</b> ${esc(deal ? (deal.incoterm || 'CIF') : 'CIF')}<br>
+     <b>Incoterm:</b> ${esc(negIncoterm(neg, deal))}<br>
      <b>Negotiation rounds:</b> ${neg.round}<br>
      <b>Issued:</b> ${esc(now())}</p>
   <h3>Agreed terms</h3><p>${esc(neg.offer_terms)}</p>
@@ -5440,7 +7022,7 @@ app.post('/negotiation/:id/owner-approve', requireCompany, (req, res) => {
   res.redirect(`/negotiation/${neg.id}?msg=` + encodeURIComponent('Signature approved — now agree the commission split.'));
 });
 
-// Either party proposes (or counter-proposes) the commission split.
+// Either party proposes (or counter-proposes) the commission split + the payment milestone schedule.
 app.post('/negotiation/:id/split', requireCompany, (req, res) => {
   const neg = negGuard(req, res, ['OWNER_APPROVED', 'SPLIT_NEGO']);
   if (!neg) return;
@@ -5449,27 +7031,39 @@ app.post('/negotiation/:id/split', requireCompany, (req, res) => {
   }
   const split = String(req.body.split || '');
   if (!NEG_SPLITS[split]) return res.redirect(`/negotiation/${neg.id}?err=` + encodeURIComponent('Invalid split option.'));
-  db.prepare(`UPDATE negotiations SET commission_split = ?, split_proposed_by = ?, state = 'SPLIT_NEGO', updated_at = ? WHERE id = ?`)
-    .run(split, req.user.id, now(), neg.id);
-  negEvent(neg.id, req.user.id, 'split', { note: `Proposed split: ${NEG_SPLITS[split]}` });
-  audit('DEAL AGENT', 'commission split proposed', 'pass', `${req.user.name} proposed split "${split}" on negotiation #${neg.id}`);
+  // (5) The milestone schedule rides along with the split proposal — validated server-side (1–4 rows, sum = 100).
+  const ms = parseMilestonesInput(req.body);
+  if (ms.error) {
+    audit('DEAL AGENT', 'milestone proposal validation', 'fail', `${req.user.name} proposed invalid milestones on negotiation #${neg.id}: ${ms.error}`);
+    return res.redirect(`/negotiation/${neg.id}?err=` + encodeURIComponent(ms.error));
+  }
+  const msJson = JSON.stringify(ms.milestones);
+  db.prepare(`UPDATE negotiations SET commission_split = ?, split_proposed_by = ?, milestone_proposal = ?, state = 'SPLIT_NEGO', updated_at = ? WHERE id = ?`)
+    .run(split, req.user.id, msJson, now(), neg.id);
+  negEvent(neg.id, req.user.id, 'split', { note: `Proposed split: ${NEG_SPLITS[split]} · Milestones: ${milestoneSummaryText(ms.milestones)}` });
+  audit('DEAL AGENT', 'commission split proposed', 'pass', `${req.user.name} proposed split "${split}" + milestones (${milestoneSummaryText(ms.milestones)}) on negotiation #${neg.id}`);
   const other = req.user.id === neg.buyer_id ? neg.seller_id : neg.buyer_id;
-  notify(other, 'split_proposed', `${req.user.name} proposed a commission split of "${NEG_SPLITS[split]}" on negotiation #${neg.id}. Accept or counter-propose.`, `/negotiation/${neg.id}`);
-  res.redirect(`/negotiation/${neg.id}?msg=` + encodeURIComponent('Split proposed — the other party has been notified.'));
+  notify(other, 'split_proposed', `${req.user.name} proposed a commission split of "${NEG_SPLITS[split]}" and a payment milestone schedule on negotiation #${neg.id}. Accept or counter-propose.`, `/negotiation/${neg.id}`);
+  res.redirect(`/negotiation/${neg.id}?msg=` + encodeURIComponent('Split & milestone schedule proposed — the other party has been notified.'));
 });
 
-// The other party accepts the proposed split → PENDING_ADMIN.
+// The other party accepts the proposed split + milestone schedule → PENDING_ADMIN.
 app.post('/negotiation/:id/split-accept', requireCompany, (req, res) => {
   const neg = negGuard(req, res, ['SPLIT_NEGO']);
   if (!neg) return;
   if (neg.split_proposed_by === req.user.id) {
     return res.redirect(`/negotiation/${neg.id}?err=` + encodeURIComponent('You made the current proposal — the other party must accept it.'));
   }
+  // Defense in depth: the accepted milestone schedule must still be valid (1–4 rows, sum = 100).
+  const ms = parseMilestoneJson(neg.milestone_proposal);
+  if (!ms) {
+    return res.redirect(`/negotiation/${neg.id}?err=` + encodeURIComponent('No valid milestone schedule on the table — propose one first.'));
+  }
   negSetState(neg.id, 'PENDING_ADMIN');
-  negEvent(neg.id, req.user.id, 'split_accept', { note: `Accepted split: ${NEG_SPLITS[neg.commission_split] || neg.commission_split}` });
-  audit('DEAL AGENT', 'commission split accepted', 'pass', `${req.user.name} accepted split "${neg.commission_split}" on negotiation #${neg.id} — pending admin final approval`);
+  negEvent(neg.id, req.user.id, 'split_accept', { note: `Accepted split: ${NEG_SPLITS[neg.commission_split] || neg.commission_split} · Milestones: ${milestoneSummaryText(ms)}` });
+  audit('DEAL AGENT', 'commission split accepted', 'pass', `${req.user.name} accepted split "${neg.commission_split}" + milestones (${milestoneSummaryText(ms)}) on negotiation #${neg.id} — pending admin final approval`);
   const other = req.user.id === neg.buyer_id ? neg.seller_id : neg.buyer_id;
-  notify(other, 'split_accepted', `${req.user.name} accepted the commission split on negotiation #${neg.id} — awaiting admin final approval.`, `/negotiation/${neg.id}`);
+  notify(other, 'split_accepted', `${req.user.name} accepted the commission split and milestone schedule on negotiation #${neg.id} — awaiting admin final approval.`, `/negotiation/${neg.id}`);
   res.redirect(`/negotiation/${neg.id}?msg=` + encodeURIComponent('Split accepted — the negotiation now awaits admin final approval.'));
 });
 
@@ -5981,12 +7575,19 @@ app.get('/new', requireCompany, (req, res) => {
         <button class="btn" type="submit">Post update</button>
       </form>
     </div>
+    <div class="card create-card js-tilt">
+      <div class="big-ic">📣</div>
+      <h2>Promote</h2>
+      <p class="muted">The ADVERTISING AGENT drafts a polished marketing post for your product or service — you review, edit and publish it.</p>
+      <a class="btn js-magnet" href="/promote" style="margin-top:14px">Open the Advertising Agent →</a>
+    </div>
   </div>`;
   res.send(page('Create', body, req.user, req.query.msg, req.query.err, 'new'));
 });
 
 // ============================= PROFILE (/profile) =============================
 app.get('/profile', requireCompany, (req, res) => {
+  const lang = req.user.lang || 'en';
   const c = db.prepare('SELECT * FROM companies WHERE id = ?').get(req.user.id);
   if (!c) return res.redirect('/login?err=' + encodeURIComponent('Please sign in again.'));
   const fc = followCounts(c.id);
@@ -5997,7 +7598,7 @@ app.get('/profile', requireCompany, (req, res) => {
     ? deals.map((d, idx) => feedCard(dealFeedItem(d), req.user, names, idx)).join('')
     : '<div class="card"><p class="muted">No deals yet — <a href="/deals/new">post your first deal</a>.</p></div>';
   const postsHtml = posts.length
-    ? posts.map((p, idx) => feedCard({ kind: 'post', ref_id: p.id, company_id: p.company_id, body: p.body, created_at: p.created_at, media_id: p.media_id, author_name: p.author_name || '', is_system: p.is_system || 0 }, req.user, names, idx)).join('')
+    ? posts.map((p, idx) => feedCard({ kind: 'post', ref_id: p.id, company_id: p.company_id, body: p.body, created_at: p.created_at, media_id: p.media_id, author_name: p.author_name || '', is_system: p.is_system || 0, is_promo: p.is_promo || 0 }, req.user, names, idx)).join('')
     : '<div class="card"><p class="muted">No posts yet — share an update from the <a href="/new">create menu</a>.</p></div>';
 
   const coverHtml = c.header_media_id ? `<img class="profile-cover" src="/media/${c.header_media_id}" alt="${esc(c.name)} header image" loading="lazy">` : '';
@@ -6007,6 +7608,7 @@ app.get('/profile', requireCompany, (req, res) => {
     <div class="feed-head"><h2>${avatarHtml(c.name, c.avatar_media_id, 'avatar-lg')}${esc(c.name)}</h2>
       <a class="btn btn-sm btn-outline" href="/company/${c.id}">View public profile</a></div>
     <p style="margin-top:6px">${starsHtml(c.reputation)}</p>
+    <p style="margin-top:6px">${bankKycBadgeHtml(c, lang)}${c.bank_kyc_notes && c.bank_kyc_status !== 'verified' ? `<br><span class="muted" style="font-size:12px">${esc(c.bank_kyc_notes)}</span>` : ''}</p>
     ${c.bio ? `<p class="profile-bio">${esc(c.bio)}</p>` : ''}
     <p class="muted">${esc(c.email)} · ${fc.followers} followers · ${fc.following} following · member since ${esc(c.created_at.slice(0, 10))}</p>
     ${c.website ? `<p style="margin-top:8px">🌐 <a href="${esc(c.website)}" rel="noopener noreferrer nofollow">${esc(c.website)}</a></p>` : ''}
@@ -6041,6 +7643,41 @@ app.get('/profile', requireCompany, (req, res) => {
       <textarea name="about" rows="6" maxlength="2000" placeholder="What your company does, who you serve, why you win.">${esc(c.about || '')}</textarea>
       <button class="btn" type="submit">Save bio &amp; about</button>
     </form>`}
+  </div>
+  <div class="card" data-reveal>
+    <h3>🏦 ${esc(t(lang, 'bank.title'))}</h3>
+    <p class="muted">Used for commission payouts and counterparty invoicing. The BANK RESEARCH AGENT validates them automatically (SWIFT structure, IBAN checksum, completeness) and shows the verdict as a badge on your profile. Full details stay private to you and the platform admin.</p>
+    ${req.user.memberId ? '<p class="muted">Team members cannot change bank details — ask the main company account.</p>' : `
+    <form method="POST" action="/profile/bank">
+      <div class="grid2" style="gap:10px">
+        <div><label>${esc(t(lang, 'bank.name'))}</label><input type="text" name="bank_name" maxlength="120" value="${esc(c.bank_name || '')}" placeholder="e.g. Emirates NBD"></div>
+        <div><label>${esc(t(lang, 'bank.swift'))}</label><input type="text" name="bank_swift" maxlength="11" value="${esc(c.bank_swift || '')}" placeholder="e.g. EBILAEAD" style="text-transform:uppercase"></div>
+      </div>
+      <div class="grid2" style="gap:10px">
+        <div><label>${esc(t(lang, 'bank.iban'))}</label><input type="text" name="bank_iban" maxlength="34" value="${esc(c.bank_iban || '')}" placeholder="e.g. AE070331234567890123456"></div>
+        <div><label>${esc(t(lang, 'bank.country'))}</label><input type="text" name="bank_country" maxlength="60" value="${esc(c.bank_country || '')}" placeholder="e.g. United Arab Emirates"></div>
+      </div>
+      <label>${esc(t(lang, 'bank.holder'))}</label><input type="text" name="bank_holder" maxlength="120" value="${esc(c.bank_holder || '')}" placeholder="Legal account holder name">
+      <button class="btn" type="submit">${esc(t(lang, 'bank.save'))}</button>
+    </form>`}
+  </div>
+  <div class="card" data-reveal>
+    <h3>🎨 Platform theme</h3>
+    <p class="muted">Pick your company's palette — applied to every page of your sessions and composed with the dark/light toggle (top right). Takes effect on the next page load.</p>
+    <form method="POST" action="/profile/theme">
+      <div class="palette-grid">
+        ${Object.entries(THEME_PALETTES).map(([key, p]) => `
+        <label class="palette-opt">
+          <input type="radio" name="theme_choice" value="${esc(key)}"${(THEME_PALETTES[c.theme_choice] ? c.theme_choice : 'titan') === key ? ' checked' : ''}>
+          <span class="palette-card">
+            <span class="palette-swatch"><span style="background:${esc(p.dark)}"></span><span style="background:${esc(p.light)}"></span></span>
+            <span class="palette-name">${esc(p.label)}${key === 'titan' ? ' · default' : ''}</span><br>
+            <span class="palette-hint">${esc(p.hint)}</span>
+          </span>
+        </label>`).join('')}
+      </div>
+      <button class="btn btn-sm" type="submit">Apply theme</button>
+    </form>
   </div>
   <div class="stats">
     <div class="stat card--cut js-tilt" data-reveal style="--i:0" data-num="01"><div class="num gold" data-count="${deals.length}">${deals.length}</div><div class="lbl">My deals</div></div>
@@ -6077,6 +7714,15 @@ app.post('/profile/info', requireCompany, (req, res) => {
   const about = String(req.body.about || '').trim().slice(0, 2000);
   db.prepare('UPDATE companies SET bio = ?, about = ? WHERE id = ?').run(bio, about, req.user.id);
   res.redirect('/profile?msg=' + encodeURIComponent('Profile updated.'));
+});
+
+// Batch A: per-company platform palette. Persisted on companies.theme_choice and applied
+// via <html data-palette="…"> on the next page load (composed with the dark/light toggle).
+app.post('/profile/theme', requireCompany, (req, res) => {
+  const choice = String(req.body.theme_choice || 'titan');
+  if (!THEME_PALETTES[choice]) return res.redirect('/profile?err=' + encodeURIComponent('Unknown palette.'));
+  db.prepare('UPDATE companies SET theme_choice = ? WHERE id = ?').run(choice, req.user.id);
+  res.redirect('/profile?msg=' + encodeURIComponent(`Theme set to ${THEME_PALETTES[choice].label} — applied across your sessions.`));
 });
 
 // ============================= SUB-ACCOUNTS (TEAM MEMBERS) =============================
@@ -6154,6 +7800,7 @@ app.post('/profile/team/:id/deactivate', requireCompany, (req, res) => {
 
 // ============================= DASHBOARD (/dashboard) =============================
 app.get('/dashboard', requireCompany, (req, res) => {
+  const lang = req.user.lang || 'en';
   const myId = req.user.id;
   const count = (sql, ...args) => db.prepare(sql).get(...args).n;
   const stats = {
@@ -6175,10 +7822,10 @@ app.get('/dashboard', requireCompany, (req, res) => {
       (SELECT COUNT(*) FROM counter_offers co JOIN deals d ON d.id = co.deal_id WHERE d.company_id = ? AND co.status = 'pending') AS n`, myId, myId)
   };
   const tiles = [
-    ['My deals', stats.deals, ' gold'], ['My posts', stats.posts, ''], ['Followers', stats.followers, ' mint'],
-    ['Likes received', stats.likesReceived, ' gold'], ['Comments received', stats.commentsReceived, ''],
-    ['Contracts I signed', stats.signedPending + ' pending · ' + stats.signedApproved + ' approved', ''],
-    ['Contracts on my deals', stats.minePending + ' pending · ' + stats.mineApproved + ' approved', '']
+    [t(lang, 'dash.mydeals'), stats.deals, ' gold'], [t(lang, 'dash.myposts'), stats.posts, ''], [t(lang, 'dash.followers'), stats.followers, ' mint'],
+    [t(lang, 'dash.likes'), stats.likesReceived, ' gold'], [t(lang, 'dash.comments'), stats.commentsReceived, ''],
+    [t(lang, 'dash.contractssigned'), stats.signedPending + ' pending · ' + stats.signedApproved + ' approved', ''],
+    [t(lang, 'dash.contractsonmine'), stats.minePending + ' pending · ' + stats.mineApproved + ' approved', '']
   ];
   const tilesHtml = `<div class="stats">${tiles.map(([l, n, cls], ti) => `<div class="stat card--cut js-tilt" data-reveal style="--i:${Math.min(ti, 8)}" data-num="${String(ti + 1).padStart(2, '0')}"><div class="num${cls}"${typeof n === 'number' ? ` data-count="${n}"` : ''}>${n}</div><div class="lbl">${l}</div></div>`).join('')}</div>`;
 
@@ -6245,13 +7892,33 @@ app.get('/dashboard', requireCompany, (req, res) => {
   })();
   </script>`;
 
+  // Batch C (4)+(5): Accounting & Warehouse quick cards.
+  const whItems = count('SELECT COUNT(*) AS n FROM warehouse_items WHERE company_id = ?', myId);
+  const whLow = count('SELECT COUNT(*) AS n FROM warehouse_items WHERE company_id = ? AND quantity <= reorder_level', myId);
+  const openInv = db.prepare(`SELECT COALESCE(SUM(amount), 0) AS s, currency FROM invoices WHERE company_id = ? AND status IN ('sent','overdue') GROUP BY currency ORDER BY currency`).all(myId);
+  const openInvText = openInv.length ? openInv.map(r => `${fmtAmount(r.s)} ${esc(r.currency)}`).join(' · ') : '—';
+  const batchCCards = `
+  <div class="grid2">
+    <div class="card card--cut js-tilt" data-reveal style="--i:5" data-num="AC">
+      <h3>📒 ${esc(t(lang, 'dash.accounting'))}</h3>
+      <p class="muted">${esc(t(lang, 'acct.receivables'))}: <b>${openInvText}</b></p>
+      <a class="btn btn-sm btn-outline" href="/accounting">${esc(t(lang, 'acct.title'))} →</a>
+    </div>
+    <div class="card card--cut js-tilt" data-reveal style="--i:6" data-num="WH">
+      <h3>📦 ${esc(t(lang, 'dash.warehouse'))}</h3>
+      <p class="muted"><b>${whItems}</b> ${esc(t(lang, 'dash.items'))} · ${whLow ? `<span style="color:var(--danger);font-weight:700">${whLow} ${esc(t(lang, 'dash.lowstock'))} ⚠️</span>` : `0 ${esc(t(lang, 'dash.lowstock'))} ✓`}</p>
+      <a class="btn btn-sm btn-outline" href="/warehouse">${esc(t(lang, 'wh.title'))} →</a>
+    </div>
+  </div>`;
+
   const body = `
-  <h2 class="sec-h" style="margin-top:0;margin-bottom:14px">📊 Company dashboard</h2>
+  <h2 class="sec-h" style="margin-top:0;margin-bottom:14px">📊 ${esc(t(lang, 'dash.title'))}</h2>
   <div class="card" style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
-    <div><h3 style="margin-bottom:2px">📥 Deal inbox</h3>
+    <div><h3 style="margin-bottom:2px">📥 ${esc(t(lang, 'dash.inbox'))}</h3>
       <p class="muted">Contracts and counter offers on your deals awaiting your decision.</p></div>
-    <a class="btn btn-sm${stats.inboxActions ? '' : ' btn-outline'}" href="/deals/inbox">Open inbox${stats.inboxActions ? ` <span class="unread-chip" style="margin-left:6px">${stats.inboxActions}</span>` : ''}</a>
+    <a class="btn btn-sm${stats.inboxActions ? '' : ' btn-outline'}" href="/deals/inbox">${esc(t(lang, 'dash.openinbox'))}${stats.inboxActions ? ` <span class="unread-chip" style="margin-left:6px">${stats.inboxActions}</span>` : ''}</a>
   </div>
+  ${batchCCards}
   ${tilesHtml}
   <div class="card" data-reveal><h3>My deals</h3>
     <table><tr><th>Title</th><th>Value</th><th>Likes</th><th>Comments</th><th>Contract</th></tr>${dealsRows}</table></div>
@@ -6420,10 +8087,10 @@ app.get('/chat/:id', (req, res) => {
     const senderLine = (conv.type === 'group' || m.author_name) && !mine
       ? `<div class="bubble-sender">${esc(sender)}${m.author_name ? ` — by ${esc(m.author_name)}` : ''}</div>`
       : (mine && m.author_name ? `<div class="bubble-sender">— by ${esc(m.author_name)}</div>` : '');
-    return `<div class="bubble ${mine ? 'mine' : 'theirs'}">
+    return `<div class="bubble ${mine ? 'mine' : 'theirs'}" data-dz-tr>
       ${senderLine}
-      ${esc(m.body)}
-      <div class="bubble-meta">${esc(m.created_at.slice(0, 16).replace('T', ' '))}</div>
+      <span class="dz-tr-text">${esc(m.body)}</span>
+      <div class="bubble-meta">${esc(m.created_at.slice(0, 16).replace('T', ' '))}${user.isAdmin ? '' : ` · <button type="button" class="dz-tr-btn">🌐 ${esc(t((user.lang || 'en'), 'tr.translate'))}</button>`}</div>
     </div>`;
   }).join('') : '<p class="muted">No messages yet — say hello.</p>';
 
@@ -6447,14 +8114,20 @@ app.get('/chat/:id', (req, res) => {
       if(!box)return;
       var div=document.createElement('div');
       div.className='bubble '+((m.sender_company_id===ME)?'mine':'theirs');
+      div.setAttribute('data-dz-tr','');
       if(m.sender_company_id!==ME&&(ISGROUP||m.author_name)){
         var s=document.createElement('div');s.className='bubble-sender';
         s.textContent=(m.sender_name||'')+(m.author_name?' — by '+m.author_name:'');
         div.appendChild(s);
       }
-      div.appendChild(document.createTextNode(m.body));
+      var txt=document.createElement('span');txt.className='dz-tr-text';txt.textContent=m.body;
+      div.appendChild(txt);
       var meta=document.createElement('div');meta.className='bubble-meta';
       meta.textContent=(m.created_at||'').slice(0,16).replace('T',' ')+(optimistic?' · sending…':'');
+      if(!optimistic){
+        var tb=document.createElement('button');tb.type='button';tb.className='dz-tr-btn';
+        tb.textContent=' 🌐 '+DZ_TR.btnLabel;meta.appendChild(tb);
+      }
       div.appendChild(meta);
       box.appendChild(div);scrollDown();
     }
@@ -7297,7 +8970,7 @@ const TRACKING_MAP_SCRIPT = `<script>(function(){
   }catch(e){fallback('🗺️ Map could not be rendered here.');}
 })();</script>`;
 
-// Full-width tracking map: every in-transit (dispatched/shipped) CIF/CRF deal as a pulsing marker.
+// Full-width tracking map: every in-transit (dispatched/shipped) CIF/FOB/CFR deal as a pulsing marker.
 // Logged-in companies + admin. Coordinates are geocoded lazily; deal values are never shown.
 app.get('/tracking', requireCompanyOrAdmin, async (req, res) => {
   let deals = [];
@@ -7335,18 +9008,18 @@ app.get('/tracking', requireCompanyOrAdmin, async (req, res) => {
       <div class="muted" style="font-size:12px">${esc(d.title.slice(0, 60))}</div>
       <div style="font-size:12px;margin-top:4px">📍 ${esc(d.origin || '?')} → ${esc(d.destination || 'destination TBD')}</div>
     </div>`).join('')}</div>`
-    : '<div class="card" data-reveal><p class="muted">No shipments in transit right now. CIF/CRF deals appear here once they reach <b>dispatched</b> or <b>shipped</b>.</p></div>';
+    : '<div class="card" data-reveal><p class="muted">No shipments in transit right now. CIF/FOB/CFR deals appear here once they reach <b>dispatched</b> or <b>shipped</b>.</p></div>';
   const mapHtml = markers.length
     ? `<div id="tracking-map" class="map-embed map-full" role="img" aria-label="Global shipment tracking map"></div>
        <script>window.DZ_TRACKING_DEALS=${jsJson(markers)};</script>
        ${TRACKING_MAP_SCRIPT}`
     : `<div class="card map-placeholder" data-reveal style="margin-top:14px"><h3>🗺️ Global tracking map</h3>
-       <p class="muted" style="margin-top:8px">${deals.length ? 'Map activates once origin &amp; destination are geocoded for the in-transit deals.' : 'Map activates once CIF/CRF deals are dispatched or shipped.'}</p></div>`;
+       <p class="muted" style="margin-top:8px">${deals.length ? 'Map activates once origin &amp; destination are geocoded for the in-transit deals.' : 'Map activates once CIF/FOB/CFR deals are dispatched or shipped.'}</p></div>`;
   const body = `
   <div class="card" data-reveal>
     <div class="kicker">Live logistics</div>
     <h2>🌍 Shipment tracking</h2>
-    <p class="muted">Every in-transit CIF/CRF deal on the network — <span style="color:var(--mint)">mint</span> markers are your shipments,
+    <p class="muted">Every in-transit CIF/FOB/CFR deal on the network — <span style="color:var(--mint)">mint</span> markers are your shipments,
       <span style="color:var(--gold)">gold</span> markers are other companies'. Deal values are never shown.</p>
   </div>
   ${strip}
@@ -7413,6 +9086,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
   };
   // Platform commission: the live admin-adjustable pct of the summed value of approved (finalized) deals, per currency.
   const feePct = platformFeePct();
+  const bankCfg = bankDetails() || {}; // Batch B — structured receiving bank details for the settings form
   const approvedDeals = db.prepare(`SELECT value, currency FROM deals WHERE contract_state = 'approved'`).all();
   const feeByCurrency = {};
   for (const d of approvedDeals) {
@@ -7505,10 +9179,12 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
     const amounts = isFinite(f.fee)
       ? `${f.pct}% = <b>${fmtAmount(f.fee)} ${esc(f.cur)}</b> — buyer ${fmtAmount(f.buyer)} · seller ${fmtAmount(f.seller)} ${esc(f.cur)}`
       : `${f.pct}% of ${esc(n.offer_value)} ${esc(n.offer_currency || 'USD')}`;
+    const negMs = parseMilestoneJson(n.milestone_proposal);
+    const msLine = negMs ? `<br><span class="muted">📊 ${esc(milestoneSummaryText(negMs))}</span>` : '';
     return `<tr>
       <td><b>${esc(deal ? deal.title : '(deal removed)')}</b> <span class="muted">№ ${esc(deal ? (deal.deal_number || String(n.deal_id)) : String(n.deal_id))} · neg #${n.id} · round ${n.round}</span></td>
       <td>${esc(names.get(n.seller_id) || '?')} ⇄ ${esc(names.get(n.buyer_id) || '?')}</td>
-      <td><b>${esc(splitLabel)}</b><br><span class="muted">${amounts}</span></td>
+      <td><b>${esc(splitLabel)}</b><br><span class="muted">${amounts}</span>${msLine}</td>
       <td style="white-space:nowrap">
         <a class="btn btn-sm btn-outline" href="/negotiation/${n.id}">View</a>
         <form method="POST" action="/admin/negotiations/${n.id}/approve" style="display:inline"><button class="btn btn-sm btn-green">Approve</button></form>
@@ -7538,6 +9214,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
       <td>${esc(names.get(p.company_id) || '?')}</td>
       <td><b>${fmtAmount(p.amount)} ${esc(p.currency)}</b></td>
       <td class="muted">${p.note ? esc(p.note) : '—'}</td>
+      <td>${p.proof_media_id ? `<a class="btn btn-sm btn-outline" href="/payments/${p.id}/proof">📄 ${esc(p.proof_filename || 'receipt.pdf')}</a>` : '<span class="muted">— none</span>'}</td>
       <td class="muted" style="white-space:nowrap">${esc(p.created_at.slice(0, 16).replace('T', ' '))}</td>
       <td style="white-space:nowrap">
         <form method="POST" action="/admin/payments/${p.id}/approve" style="display:inline"><button class="btn btn-sm btn-green">Approve</button></form>
@@ -7548,7 +9225,18 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
       </td>
     </tr>`;
   });
-  const paymentsTableHtml = paymentRows.length ? paymentRows.join('') : '<tr><td colspan="6" class="muted">No payment confirmations awaiting review. Parties confirm their bank transfers from the deal page.</td></tr>';
+  const paymentsTableHtml = paymentRows.length ? paymentRows.join('') : '<tr><td colspan="7" class="muted">No payment confirmations awaiting review. Parties confirm their bank transfers from the deal page.</td></tr>';
+
+  // ⚠️ Open escrow disputes (Batch B) — party-flagged deals surface here for mediation.
+  let openDisputes = [];
+  try { openDisputes = db.prepare('SELECT id, title, deal_number, escrow_dispute_at FROM deals WHERE escrow_dispute_at IS NOT NULL ORDER BY escrow_dispute_at DESC LIMIT 20').all(); } catch (e) { openDisputes = []; }
+  const disputesHtml = openDisputes.length ? `<div class="card" data-reveal><h3>⚠️ Open escrow disputes</h3>
+    <table><tr><th>Deal</th><th>Raised (UTC)</th><th></th></tr>${openDisputes.map(d => `<tr>
+      <td><b>${esc(d.title)}</b> <span class="muted">№ ${esc(d.deal_number || String(d.id))}</span></td>
+      <td class="muted">${esc(d.escrow_dispute_at.slice(0, 16).replace('T', ' '))}</td>
+      <td><a class="btn btn-sm btn-outline" href="/deal/${d.id}">Open deal</a></td>
+    </tr>`).join('')}</table>
+    <p class="muted" style="margin-top:8px">Disputes pause the escrow release design. Mediate with the parties, then resolve off-platform (flow preview).</p></div>` : '';
 
   // All companies (suspend / reactivate / delete / reputation / research)
   const allCompanies = db.prepare('SELECT * FROM companies ORDER BY created_at DESC LIMIT 100').all();
@@ -7601,8 +9289,9 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
   <div class="card" data-reveal><h3>🤝 Pending negotiations — final approval (commission split)</h3>
     <table><tr><th>Deal</th><th>Parties</th><th>Split &amp; commission</th><th>Actions</th></tr>${negsTableHtml}</table></div>
   <div class="card" data-reveal><h3>💰 Commission payments ${pendingPayCount ? `<span class="badge badge-sealed">${pendingPayCount} pending</span>` : ''}</h3>
-    <p class="muted" style="margin-bottom:8px">Verify each bank transfer, then approve. A deal's shipment tracking unlocks once every required share (per the agreed split) is approved.</p>
-    <table><tr><th>Deal / contract</th><th>Company</th><th>Amount</th><th>Note</th><th>Date (UTC)</th><th>Actions</th></tr>${paymentsTableHtml}</table></div>
+    <p class="muted" style="margin-bottom:8px">Verify each bank transfer — open the receipt PDF first when one is attached — then approve. A deal's shipment tracking unlocks once every required share (per the agreed split) is approved.</p>
+    <table><tr><th>Deal / contract</th><th>Company</th><th>Amount</th><th>Note</th><th>Proof</th><th>Date (UTC)</th><th>Actions</th></tr>${paymentsTableHtml}</table></div>
+  ${disputesHtml}
   <div class="card" data-reveal><h3>All companies</h3>
     <table><tr><th>Company</th><th>Status</th><th>Reputation</th><th>Actions</th></tr>${companiesHtml}</table></div>
   <div class="card" data-reveal><h3>All deals</h3>
@@ -7622,11 +9311,25 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
       <p class="muted" style="margin-top:8px">Between 0.1% and 20%. Applied immediately to deal pages, contracts, documents and the commission tile. Changes are audit-logged.</p>
     </form>
     <hr class="sep">
-    <form method="POST" action="/admin/settings/bank-details" style="max-width:480px">
-      <label>Commission payment instructions (bank details)</label>
-      <textarea name="admin_bank_details" rows="4" maxlength="1000" placeholder="e.g. Dealzoin Ltd · IBAN DE00 1234 5678 9000 0000 00 · SWIFT DEUTDEFF · Reference: deal number">${esc((db.prepare('SELECT value FROM settings WHERE key = ?').get('admin_bank_details') || {}).value || '')}</textarea>
+    <h4 style="margin:0 0 8px">🏦 Dealzoin receiving bank details</h4>
+    <p class="muted" style="margin:0 0 10px">Shown as an elegant copy-to-clipboard card on every commission payment card. The payment reference with the deal number is added automatically. Save all fields empty to fall back to the default note.</p>
+    <form method="POST" action="/admin/settings/bank-details" style="max-width:560px">
+      <div class="grid2" style="gap:10px">
+        <div><label>Bank name</label><input type="text" name="bank_name" maxlength="120" value="${esc(bankCfg.bank_name || '')}" placeholder="e.g. First Emirates Bank"></div>
+        <div><label>Account name</label><input type="text" name="bank_account" maxlength="120" value="${esc(bankCfg.bank_account || '')}" placeholder="e.g. Dealzoin Ltd"></div>
+      </div>
+      <div class="grid2" style="gap:10px">
+        <div><label>IBAN</label><input type="text" name="bank_iban" maxlength="60" value="${esc(bankCfg.bank_iban || '')}" placeholder="e.g. AE07 0331 2345 6789 0123 456"></div>
+        <div><label>SWIFT / BIC</label><input type="text" name="bank_swift" maxlength="20" value="${esc(bankCfg.bank_swift || '')}" placeholder="e.g. EBILAEAD"></div>
+      </div>
+      <div class="grid2" style="gap:10px">
+        <div><label>Currency</label><select name="bank_currency">${optionsHtml([''].concat(DEAL_CURRENCIES), bankCfg.bank_currency || '')}</select></div>
+        <div><label>Reference instructions</label><input type="text" name="bank_ref" maxlength="200" value="${esc(bankCfg.bank_ref || '')}" placeholder="e.g. Always quote the deal number"></div>
+      </div>
+      <label>Legacy free-text instructions (optional fallback, shown when the fields above are empty)</label>
+      <textarea name="admin_bank_details" rows="3" maxlength="1000" placeholder="e.g. Dealzoin Ltd · IBAN DE00 1234 5678 9000 0000 00 · SWIFT DEUTDEFF · Reference: deal number">${esc((db.prepare('SELECT value FROM settings WHERE key = ?').get('admin_bank_details') || {}).value || '')}</textarea>
       <button class="btn btn-sm" type="submit">Update bank details</button>
-      <p class="muted" style="margin-top:8px">Shown to both parties on the commission payment card of every finalized deal and private contract. Save an empty field to restore the default note.</p>
+      <p class="muted" style="margin-top:8px">Changes are audit-logged. Parties copy each field with one click on the deal page.</p>
     </form></div>
   <div class="card" data-reveal><h3>🤖 Agent activity (latest 50)</h3>
     <table><tr><th>Time (UTC)</th><th>Agent</th><th>Action</th><th>Result</th><th>Details</th></tr>${auditHtml}</table></div>`;
@@ -7677,6 +9380,7 @@ function wipeCompanyData(id) {
       db.prepare('DELETE FROM counter_offers WHERE deal_id = ?').run(d);
       db.prepare('DELETE FROM deal_documents WHERE deal_id = ?').run(d);
       db.prepare('DELETE FROM commission_payments WHERE deal_id = ?').run(d);
+      try { db.prepare('DELETE FROM receiving_updates WHERE deal_id = ?').run(d); } catch (e) { /* table predates Batch B on legacy DBs */ }
     }
     for (const p of postIds) {
       db.prepare(`DELETE FROM likes WHERE target_type = 'post' AND target_id = ?`).run(p);
@@ -7845,6 +9549,34 @@ app.post('/admin/companies/:id/reputation', requireAdmin, (req, res) => {
 app.get('/admin/companies/:id/research', requireAdmin, (req, res) => {
   const c = db.prepare('SELECT * FROM companies WHERE id = ?').get(parseInt(req.params.id, 10));
   if (!c) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Company not found.'));
+  // Batch C (3): full bank details + BANK RESEARCH AGENT verdict, admin-only, with override.
+  const hasBank = c.bank_name || c.bank_swift || c.bank_iban || c.bank_country || c.bank_holder;
+  const kycBadge = c.bank_kyc_status === 'verified' ? '<span class="badge badge-pass">verified ✓</span>'
+    : c.bank_kyc_status === 'rejected' ? '<span class="badge badge-rejected">rejected</span>'
+    : c.bank_kyc_status === 'warnings' ? '<span class="badge badge-sealed">warnings ⚠️</span>'
+    : '<span class="badge">not provided</span>';
+  const bankKycCard = `
+  <div class="card" style="max-width:560px;margin:18px auto 0" data-reveal>
+    <div class="kicker">🏦 BANK RESEARCH AGENT</div>
+    <h3 style="margin:6px 0 8px">Bank details &amp; KYC — ${kycBadge}</h3>
+    ${hasBank ? `<div class="bank-card">
+      ${c.bank_name ? bankFieldRow('Bank name', c.bank_name) : ''}
+      ${c.bank_swift ? bankFieldRow('SWIFT / BIC', c.bank_swift) : ''}
+      ${c.bank_iban ? bankFieldRow('IBAN / account', c.bank_iban) : ''}
+      ${c.bank_country ? bankFieldRow('Bank country', c.bank_country) : ''}
+      ${c.bank_holder ? bankFieldRow('Account holder', c.bank_holder) : ''}
+    </div>` : '<p class="muted">No bank details provided yet.</p>'}
+    ${c.bank_kyc_notes ? `<p class="muted" style="margin-top:8px;white-space:pre-wrap">Agent notes: ${esc(c.bank_kyc_notes)}${c.bank_kyc_at ? ` · checked ${esc(c.bank_kyc_at.slice(0, 16).replace('T', ' '))} UTC` : ''}</p>` : ''}
+    ${hasBank ? `<form method="POST" action="/admin/companies/${c.id}/bank-kyc" style="margin-top:10px">
+      <label>Admin override</label>
+      <div class="grid2" style="gap:10px">
+        <select name="kyc_status">${optionsHtml(['verified', 'rejected'], c.bank_kyc_status === 'rejected' ? 'rejected' : 'verified')}</select>
+        <input type="text" name="kyc_note" maxlength="300" placeholder="Override note (required)" required>
+      </div>
+      <button class="btn btn-sm" type="submit">Apply override</button>
+    </form>` : ''}
+    ${hasBank ? COPY_BTN_SCRIPT : ''}
+  </div>`;
   const body = `
   <div class="card" style="max-width:560px;margin:0 auto">
     <div class="kicker">🔬 Research Agent</div>
@@ -7859,7 +9591,8 @@ app.get('/admin/companies/:id/research', requireAdmin, (req, res) => {
       <button class="btn" type="submit">Save intelligence</button>
       <a class="btn btn-outline" href="/admin/dashboard" style="margin-left:8px">Back</a>
     </form>
-  </div>`;
+  </div>
+  ${bankKycCard}`;
   res.send(page('Research — ' + c.name, body, req.user, req.query.msg, req.query.err));
 });
 
@@ -7942,9 +9675,22 @@ app.post('/admin/companies/:id/research', requireAdmin, async (req, res) => {
     : 'err=' + encodeURIComponent('No public data found for "' + c.name + '" (' + (failReason || 'not found') + '). You can still fill the fields manually.')));
 });
 
+// ----- Batch C (3): admin bank-KYC override (pins the BANK RESEARCH AGENT verdict) -----
+app.post('/admin/companies/:id/bank-kyc', requireAdmin, (req, res) => {
+  const c = db.prepare('SELECT * FROM companies WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!c) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Company not found.'));
+  const status = req.body.kyc_status === 'rejected' ? 'rejected' : 'verified';
+  const note = String(req.body.kyc_note || '').trim().slice(0, 300);
+  if (!note) return res.redirect(`/admin/companies/${c.id}/research?err=` + encodeURIComponent('An override note is required.'));
+  db.prepare('UPDATE companies SET bank_kyc_status = ?, bank_kyc_notes = ?, bank_kyc_at = ? WHERE id = ?')
+    .run(status, `Admin override → ${status}: ${note}`, now(), c.id);
+  audit('BANK RESEARCH AGENT', 'bank KYC admin override', status === 'verified' ? 'pass' : 'fail',
+    `Admin overrode bank KYC for "${c.name}" (#${c.id}) → ${status}: ${note.slice(0, 300)}`);
+  res.redirect(`/admin/companies/${c.id}/research?msg=` + encodeURIComponent(`Bank KYC for ${c.name} set to ${status}.`));
+});
+
 // ----- Deal moderation -----
-app.post('/admin/deals/:id/delete', requireAdmin, (req, res) => {
-  const d = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
+app.post('/admin/deals/:id/delete', requireAdmin, (req, res) => {  const d = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
   if (!d) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Deal not found.'));
   const wipe = db.transaction(() => {
     db.prepare(`DELETE FROM likes WHERE target_type = 'deal' AND target_id = ?`).run(d.id);
@@ -8080,13 +9826,28 @@ app.post('/admin/settings/commission', requireAdmin, (req, res) => {
   res.redirect('/admin/dashboard?msg=' + encodeURIComponent(`Platform commission updated from ${old}% to ${rounded}%.`));
 });
 
-// ----- Platform settings: commission payment instructions (bank details shown to both parties) -----
+// ----- Platform settings: Dealzoin receiving bank details (structured fields + legacy free-text fallback) -----
 app.post('/admin/settings/bank-details', requireAdmin, (req, res) => {
-  const v = String(req.body.admin_bank_details || '').trim().slice(0, 1000);
-  db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
-    .run('admin_bank_details', v);
-  audit('ADMIN', 'bank details change', 'pass', v ? 'Commission payment bank details updated' : 'Commission payment bank details reset to default');
-  res.redirect('/admin/dashboard?msg=' + encodeURIComponent(v ? 'Bank details updated — shown on all commission payment cards.' : 'Bank details reset to the default note.'));
+  const upsert = db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value');
+  const fields = {
+    bank_name: String(req.body.bank_name || '').trim().slice(0, 120),
+    bank_account: String(req.body.bank_account || '').trim().slice(0, 120),
+    bank_iban: String(req.body.bank_iban || '').trim().slice(0, 60),
+    bank_swift: String(req.body.bank_swift || '').trim().slice(0, 20),
+    bank_currency: DEAL_CURRENCIES.includes(req.body.bank_currency) ? req.body.bank_currency : '',
+    bank_ref: String(req.body.bank_ref || '').trim().slice(0, 200)
+  };
+  const legacy = String(req.body.admin_bank_details || '').trim().slice(0, 1000);
+  const tx = db.transaction(() => {
+    for (const [k, v] of Object.entries(fields)) upsert.run(k, v);
+    upsert.run('admin_bank_details', legacy);
+  });
+  tx();
+  const structured = Object.values(fields).some(v => v);
+  audit('ADMIN', 'bank details change', 'pass', structured
+    ? `Receiving bank details updated (${fields.bank_name || '?'} · ${fields.bank_iban || 'no IBAN'} · ${fields.bank_currency || 'currency unset'})`
+    : (legacy ? 'Commission payment bank details updated (legacy free-text)' : 'Commission payment bank details reset to default'));
+  res.redirect('/admin/dashboard?msg=' + encodeURIComponent('Bank details updated — shown with one-click Copy buttons on all commission payment cards.'));
 });
 
 // ----- Commission payment review: approve a party's bank-transfer confirmation -----
@@ -8144,6 +9905,7 @@ app.post('/admin/negotiations/:id/approve', requireAdmin, (req, res) => {
   const dealTitle = deal ? deal.title : 'deal #' + neg.deal_id;
   const f = negFeeBreakdown(neg);
   const splitLabel = NEG_SPLITS[neg.commission_split] || NEG_SPLITS['50-50'];
+  const msApproved = parseMilestoneJson(neg.milestone_proposal); // (5) frozen onto the deal at finalization
   const feeNote = isFinite(f.fee)
     ? ` Commission due before deal processing: ${fmtAmount(f.fee)} ${f.cur} (${splitLabel} — buyer ${fmtAmount(f.buyer)} ${f.cur}, seller ${fmtAmount(f.seller)} ${f.cur}).`
     : ` The ${f.pct}% platform commission (${splitLabel}) is due before deal processing.`;
@@ -8151,9 +9913,10 @@ app.post('/admin/negotiations/:id/approve', requireAdmin, (req, res) => {
     // 1) Mark the deal as approved, record the buyer on the deal, close the status pipeline.
     //    The commission payment gate opens here: payment_status flips 'none' → 'pending_payment'
     //    and the fee/split are frozen on the deal (later fee-pct changes never rewrite them).
+    //    The agreed payment milestone schedule is frozen alongside (drives the escrow panel).
     db.prepare(`UPDATE deals SET contract_state = 'approved', contract_party = ?, contract_party_id = ?, status = 'closed',
-                payment_status = 'pending_payment', payment_split = ?, payment_fee = ?, payment_currency = ? WHERE id = ?`)
-      .run(buyerName, neg.buyer_id, f.split, isFinite(f.fee) ? Math.round(f.fee * 100) / 100 : null, f.cur, neg.deal_id);
+                payment_status = 'pending_payment', payment_split = ?, payment_fee = ?, payment_currency = ?, payment_milestones = ? WHERE id = ?`)
+      .run(buyerName, neg.buyer_id, f.split, isFinite(f.fee) ? Math.round(f.fee * 100) / 100 : null, f.cur, msApproved ? JSON.stringify(msApproved) : null, neg.deal_id);
     // 2) Archive the signature record (same pattern as the legacy contract queue).
     db.prepare('DELETE FROM contracts WHERE negotiation_id = ?').run(neg.id);
     // 3) Close the negotiation.
@@ -8273,11 +10036,11 @@ const ZO_KNOWLEDGE = [
       links: [{ label: 'Tracking', href: '/tracking' }], sug: ['How does tracking work?', 'What are incoterms?'] }) },
   { id: 'tracking', scope: 'public',
     kw: [['tracking', 5], ['track', 3], ['shipment', 5], ['shipping', 4], ['vessel', 3], ['cargo', 3], ['map', 3], ['where is my', 3]],
-    reply: () => ({ text: 'The Tracking page shows live shipment maps for your finalized CIF/CRF deals once the commission payment is approved (the payment gate). Each deal page also has its own shipment tracking map with origin → destination. FOP deals are not tracked on-platform, because the buyer arranges the carriage.',
+    reply: () => ({ text: 'The Tracking page shows live shipment maps for your finalized CIF/FOB/CFR deals once the commission payment is approved (the payment gate). Each deal page also has its own shipment tracking map with origin → destination. FOP deals are not tracked on-platform, because the buyer arranges the carriage.',
       links: [{ label: 'Shipment tracking', href: '/tracking' }], sug: ['What are incoterms?', 'What is the commission?'] }) },
   { id: 'incoterms', scope: 'public',
     kw: [['incoterm', 6], ['incoterms', 6], ['fop', 4], ['cif', 4], ['crf', 4], ['freight', 3], ['insurance', 2]],
-    reply: () => ({ text: 'Deals use three incoterms:\n• FOP — Free on Plane/Point: the buyer arranges & pays main carriage; no platform tracking.\n• CIF — Cost, Insurance & Freight: the seller pays shipping and insurance to the destination port; platform tracking enabled.\n• CRF — Cost & Freight: the seller pays freight to the destination port; insurance is on the buyer; platform tracking enabled.\nYou pick the incoterm when posting the deal.',
+    reply: () => ({ text: 'Deals use four incoterms:\n• FOP — Free on Plane/Point: the buyer arranges & pays main carriage; no platform tracking.\n• CIF — Cost, Insurance & Freight: the seller pays shipping and insurance to the destination port; platform tracking enabled.\n• FOB — Free on Board: the seller delivers on board at the origin port; the buyer takes over from there; platform tracking enabled.\n• CFR — Cost & Freight: the seller pays freight to the destination port; insurance is on the buyer; platform tracking enabled.\nYou pick the incoterm when posting the deal, and the seller confirms or changes it on each private offer.',
       links: [{ label: 'Create a deal', href: '/deals/new' }], sug: ['How does tracking work?', 'How do I post a deal?'] }) },
   { id: 'follow', scope: 'public',
     kw: [['follow', 4], ['unfollow', 4], ['followers', 3], ['following', 3]],
@@ -8489,6 +10252,624 @@ app.post('/assistant/ask', (req, res) => {
     links: [],
     suggestions: sug
   }, 'fallback');
+});
+
+// ============================= BATCH C ROUTES =============================
+// ----- (7) Language switch -----
+app.post('/lang', (req, res) => {
+  const lang = String((req.body && req.body.lang) || '');
+  if (SUPPORTED_LANGS.includes(lang)) {
+    res.setHeader('Set-Cookie', `dz_lang=${lang}; Path=/; Max-Age=${365 * 24 * 3600}; SameSite=Lax`);
+    const u = currentUser(req);
+    if (u && !u.isAdmin) {
+      try { db.prepare('UPDATE companies SET lang = ? WHERE id = ?').run(lang, u.id); } catch (e) { /* cookie still set */ }
+    }
+  }
+  const back = String(req.get('referer') || '/').split('?')[0];
+  res.redirect(/^https?:/i.test(back) ? '/' : (back || '/'));
+});
+
+// ----- (1) News ticker JSON (60s client polling; markets are cached server-side, DB part is cheap) -----
+app.get('/api/ticker', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  try {
+    res.json({ ok: true, html: tickerSegmentsHtml(reqLang(req)) });
+  } catch (e) {
+    res.json({ ok: false, html: '' }); // graceful — the client keeps the stale ticker
+  }
+});
+
+// ----- (2) Direct translator -----
+const translateRate = new Map(); // companyId -> [timestamps] (30 req/min window)
+function translateRateOk(companyId) {
+  const nowMs = Date.now();
+  const arr = (translateRate.get(companyId) || []).filter(ts => nowMs - ts < 60000);
+  if (arr.length >= 30) { translateRate.set(companyId, arr); return false; }
+  arr.push(nowMs);
+  translateRate.set(companyId, arr);
+  return true;
+}
+/** Extract the translated text from the Google gtx nested-array response. */
+function parseGoogleTranslate(json) {
+  if (!Array.isArray(json) || !Array.isArray(json[0])) return '';
+  return json[0].map(seg => (Array.isArray(seg) && seg[0]) ? String(seg[0]) : '').join('').trim();
+}
+app.post('/api/translate', requireCompany, async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const rawText = String((req.body && req.body.text) || '');
+  if (rawText.length > 2000) return res.status(413).json({ ok: false, error: 'too_long' });
+  const text = rawText;
+  let target = String((req.body && req.body.target) || '').trim().toLowerCase();
+  if (!/^[a-z]{2,3}(-[a-z0-9]{2,8})?$/.test(target)) target = 'en';
+  if (!text.trim()) return res.status(400).json({ ok: false, error: 'empty' });
+  if (!translateRateOk(req.user.id)) return res.status(429).json({ ok: false, error: 'rate_limited' });
+  const cacheKey = crypto.createHash('sha256').update(target + '\n' + text).digest('hex');
+  try {
+    const hit = db.prepare('SELECT result FROM translation_cache WHERE cache_key = ?').get(cacheKey);
+    if (hit) return res.json({ ok: true, text: hit.result, target, cached: true });
+  } catch (e) { /* cache read failure must not block translation */ }
+  // Proxy to the free Google endpoint — 5s timeout, graceful failure (client toasts).
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => { try { ctrl.abort(); } catch (e) { /* settled */ } }, 5000);
+    let data = null;
+    try {
+      const url = 'https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&dt=t&tl='
+        + encodeURIComponent(target) + '&q=' + encodeURIComponent(text);
+      const resp = await fetch(url, { signal: ctrl.signal, headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Dealzoin/1.0)' } });
+      if (resp && resp.ok) data = await resp.json();
+    } finally {
+      clearTimeout(timer);
+    }
+    const out = parseGoogleTranslate(data);
+    if (!out) return res.status(502).json({ ok: false, error: 'unavailable' });
+    try {
+      db.prepare('INSERT OR REPLACE INTO translation_cache (cache_key, target, result, created_at) VALUES (?,?,?,?)')
+        .run(cacheKey, target, out.slice(0, 4000), now());
+    } catch (e) { /* caching is best-effort */ }
+    return res.json({ ok: true, text: out, target });
+  } catch (e) {
+    return res.status(502).json({ ok: false, error: 'unavailable' });
+  }
+});
+
+// ----- (3) BANK RESEARCH AGENT — company bank details KYC -----
+/** Basic ISO-13616 IBAN mod-97 checksum. Returns true/false; null when the input isn't IBAN-shaped. */
+function ibanChecksumOk(iban) {
+  const s = String(iban || '').replace(/\s+/g, '').toUpperCase();
+  if (!/^[A-Z]{2}\d{2}[A-Z0-9]{11,30}$/.test(s)) return null;
+  const rearr = s.slice(4) + s.slice(0, 4);
+  let digits = '';
+  for (const ch of rearr) digits += /[A-Z]/.test(ch) ? String(ch.charCodeAt(0) - 55) : ch;
+  let rem = 0;
+  for (const ch of digits) rem = (rem * 10 + (ch.charCodeAt(0) - 48)) % 97;
+  return rem === 1;
+}
+/** Common bank-country names → ISO 3166-1 alpha-2 (for the IBAN country cross-check). */
+const COUNTRY_TO_ISO = {
+  'united arab emirates': 'AE', uae: 'AE', emirates: 'AE', 'saudi arabia': 'SA', ksa: 'SA', qatar: 'QA', bahrain: 'BH',
+  kuwait: 'KW', oman: 'OM', egypt: 'EG', jordan: 'JO', lebanon: 'LB', 'united states': 'US', usa: 'US', 'united kingdom': 'GB',
+  uk: 'GB', britain: 'GB', germany: 'DE', france: 'FR', netherlands: 'NL', spain: 'ES', italy: 'IT', switzerland: 'CH',
+  india: 'IN', china: 'CN', 'hong kong': 'HK', singapore: 'SG', turkey: 'TR', 'south africa': 'ZA', nigeria: 'NG', kenya: 'KE'
+};
+function countryToIso(country) {
+  const c = String(country || '').trim();
+  if (/^[A-Za-z]{2}$/.test(c)) return c.toUpperCase();
+  return COUNTRY_TO_ISO[c.toLowerCase()] || '';
+}
+/**
+ * BANK RESEARCH AGENT: validates a company's saved bank details — SWIFT structure, IBAN
+ * checksum, completeness score, IBAN-country vs declared bank-country — then stores the verdict
+ * (bank_kyc_status: verified | warnings | rejected + human-readable notes) and audit-logs it.
+ * An admin override pins status to verified/rejected and survives re-runs of the agent.
+ */
+function runBankKycAgent(companyId) {
+  const c = db.prepare('SELECT * FROM companies WHERE id = ?').get(companyId);
+  if (!c) return null;
+  // Admin override is sticky — the agent does not re-judge overridden companies.
+  if (c.bank_kyc_status === 'rejected' || (c.bank_kyc_status === 'verified' && /admin override/i.test(c.bank_kyc_notes || ''))) {
+    return { status: c.bank_kyc_status, notes: c.bank_kyc_notes };
+  }
+  const name = (c.bank_name || '').trim(), holder = (c.bank_holder || '').trim();
+  const swift = (c.bank_swift || '').replace(/\s+/g, '').toUpperCase();
+  const iban = (c.bank_iban || '').replace(/\s+/g, '').toUpperCase();
+  const bcountry = (c.bank_country || '').trim();
+  const any = name || holder || swift || iban || bcountry;
+  if (!any) {
+    db.prepare("UPDATE companies SET bank_kyc_status = '', bank_kyc_notes = '', bank_kyc_at = ? WHERE id = ?").run(now(), c.id);
+    return { status: '', notes: '' };
+  }
+  const notes = [];
+  const filled = [name, holder, swift, iban, bcountry].filter(Boolean).length;
+  // SWIFT/BIC: 8 or 11 chars — 4 bank + 2 country + 2 location (+ 3 branch).
+  if (swift) {
+    if (!/^[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}([A-Z0-9]{3})?$/.test(swift)) notes.push('SWIFT format invalid (expected 8 or 11 chars: BANKCCLL[BBB])');
+  } else notes.push('SWIFT/BIC missing');
+  // IBAN: checksum where applicable; plain account numbers are accepted but noted.
+  const ibanOk = ibanChecksumOk(iban);
+  if (iban) {
+    if (ibanOk === false) notes.push('IBAN checksum failed — please re-check the number');
+    else if (ibanOk === null) notes.push('Not an IBAN-shaped account number — treated as a local account (no checksum possible)');
+  } else notes.push('IBAN / account number missing');
+  // Country cross-check: IBAN prefix vs the declared bank country.
+  const iso = countryToIso(bcountry);
+  if (ibanOk !== null && iso && iban.slice(0, 2) !== iso) notes.push(`Country mismatch: IBAN country (${iban.slice(0, 2)}) ≠ declared bank country (${iso})`);
+  if (!bcountry) notes.push('Bank country missing');
+  if (!name) notes.push('Bank name missing');
+  if (!holder) notes.push('Account holder missing');
+  const score = Math.round((filled / 5) * 100);
+  notes.push(`Completeness: ${score}% (${filled}/5 fields)`);
+  // When every field is filled and valid, only the completeness note remains → verified.
+  const finalStatus = notes.length === 1 ? 'verified' : 'warnings';
+  const noteText = notes.join(' · ');
+  db.prepare('UPDATE companies SET bank_kyc_status = ?, bank_kyc_notes = ?, bank_kyc_at = ? WHERE id = ?')
+    .run(finalStatus, noteText.slice(0, 500), now(), c.id);
+  audit('BANK RESEARCH AGENT', 'bank KYC check', finalStatus === 'verified' ? 'pass' : 'flag',
+    `Bank KYC for "${c.name}" (#${c.id}): ${finalStatus} — ${noteText.slice(0, 380)}`);
+  return { status: finalStatus, notes: noteText };
+}
+/** Verification badge for the company's OWN profile. */
+function bankKycBadgeHtml(c, lang) {
+  const st = c.bank_kyc_status || '';
+  if (!st) return `<span class="badge">${esc(t(lang, 'bank.verified'))}: ${esc(t(lang, 'bank.notset'))}</span>`;
+  if (st === 'verified') return `<span class="badge badge-pass">🏦 ${esc(t(lang, 'bank.verified'))}: ${esc(t(lang, 'bank.passed'))} ✓</span>`;
+  if (st === 'rejected') return `<span class="badge badge-rejected">🏦 ${esc(t(lang, 'bank.verified'))}: ${esc(t(lang, 'bank.rejected'))}</span>`;
+  return `<span class="badge badge-sealed" title="${esc(c.bank_kyc_notes || '')}">🏦 ${esc(t(lang, 'bank.verified'))}: ${esc(t(lang, 'bank.warnings'))} ⚠️</span>`;
+}
+/** Profile settings: save bank details, then the BANK RESEARCH AGENT re-checks them. */
+app.post('/profile/bank', requireCompany, (req, res) => {
+  if (req.user.memberId) return res.redirect('/profile?err=' + encodeURIComponent('Team members cannot change bank details.'));
+  db.prepare('UPDATE companies SET bank_name = ?, bank_swift = ?, bank_iban = ?, bank_country = ?, bank_holder = ? WHERE id = ?')
+    .run(String(req.body.bank_name || '').trim().slice(0, 120),
+         String(req.body.bank_swift || '').trim().slice(0, 11),
+         String(req.body.bank_iban || '').trim().slice(0, 34),
+         String(req.body.bank_country || '').trim().slice(0, 60),
+         String(req.body.bank_holder || '').trim().slice(0, 120),
+         req.user.id);
+  const verdict = runBankKycAgent(req.user.id);
+  const msg = verdict && verdict.status === 'verified'
+    ? 'Bank details saved — all BANK RESEARCH AGENT checks passed ✓'
+    : 'Bank details saved — agent notes: ' + ((verdict && verdict.notes) || '').slice(0, 220);
+  res.redirect('/profile?' + (verdict && verdict.status === 'verified' ? 'msg=' : 'err=') + encodeURIComponent(msg));
+});
+
+// ----- (4) ACCOUNTING AGENT (lite Odoo): invoices, expenses, ledger, CSV export -----
+const INVOICE_STATUSES = ['draft', 'sent', 'paid', 'overdue'];
+const EXPENSE_CATEGORIES = ['General', 'Logistics', 'Salaries', 'Marketing', 'Operations', 'Travel', 'Software', 'Customs & duties', 'Other'];
+/** Lazy status maintenance: sent invoices past their due date flip to overdue (date-only compare). */
+function accountingSweep(companyId) {
+  const today = now().slice(0, 10);
+  const r = db.prepare(`UPDATE invoices SET status = 'overdue' WHERE company_id = ? AND status = 'sent' AND due_date != '' AND due_date < ?`).run(companyId, today);
+  if (r.changes > 0) {
+    agentInsight(companyId, 'ACCOUNTING AGENT', 'warn', `${r.changes} invoice(s) auto-marked overdue as of ${today} — consider sending a payment reminder.`);
+    audit('ACCOUNTING AGENT', 'overdue sweep', 'flag', `Company #${companyId}: ${r.changes} invoice(s) auto-marked overdue`);
+  }
+}
+/** ACCOUNTING AGENT checks on a new invoice: duplicate amount+client within 7 days. */
+function accountingAgentInvoice(companyId, inv) {
+  try {
+    const dup = db.prepare(`SELECT id FROM invoices WHERE company_id = ? AND id != ? AND client = ? AND ABS(amount - ?) < 0.005
+      AND created_at >= datetime('now', '-7 days') LIMIT 1`).get(companyId, inv.id, inv.client, inv.amount);
+    if (dup) {
+      agentInsight(companyId, 'ACCOUNTING AGENT', 'warn', `Possible duplicate invoice: #${inv.id} matches #${dup.id} (same client "${inv.client}" + amount ${fmtAmount(inv.amount)} ${inv.currency}) within 7 days.`);
+    }
+  } catch (e) { /* agent must never break the flow */ }
+}
+/** ACCOUNTING AGENT checks on a new expense: > 50% of the trailing monthly average. */
+function accountingAgentExpense(companyId, exp) {
+  try {
+    const rows = db.prepare(`SELECT substr(COALESCE(NULLIF(spent_on,''), created_at), 1, 7) AS ym, SUM(amount) AS s
+      FROM expenses WHERE company_id = ? AND id != ? AND currency = ? GROUP BY ym`).all(companyId, exp.id, exp.currency);
+    if (rows.length < 2) return; // not enough history for a meaningful average
+    const avg = rows.reduce((a, r) => a + (r.s || 0), 0) / rows.length;
+    if (avg > 0 && exp.amount > avg * 0.5) {
+      agentInsight(companyId, 'ACCOUNTING AGENT', 'warn', `Unusual expense: ${fmtAmount(exp.amount)} ${exp.currency} in "${exp.category}" is above 50% of your monthly average (${fmtAmount(avg)} ${exp.currency}).`);
+    }
+  } catch (e) { /* best-effort */ }
+}
+/** Small status chip for invoices. */
+function invoiceStatusBadge(status) {
+  const cls = status === 'paid' ? 'badge-pass' : status === 'overdue' ? 'badge-rejected' : status === 'sent' ? 'badge-sealed' : '';
+  return `<span class="badge ${cls}">${esc(status)}</span>`;
+}
+app.get('/accounting', requireCompany, (req, res) => {
+  const lang = req.user.lang || 'en';
+  const myId = req.user.id;
+  accountingSweep(myId);
+  const invoices = db.prepare('SELECT * FROM invoices WHERE company_id = ? ORDER BY created_at DESC, id DESC LIMIT 200').all(myId);
+  const expenses = db.prepare("SELECT * FROM expenses WHERE company_id = ? ORDER BY COALESCE(NULLIF(spent_on, ''), created_at) DESC, id DESC LIMIT 200").all(myId);
+  const myDeals = db.prepare('SELECT id, title, deal_number FROM deals WHERE company_id = ? ORDER BY created_at DESC LIMIT 50').all(myId);
+
+  // Summary cards (per-currency sums; most companies use a single currency — mixed sums are listed per currency).
+  const sumBy = (rows, pred) => {
+    const out = {};
+    for (const r of rows) if (pred(r)) out[r.currency] = (out[r.currency] || 0) + r.amount;
+    return Object.entries(out).sort().map(([c, v]) => `${fmtAmount(v)} ${esc(c)}`).join('<br>') || '—';
+  };
+  const receivables = sumBy(invoices, i => i.status === 'sent' || i.status === 'overdue');
+  const paidSum = sumBy(invoices, i => i.status === 'paid');
+  const overdueSum = sumBy(invoices, i => i.status === 'overdue');
+  const expenseSum = sumBy(expenses, () => true);
+  const netSum = (() => {
+    const m = {};
+    for (const i of invoices) if (i.status === 'paid') m[i.currency] = (m[i.currency] || 0) + i.amount;
+    for (const e of expenses) m[e.currency] = (m[e.currency] || 0) - e.amount;
+    return Object.entries(m).sort().map(([c, v]) => `${fmtAmount(v)} ${esc(c)}`).join('<br>') || '—';
+  })();
+
+  const invoiceRows = invoices.length ? invoices.map(i => {
+    const actions = [];
+    if (i.status === 'draft') actions.push(['sent', 'sent']);
+    if (i.status === 'sent' || i.status === 'overdue') actions.push(['paid', 'paid']);
+    return `<tr>
+      <td>#${i.id} <b>${esc(i.client)}</b>${i.deal_id ? `<br><a class="muted" href="/deal/${i.deal_id}">🔗 linked deal</a>` : ''}${i.notes ? `<br><span class="muted">${esc(i.notes)}</span>` : ''}</td>
+      <td class="qty">${fmtAmount(i.amount)} ${esc(i.currency)}</td>
+      <td class="muted">${esc(i.due_date || '—')}</td>
+      <td>${invoiceStatusBadge(i.status)}</td>
+      <td>${actions.map(([s, label]) => `<form method="POST" action="/accounting/invoices/${i.id}/status" style="display:inline"><input type="hidden" name="status" value="${s}"><button class="btn btn-sm btn-outline" type="submit">${esc(t(lang, 'acct.mark'))} ${esc(label)}</button></form>`).join(' ')}</td>
+    </tr>`;
+  }).join('') : `<tr><td colspan="5" class="muted">${esc(t(lang, 'common.none'))}</td></tr>`;
+
+  const expenseRows = expenses.length ? expenses.map(e => `<tr>
+      <td><b>${esc(e.category)}</b>${e.notes ? `<br><span class="muted">${esc(e.notes)}</span>` : ''}</td>
+      <td class="qty">−${fmtAmount(e.amount)} ${esc(e.currency)}</td>
+      <td class="muted">${esc(e.spent_on || e.created_at.slice(0, 10))}</td>
+    </tr>`).join('') : `<tr><td colspan="3" class="muted">${esc(t(lang, 'common.none'))}</td></tr>`;
+
+  // Ledger: invoices (+) and expenses (−) merged chronologically with a running balance.
+  const entries = [];
+  for (const i of invoices) entries.push({ date: (i.due_date || i.created_at.slice(0, 10)), text: `Invoice #${i.id} — ${i.client} (${i.status})`, amount: i.amount, currency: i.currency, kind: 'invoice' });
+  for (const e of expenses) entries.push({ date: (e.spent_on || e.created_at.slice(0, 10)), text: `Expense — ${e.category}${e.notes ? ': ' + e.notes : ''}`, amount: -e.amount, currency: e.currency, kind: 'expense' });
+  entries.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
+  let running = 0;
+  const ledgerRows = entries.length ? entries.map(en => {
+    running += en.amount;
+    return `<tr><td class="muted">${esc(en.date)}</td><td>${esc(en.text)}</td>
+      <td class="qty" style="color:${en.amount >= 0 ? 'var(--mint)' : 'var(--danger)'}">${en.amount >= 0 ? '+' : ''}${fmtAmount(en.amount)} ${esc(en.currency)}</td>
+      <td class="qty">${fmtAmount(running)}</td></tr>`;
+  }).join('') : `<tr><td colspan="4" class="muted">${esc(t(lang, 'common.none'))}</td></tr>`;
+
+  const insights = db.prepare(`SELECT * FROM agent_insights WHERE company_id = ? AND agent = 'ACCOUNTING AGENT' ORDER BY id DESC LIMIT 5`).all(myId);
+  const insightsHtml = insights.length
+    ? `<div class="card agent-insights" data-reveal><h3>🤖 ${esc(t(lang, 'acct.insights'))}</h3><ul>${insights.map(g => `<li>${g.level === 'warn' ? '⚠️' : 'ℹ️'} ${esc(g.text)} <span class="muted">· ${esc(g.created_at.slice(0, 10))}</span></li>`).join('')}</ul></div>` : '';
+
+  const dealOpts = `<option value="">—</option>` + myDeals.map(d => `<option value="${d.id}">${esc(d.deal_number || ('#' + d.id))} ${esc(d.title.slice(0, 40))}</option>`).join('');
+  const body = `
+  <div class="feed-head" style="margin-bottom:12px"><h2 class="sec-h" style="margin:0">📒 ${esc(t(lang, 'acct.title'))}</h2>
+    <a class="btn btn-sm btn-outline" href="/accounting/export.csv">⬇ ${esc(t(lang, 'acct.export'))}</a></div>
+  <div class="stats">
+    <div class="stat card--cut" data-reveal style="--i:0" data-num="01"><div class="num gold" style="font-size:1.15rem">${receivables}</div><div class="lbl">${esc(t(lang, 'acct.receivables'))}</div></div>
+    <div class="stat card--cut" data-reveal style="--i:1" data-num="02"><div class="num mint" style="font-size:1.15rem">${paidSum}</div><div class="lbl">${esc(t(lang, 'acct.paid'))}</div></div>
+    <div class="stat card--cut" data-reveal style="--i:2" data-num="03"><div class="num" style="font-size:1.15rem;color:var(--danger)">${overdueSum}</div><div class="lbl">${esc(t(lang, 'acct.overdue'))}</div></div>
+    <div class="stat card--cut" data-reveal style="--i:3" data-num="04"><div class="num" style="font-size:1.15rem">${expenseSum}</div><div class="lbl">${esc(t(lang, 'acct.expenses'))}</div></div>
+    <div class="stat card--cut" data-reveal style="--i:4" data-num="05"><div class="num gold" style="font-size:1.15rem">${netSum}</div><div class="lbl">${esc(t(lang, 'acct.net'))}</div></div>
+  </div>
+  ${insightsHtml}
+  <div class="grid2" style="align-items:start">
+    <div class="card" data-reveal><h3>🧾 ${esc(t(lang, 'acct.newinvoice'))}</h3>
+      <form method="POST" action="/accounting/invoices">
+        <label>${esc(t(lang, 'acct.client'))} *</label><input type="text" name="client" required maxlength="160">
+        <div class="grid2" style="gap:10px">
+          <div><label>${esc(t(lang, 'common.amount'))} *</label><input type="number" name="amount" min="0.01" step="any" required></div>
+          <div><label>${esc(t(lang, 'common.currency'))}</label><select name="currency">${optionsHtml(DEAL_CURRENCIES, 'USD')}</select></div>
+        </div>
+        <label>${esc(t(lang, 'acct.duedate'))}</label><input type="date" name="due_date">
+        <label>${esc(t(lang, 'acct.linkeddeal'))} (${esc(t(lang, 'common.optional'))})</label><select name="deal_id">${dealOpts}</select>
+        <label>${esc(t(lang, 'common.notes'))}</label><textarea name="notes" rows="2" maxlength="500"></textarea>
+        <button class="btn" type="submit">${esc(t(lang, 'common.save'))}</button>
+      </form>
+    </div>
+    <div class="card" data-reveal><h3>💸 ${esc(t(lang, 'acct.recordexpense'))}</h3>
+      <form method="POST" action="/accounting/expenses">
+        <label>${esc(t(lang, 'common.category'))} *</label><select name="category">${optionsHtml(EXPENSE_CATEGORIES, 'General')}</select>
+        <div class="grid2" style="gap:10px">
+          <div><label>${esc(t(lang, 'common.amount'))} *</label><input type="number" name="amount" min="0.01" step="any" required></div>
+          <div><label>${esc(t(lang, 'common.currency'))}</label><select name="currency">${optionsHtml(DEAL_CURRENCIES, 'USD')}</select></div>
+        </div>
+        <label>${esc(t(lang, 'acct.spenton'))}</label><input type="date" name="spent_on">
+        <label>${esc(t(lang, 'common.notes'))}</label><textarea name="notes" rows="2" maxlength="500"></textarea>
+        <button class="btn" type="submit">${esc(t(lang, 'common.save'))}</button>
+      </form>
+    </div>
+  </div>
+  <div class="card" data-reveal><h3>🧾 ${esc(t(lang, 'acct.invoices'))}</h3>
+    <table><tr><th>${esc(t(lang, 'acct.client'))}</th><th>${esc(t(lang, 'common.amount'))}</th><th>${esc(t(lang, 'acct.duedate'))}</th><th>${esc(t(lang, 'common.status'))}</th><th></th></tr>${invoiceRows}</table></div>
+  <div class="card" data-reveal><h3>💸 ${esc(t(lang, 'acct.expenses'))}</h3>
+    <table><tr><th>${esc(t(lang, 'common.category'))}</th><th>${esc(t(lang, 'common.amount'))}</th><th>${esc(t(lang, 'common.date'))}</th></tr>${expenseRows}</table></div>
+  <div class="card" data-reveal><h3>📚 ${esc(t(lang, 'acct.ledger'))}</h3>
+    <table><tr><th>${esc(t(lang, 'common.date'))}</th><th>Entry</th><th>${esc(t(lang, 'common.amount'))}</th><th>${esc(t(lang, 'acct.balance'))}</th></tr>${ledgerRows}</table></div>`;
+  res.send(page(t(lang, 'acct.title'), body, req.user, req.query.msg, req.query.err, 'dashboard'));
+});
+
+app.post('/accounting/invoices', requireCompany, (req, res) => {
+  const client = String(req.body.client || '').trim().slice(0, 160);
+  const amount = parseFloat(req.body.amount);
+  if (!client || !isFinite(amount) || amount <= 0) return res.redirect('/accounting?err=' + encodeURIComponent('Client and a positive amount are required.'));
+  const currency = DEAL_CURRENCIES.includes(req.body.currency) ? req.body.currency : 'USD';
+  const due = /^\d{4}-\d{2}-\d{2}$/.test(req.body.due_date || '') ? req.body.due_date : '';
+  const notes = String(req.body.notes || '').trim().slice(0, 500);
+  const dealId = parseInt(req.body.deal_id, 10);
+  const linked = dealId && db.prepare('SELECT id FROM deals WHERE id = ? AND company_id = ?').get(dealId, req.user.id) ? dealId : null;
+  const r = db.prepare('INSERT INTO invoices (company_id, client, amount, currency, due_date, notes, deal_id, status, created_at) VALUES (?,?,?,?,?,?,?,?,?)')
+    .run(req.user.id, client, amount, currency, due, notes, linked, 'draft', now());
+  accountingAgentInvoice(req.user.id, { id: r.lastInsertRowid, client, amount, currency });
+  audit('ACCOUNTING AGENT', 'invoice created', 'pass', `Company #${req.user.id} created invoice #${r.lastInsertRowid} for "${client.slice(0, 60)}"`);
+  res.redirect('/accounting?msg=' + encodeURIComponent('Invoice #' + r.lastInsertRowid + ' created (draft).'));
+});
+
+app.post('/accounting/invoices/:id/status', requireCompany, (req, res) => {
+  const inv = db.prepare('SELECT * FROM invoices WHERE id = ? AND company_id = ?').get(parseInt(req.params.id, 10), req.user.id);
+  if (!inv) return res.redirect('/accounting?err=' + encodeURIComponent('Invoice not found.'));
+  const next = String(req.body.status || '');
+  const allowed = { draft: ['sent'], sent: ['paid'], overdue: ['paid'], paid: [] };
+  if (!(allowed[inv.status] || []).includes(next)) return res.redirect('/accounting?err=' + encodeURIComponent(`Cannot move an invoice from ${inv.status} to ${next}.`));
+  db.prepare('UPDATE invoices SET status = ? WHERE id = ?').run(next, inv.id);
+  audit('ACCOUNTING AGENT', 'invoice status', 'pass', `Invoice #${inv.id} (${req.user.name}) ${inv.status} → ${next}`);
+  if (next === 'paid') agentInsight(req.user.id, 'ACCOUNTING AGENT', 'info', `Invoice #${inv.id} from "${inv.client}" marked paid — ${fmtAmount(inv.amount)} ${inv.currency} received.`);
+  res.redirect('/accounting?msg=' + encodeURIComponent(`Invoice #${inv.id} marked ${next}.`));
+});
+
+app.post('/accounting/expenses', requireCompany, (req, res) => {
+  const category = String(req.body.category || '').trim().slice(0, 60) || 'General';
+  const amount = parseFloat(req.body.amount);
+  if (!isFinite(amount) || amount <= 0) return res.redirect('/accounting?err=' + encodeURIComponent('A positive amount is required.'));
+  const currency = DEAL_CURRENCIES.includes(req.body.currency) ? req.body.currency : 'USD';
+  const spent = /^\d{4}-\d{2}-\d{2}$/.test(req.body.spent_on || '') ? req.body.spent_on : '';
+  const notes = String(req.body.notes || '').trim().slice(0, 500);
+  const r = db.prepare('INSERT INTO expenses (company_id, category, amount, currency, spent_on, notes, created_at) VALUES (?,?,?,?,?,?,?)')
+    .run(req.user.id, category, amount, currency, spent, notes, now());
+  accountingAgentExpense(req.user.id, { id: r.lastInsertRowid, category, amount, currency });
+  audit('ACCOUNTING AGENT', 'expense recorded', 'pass', `Company #${req.user.id} recorded ${fmtAmount(amount)} ${currency} expense (${category})`);
+  res.redirect('/accounting?msg=' + encodeURIComponent('Expense recorded.'));
+});
+
+/** CSV export of the combined ledger (invoices + expenses). */
+app.get('/accounting/export.csv', requireCompany, (req, res) => {
+  const myId = req.user.id;
+  const csvCell = (v) => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+  const lines = [['type', 'id', 'date', 'party_or_category', 'amount', 'currency', 'status', 'notes'].map(csvCell).join(',')];
+  for (const i of db.prepare('SELECT * FROM invoices WHERE company_id = ? ORDER BY created_at ASC').all(myId)) {
+    lines.push(['invoice', i.id, i.due_date || i.created_at.slice(0, 10), i.client, i.amount, i.currency, i.status, i.notes].map(csvCell).join(','));
+  }
+  for (const e of db.prepare('SELECT * FROM expenses WHERE company_id = ? ORDER BY created_at ASC').all(myId)) {
+    lines.push(['expense', e.id, e.spent_on || e.created_at.slice(0, 10), e.category, -e.amount, e.currency, '', e.notes].map(csvCell).join(','));
+  }
+  audit('ACCOUNTING AGENT', 'ledger export', 'pass', `Company #${myId} exported the accounting ledger CSV (${lines.length - 1} rows)`);
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="dealzoin-ledger-${now().slice(0, 10)}.csv"`);
+  res.send('﻿' + lines.join('\r\n') + '\r\n');
+});
+
+// ----- (5) WAREHOUSE AGENT (lite Zoho): items, stock movements, low-stock alerts -----
+app.get('/warehouse', requireCompany, (req, res) => {
+  const lang = req.user.lang || 'en';
+  const myId = req.user.id;
+  const items = db.prepare('SELECT * FROM warehouse_items WHERE company_id = ? ORDER BY name ASC LIMIT 300').all(myId);
+  const lowCount = items.filter(i => i.quantity <= i.reorder_level).length;
+  const myDeals = db.prepare('SELECT id, title, deal_number FROM deals WHERE company_id = ? ORDER BY created_at DESC LIMIT 50').all(myId);
+  const dealOpts = `<option value="">—</option>` + myDeals.map(d => `<option value="${d.id}">${esc(d.deal_number || ('#' + d.id))} ${esc(d.title.slice(0, 40))}</option>`).join('');
+
+  const filterItem = parseInt(req.query.item, 10) || 0;
+  const moves = filterItem
+    ? db.prepare('SELECT m.*, i.name AS item_name, i.sku FROM warehouse_movements m JOIN warehouse_items i ON i.id = m.item_id WHERE m.company_id = ? AND m.item_id = ? ORDER BY m.id DESC LIMIT 100').all(myId, filterItem)
+    : db.prepare('SELECT m.*, i.name AS item_name, i.sku FROM warehouse_movements m JOIN warehouse_items i ON i.id = m.item_id WHERE m.company_id = ? ORDER BY m.id DESC LIMIT 50').all(myId);
+
+  const itemRows = items.length ? items.map(i => {
+    const low = i.quantity <= i.reorder_level;
+    return `<tr${low ? ' class="row-lowstock"' : ''}>
+      <td><b>${esc(i.sku)}</b></td>
+      <td><b>${esc(i.name)}</b>${i.location ? `<br><span class="muted">📍 ${esc(i.location)}</span>` : ''}</td>
+      <td class="qty">${fmtAmount(i.quantity)} ${esc(i.unit)}${low ? ` <span class="badge badge-rejected">${esc(t(lang, 'wh.lowstock'))}</span>` : ''}</td>
+      <td class="muted">${fmtAmount(i.reorder_level)} ${esc(i.unit)}</td>
+      <td>
+        <form method="POST" action="/warehouse/items/${i.id}/move" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+          <select name="direction" style="margin:0"><option value="IN">${esc(t(lang, 'wh.in'))}</option><option value="OUT">${esc(t(lang, 'wh.out'))}</option></select>
+          <input type="number" name="quantity" min="0.01" step="any" required placeholder="0" style="width:90px;margin:0">
+          <input type="text" name="note" maxlength="200" placeholder="${esc(t(lang, 'common.notes'))} (${esc(t(lang, 'common.optional'))})" style="width:150px;margin:0">
+          <select name="deal_id" style="margin:0">${dealOpts}</select>
+          <button class="btn btn-sm" type="submit">${esc(t(lang, 'wh.movement'))}</button>
+          <a class="btn btn-sm btn-outline" href="/warehouse?item=${i.id}#history">${esc(t(lang, 'wh.history'))}</a>
+        </form>
+      </td>
+    </tr>`;
+  }).join('') : `<tr><td colspan="5" class="muted">${esc(t(lang, 'common.none'))}</td></tr>`;
+
+  const moveRows = moves.length ? moves.map(m => `<tr>
+      <td class="muted">${esc(m.created_at.slice(0, 16).replace('T', ' '))}</td>
+      <td><b>${esc(m.sku)}</b> ${esc(m.item_name)}</td>
+      <td><span class="badge ${m.direction === 'IN' ? 'badge-pass' : 'badge-sealed'}">${m.direction === 'IN' ? '⬆ IN' : '⬇ OUT'}</span> ${fmtAmount(m.quantity)}</td>
+      <td>${m.deal_id ? `<a href="/deal/${m.deal_id}">🔗 deal</a> ` : ''}<span class="muted">${esc(m.note || '')}</span></td>
+    </tr>`).join('') : `<tr><td colspan="4" class="muted">${esc(t(lang, 'common.none'))}</td></tr>`;
+
+  const insights = db.prepare(`SELECT * FROM agent_insights WHERE company_id = ? AND agent = 'WAREHOUSE AGENT' ORDER BY id DESC LIMIT 5`).all(myId);
+  const insightsHtml = insights.length
+    ? `<div class="card agent-insights" data-reveal><h3>🤖 ${esc(t(lang, 'acct.insights'))}</h3><ul>${insights.map(g => `<li>${g.level === 'warn' ? '⚠️' : 'ℹ️'} ${esc(g.text)} <span class="muted">· ${esc(g.created_at.slice(0, 10))}</span></li>`).join('')}</ul></div>` : '';
+
+  const body = `
+  <h2 class="sec-h" style="margin-top:0">📦 ${esc(t(lang, 'wh.title'))}</h2>
+  <div class="stats">
+    <div class="stat card--cut" data-reveal style="--i:0" data-num="01"><div class="num gold" data-count="${items.length}">${items.length}</div><div class="lbl">${esc(t(lang, 'wh.items'))}</div></div>
+    <div class="stat card--cut" data-reveal style="--i:1" data-num="02"><div class="num${lowCount ? '" style="color:var(--danger)' : ' mint'}" data-count="${lowCount}">${lowCount}</div><div class="lbl">${esc(t(lang, 'wh.lowstock'))}</div></div>
+  </div>
+  ${insightsHtml}
+  <div class="card" data-reveal><h3>➕ ${esc(t(lang, 'wh.additem'))}</h3>
+    <form method="POST" action="/warehouse/items">
+      <div class="grid2" style="gap:10px">
+        <div><label>${esc(t(lang, 'wh.name'))} *</label><input type="text" name="name" required maxlength="160"></div>
+        <div><label>${esc(t(lang, 'wh.unit'))}</label><input type="text" name="unit" maxlength="30" value="units" placeholder="units / kg / pallets…"></div>
+      </div>
+      <div class="grid2" style="gap:10px">
+        <div><label>${esc(t(lang, 'wh.quantity'))} (initial)</label><input type="number" name="quantity" min="0" step="any" value="0"></div>
+        <div><label>${esc(t(lang, 'wh.reorder'))}</label><input type="number" name="reorder_level" min="0" step="any" value="0"></div>
+      </div>
+      <label>${esc(t(lang, 'wh.location'))}</label><input type="text" name="location" maxlength="160" placeholder="e.g. JAFZA warehouse 4, rack B-12">
+      <button class="btn" type="submit">${esc(t(lang, 'wh.additem'))}</button>
+      <span class="muted" style="margin-inline-start:8px">SKU is auto-generated (DZ-…)</span>
+    </form>
+  </div>
+  <div class="card" data-reveal><h3>🗃️ ${esc(t(lang, 'wh.items'))}</h3>
+    <table><tr><th>SKU</th><th>${esc(t(lang, 'wh.name'))}</th><th>${esc(t(lang, 'wh.current'))}</th><th>${esc(t(lang, 'wh.reorder'))}</th><th>${esc(t(lang, 'wh.movement'))}</th></tr>${itemRows}</table></div>
+  <div class="card" data-reveal id="history"><h3>🧾 ${esc(t(lang, 'wh.history'))}${filterItem ? ` — <a href="/warehouse#history">${esc(t(lang, 'common.back'))}</a>` : ''}</h3>
+    <table><tr><th>${esc(t(lang, 'common.date'))}</th><th>${esc(t(lang, 'wh.items'))}</th><th>${esc(t(lang, 'wh.movement'))}</th><th>${esc(t(lang, 'common.notes'))}</th></tr>${moveRows}</table></div>`;
+  res.send(page(t(lang, 'wh.title'), body, req.user, req.query.msg, req.query.err, 'dashboard'));
+});
+
+app.post('/warehouse/items', requireCompany, (req, res) => {
+  const name = String(req.body.name || '').trim().slice(0, 160);
+  if (!name) return res.redirect('/warehouse?err=' + encodeURIComponent('Item name is required.'));
+  const unit = String(req.body.unit || 'units').trim().slice(0, 30) || 'units';
+  const qty = Math.max(0, parseFloat(req.body.quantity) || 0);
+  const reorder = Math.max(0, parseFloat(req.body.reorder_level) || 0);
+  const location = String(req.body.location || '').trim().slice(0, 160);
+  const sku = nextSku(req.user.id);
+  db.prepare('INSERT INTO warehouse_items (company_id, sku, name, unit, quantity, reorder_level, location, created_at) VALUES (?,?,?,?,?,?,?,?)')
+    .run(req.user.id, sku, name, unit, qty, reorder, location, now());
+  audit('WAREHOUSE AGENT', 'item created', 'pass', `Company #${req.user.id} added item ${sku} "${name.slice(0, 60)}" (qty ${qty} ${unit}, reorder at ${reorder})`);
+  if (qty <= reorder) {
+    agentInsight(req.user.id, 'WAREHOUSE AGENT', 'warn', `New item ${sku} "${name}" starts at/below its reorder level (${fmtAmount(qty)} ≤ ${fmtAmount(reorder)} ${unit}).`);
+  }
+  res.redirect('/warehouse?msg=' + encodeURIComponent(`Item ${sku} added.`));
+});
+
+app.post('/warehouse/items/:id/move', requireCompany, (req, res) => {
+  const item = db.prepare('SELECT * FROM warehouse_items WHERE id = ? AND company_id = ?').get(parseInt(req.params.id, 10), req.user.id);
+  if (!item) return res.redirect('/warehouse?err=' + encodeURIComponent('Item not found.'));
+  const dir = req.body.direction === 'OUT' ? 'OUT' : 'IN';
+  const qty = parseFloat(req.body.quantity);
+  if (!isFinite(qty) || qty <= 0) return res.redirect('/warehouse?err=' + encodeURIComponent('A positive quantity is required.'));
+  if (dir === 'OUT' && qty > item.quantity) return res.redirect('/warehouse?err=' + encodeURIComponent(`Not enough stock — only ${fmtAmount(item.quantity)} ${item.unit} available.`));
+  const note = String(req.body.note || '').trim().slice(0, 200);
+  const dealId = parseInt(req.body.deal_id, 10);
+  const linked = dealId && db.prepare('SELECT id FROM deals WHERE id = ? AND company_id = ?').get(dealId, req.user.id) ? dealId : null;
+  const before = item.quantity;
+  const after = dir === 'IN' ? before + qty : before - qty;
+  const tx = db.transaction(() => {
+    db.prepare('UPDATE warehouse_items SET quantity = ? WHERE id = ?').run(after, item.id);
+    db.prepare('INSERT INTO warehouse_movements (item_id, company_id, direction, quantity, note, deal_id, created_at) VALUES (?,?,?,?,?,?,?)')
+      .run(item.id, req.user.id, dir, qty, note, linked, now());
+  });
+  tx();
+  // WAREHOUSE AGENT: low-stock alert + unusual-movement flag.
+  if (after <= item.reorder_level && before > item.reorder_level) {
+    agentInsight(req.user.id, 'WAREHOUSE AGENT', 'warn', `Low stock: ${item.sku} "${item.name}" is at ${fmtAmount(after)} ${item.unit} (reorder level ${fmtAmount(item.reorder_level)}).`);
+    notify(req.user.id, 'warehouse_low_stock', `⚠️ Low stock: ${item.sku} "${item.name}" — ${fmtAmount(after)} ${item.unit} left (reorder at ${fmtAmount(item.reorder_level)}).`, '/warehouse');
+  }
+  if (dir === 'OUT' && before > 0 && qty > before * 0.8) {
+    agentInsight(req.user.id, 'WAREHOUSE AGENT', 'warn', `Unusual movement: a single OUT of ${fmtAmount(qty)} ${item.unit} removed over 80% of the stock of ${item.sku} "${item.name}"${note ? ` (note: ${note})` : ''}.`);
+  }
+  audit('WAREHOUSE AGENT', 'stock movement', 'pass', `${item.sku} ${dir} ${qty} ${item.unit} → ${fmtAmount(after)} in stock (company #${req.user.id})`);
+  res.redirect('/warehouse?msg=' + encodeURIComponent(`${item.sku}: ${dir} ${fmtAmount(qty)} ${item.unit} — ${fmtAmount(after)} in stock.`));
+});
+
+// ----- (6) ADVERTISING AGENT — local template-based marketing copy generator -----
+const AD_TONES = {
+  professional: {
+    openings: [
+      'We are pleased to present {product} — built for organizations operating in {market}.',
+      'For decision-makers in {market}: {product} is now available through our Dealzoin storefront.',
+      '{product} represents our continued commitment to excellence in {market}.',
+      'Serious businesses in {market} choose substance over noise. That is exactly what {product} delivers.'
+    ],
+    cta: ['Contact us via Dealzoin to discuss terms.', 'Message us here on Dealzoin for a structured quotation.', 'Open a negotiation with us — we respond within one business day.']
+  },
+  bold: {
+    openings: [
+      '{market}, meet {product}. This changes the game.',
+      'Stop settling. {product} just raised the bar for {market}.',
+      'The wait is over: {product} has landed in {market}.',
+      '{product} is not an upgrade. It is a statement — now available for {market}.'
+    ],
+    cta: ['First movers win — open a negotiation today.', 'DM us on Dealzoin before your competitors do.', 'Dealzoin members get priority allocation. Move fast.']
+  },
+  friendly: {
+    openings: [
+      'Hello {market}! 👋 We would love to introduce you to {product}.',
+      'Good news for {market}: {product} is here, and we think you will love it.',
+      'We built {product} with partners in {market} in mind — come take a look!',
+      'A warm hello to our friends in {market} — {product} is officially available.'
+    ],
+    cta: ['Say hello in our Dealzoin chat — we are happy to help.', 'Drop us a message and let’s talk details.', 'Curious? Send us an LOI and we’ll take it from there.']
+  }
+};
+const AD_HASHTAGS = ['#B2B', '#Trade', '#Dealzoin', '#GlobalTrade', '#Business'];
+const AD_BEST_TIMES = [
+  'Tuesday 09:00–11:00 (your market’s local time) — mid-morning decision window',
+  'Wednesday 13:00–15:00 — post-lunch procurement browsing peak',
+  'Sunday 08:00–10:00 (Gulf markets) — start-of-week planning window',
+  'Thursday 10:00–12:00 — pre-weekend deal-making surge'
+];
+/** Deterministic pick (stable per input) so "Regenerate" varies only with the seed. */
+function adPick(arr, seed) { return arr[Math.abs(seed) % arr.length]; }
+/** ADVERTISING AGENT: compose a polished marketing post locally — no external AI API. */
+function generateAdCopy(product, market, benefits, tone, seed) {
+  const tonePack = AD_TONES[tone] || AD_TONES.professional;
+  const p = product.trim(), m = market.trim();
+  const benefitList = benefits.split(/[\n,;]+/).map(b => b.trim()).filter(Boolean).slice(0, 6);
+  const opening = adPick(tonePack.openings, seed).replaceAll('{product}', p).replaceAll('{market}', m);
+  const benefitBlock = benefitList.length
+    ? (tone === 'bold' ? 'Why it wins:' : tone === 'friendly' ? 'What you’ll appreciate:' : 'Key advantages:') + '\n'
+      + benefitList.map(b => `✔ ${b.replace(/^[•\-✔]\s*/, '')}`).join('\n')
+    : '';
+  const cta = adPick(tonePack.cta, seed + 1);
+  const tags = [...AD_HASHTAGS, '#' + m.replace(/[^A-Za-z0-9]/g, '')].filter((v, i, a) => v.length > 1 && a.indexOf(v) === i).join(' ');
+  return { copy: `${opening}\n\n${benefitBlock ? benefitBlock + '\n\n' : ''}${cta}\n\n${tags}`, bestTime: adPick(AD_BEST_TIMES, seed + 2) };
+}
+app.get('/promote', requireCompany, (req, res) => {
+  const lang = req.user.lang || 'en';
+  const body = `
+  <div class="card" style="max-width:620px;margin:0 auto" data-reveal>
+    <div class="kicker">📣 ADVERTISING AGENT</div>
+    <h2 style="margin:6px 0 10px">${esc(t(lang, 'promo.title'))}</h2>
+    <p class="muted" style="margin-bottom:12px">Describe your offer — the ADVERTISING AGENT drafts a polished marketing post locally (no external AI). You review and edit it before anything is published. Promotional posts carry a subtle "Promoted" badge.</p>
+    <form method="POST" action="/promote/preview">
+      <label>${esc(t(lang, 'promo.product'))} *</label><input type="text" name="product" required maxlength="120" placeholder="e.g. Cold-chain logistics for pharma">
+      <label>${esc(t(lang, 'promo.market'))} *</label><input type="text" name="market" required maxlength="120" placeholder="e.g. GCC healthcare distributors">
+      <label>${esc(t(lang, 'promo.benefits'))} (${esc(t(lang, 'common.optional'))}, one per line)</label>
+      <textarea name="benefits" rows="4" maxlength="800" placeholder="GDP-certified fleet&#10;Real-time temperature telemetry&#10;48h GCC delivery"></textarea>
+      <label>${esc(t(lang, 'promo.tone'))}</label>
+      <select name="tone">${optionsHtml(['professional', 'bold', 'friendly'], 'professional')}</select>
+      <button class="btn" type="submit">✨ ${esc(t(lang, 'promo.generate'))}</button>
+    </form>
+  </div>`;
+  res.send(page(t(lang, 'promo.title'), body, req.user, req.query.msg, req.query.err, 'new'));
+});
+app.post('/promote/preview', requireCompany, (req, res) => {
+  const lang = req.user.lang || 'en';
+  const product = String(req.body.product || '').trim().slice(0, 120);
+  const market = String(req.body.market || '').trim().slice(0, 120);
+  const benefits = String(req.body.benefits || '').slice(0, 800);
+  const tone = AD_TONES[req.body.tone] ? req.body.tone : 'professional';
+  const seed = parseInt(req.body.seed, 10) || 0;
+  if (!product || !market) return res.redirect('/promote?err=' + encodeURIComponent('Product and target market are required.'));
+  const { copy, bestTime } = generateAdCopy(product, market, benefits, tone, seed);
+  const body = `
+  <div class="card" style="max-width:640px;margin:0 auto" data-reveal>
+    <div class="kicker">📣 ADVERTISING AGENT · ${esc(tone)}</div>
+    <h2 style="margin:6px 0 10px">${esc(t(lang, 'promo.preview'))}</h2>
+    <form method="POST" action="/promote/publish">
+      <textarea name="body" rows="10" maxlength="2000" required style="white-space:pre-wrap">${esc(copy)}</textarea>
+      <input type="hidden" name="product" value="${esc(product)}">
+      <input type="hidden" name="market" value="${esc(market)}">
+      <input type="hidden" name="tone" value="${esc(tone)}">
+      <input type="hidden" name="benefits" value="${esc(benefits)}">
+      <p class="muted" style="margin:6px 0 12px">🕒 ${esc(t(lang, 'promo.besttime'))}: <b>${esc(bestTime)}</b> (suggested by the agent — just for fun)</p>
+      <button class="btn btn-green" type="submit">🚀 ${esc(t(lang, 'promo.publish'))}</button>
+      <button class="btn btn-outline" type="submit" formaction="/promote/preview" name="seed" value="${seed + 1}" formnovalidate>🔄 ${esc(t(lang, 'promo.regenerate'))}</button>
+      <a class="btn btn-outline" href="/promote" style="margin-inline-start:8px">${esc(t(lang, 'common.back'))}</a>
+    </form>
+  </div>`;
+  res.send(page(t(lang, 'promo.title'), body, req.user, null, null, 'new'));
+});
+app.post('/promote/publish', requireCompany, (req, res) => {
+  const bodyTxt = String(req.body.body || '').trim().slice(0, 2000);
+  if (!bodyTxt) return res.redirect('/promote?err=' + encodeURIComponent('The post cannot be empty.'));
+  const product = String(req.body.product || '').trim().slice(0, 120);
+  const market = String(req.body.market || '').trim().slice(0, 120);
+  const tone = AD_TONES[req.body.tone] ? req.body.tone : 'professional';
+  db.prepare('INSERT INTO posts (company_id, body, created_at, author_name, is_promo) VALUES (?,?,?,?,1)')
+    .run(req.user.id, bodyTxt, now(), req.user.memberName || null);
+  audit('ADVERTISING AGENT', 'promo post published', 'pass', `"${req.user.name}" published a promotional post (${tone}) for "${product.slice(0, 60)}" targeting "${market.slice(0, 60)}"`);
+  res.redirect('/timeline?msg=' + encodeURIComponent('Promotional post published to the feed 🚀'));
 });
 
 // ============================= 404 & SERVER START =============================
