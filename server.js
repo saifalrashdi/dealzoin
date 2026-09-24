@@ -359,13 +359,16 @@ try { db.exec('ALTER TABLE negotiations ADD COLUMN split_proposed_by INTEGER'); 
 try { db.exec('ALTER TABLE companies ADD COLUMN agreed_terms_version INTEGER DEFAULT 0'); } catch (e) { /* column already exists */ }
 try { db.exec('ALTER TABLE companies ADD COLUMN agreed_at TEXT'); } catch (e) { /* column already exists */ }
 try { db.exec("ALTER TABLE companies ADD COLUMN theme_choice TEXT DEFAULT 'titan'"); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE companies ADD COLUMN theme_custom TEXT'); } catch (e) { /* column already exists */ }
 try { db.exec('ALTER TABLE deals ADD COLUMN cargo_qty REAL'); } catch (e) { /* column already exists */ }
 try { db.exec("ALTER TABLE deals ADD COLUMN cargo_unit TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
 try { db.exec('ALTER TABLE negotiations ADD COLUMN loi_expires_at TEXT'); } catch (e) { /* column already exists */ }
 try { db.exec("ALTER TABLE negotiations ADD COLUMN offer_incoterm TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
-// Incoterm typo migration: historical 'CRF' values were meant to be CFR (Cost & Freight).
+// Incoterm migrations: 'CRF' was a typo for CFR; FOP was removed from the platform (all deals are platform-tracked now).
 try { db.exec("UPDATE deals SET incoterm = 'CFR' WHERE incoterm = 'CRF'"); } catch (e) { /* best-effort */ }
 try { db.exec("UPDATE negotiations SET offer_incoterm = 'CFR' WHERE offer_incoterm = 'CRF'"); } catch (e) { /* best-effort */ }
+try { db.exec("UPDATE deals SET incoterm = 'CIF' WHERE incoterm = 'FOP'"); } catch (e) { /* best-effort */ }
+try { db.exec("UPDATE negotiations SET offer_incoterm = 'CIF' WHERE offer_incoterm = 'FOP'"); } catch (e) { /* best-effort */ }
 
 // Commission payment gate (old databases keep booting; finalized legacy deals stay 'none' = unaffected).
 try { db.exec("ALTER TABLE deals ADD COLUMN payment_status TEXT DEFAULT 'none'"); } catch (e) { /* column already exists */ }
@@ -382,6 +385,24 @@ try { db.exec('ALTER TABLE deals ADD COLUMN escrow_dispute_at TEXT'); } catch (e
 // proposal parked on the negotiation while the parties negotiate.
 try { db.exec('ALTER TABLE deals ADD COLUMN payment_milestones TEXT'); } catch (e) { /* column already exists */ }
 try { db.exec('ALTER TABLE negotiations ADD COLUMN milestone_proposal TEXT'); } catch (e) { /* column already exists */ }
+
+// Milestone release requests: advancing the shipment status onto an agreed payment milestone
+// raises an admin approval request (approve/deny the release). The money itself is flow-preview.
+db.exec(`CREATE TABLE IF NOT EXISTS milestone_releases (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  deal_id      INTEGER NOT NULL,
+  ms_index     INTEGER NOT NULL,                 -- index into deals.payment_milestones
+  label        TEXT NOT NULL,
+  pct          INTEGER NOT NULL,
+  amount       REAL,                             -- pct x agreed value (display only)
+  currency     TEXT DEFAULT '',
+  status       TEXT NOT NULL DEFAULT 'pending_admin',  -- pending_admin | released | denied
+  triggered_by TEXT DEFAULT '',
+  admin_note   TEXT DEFAULT '',
+  created_at   TEXT NOT NULL,
+  decided_at   TEXT,
+  UNIQUE(deal_id, ms_index)
+)`);
 // (6) Receiving-country shipment agent: JSON nomination on the deal + a updates log table.
 try { db.exec('ALTER TABLE deals ADD COLUMN receiving_agent TEXT'); } catch (e) { /* column already exists */ }
 db.exec(`CREATE TABLE IF NOT EXISTS receiving_updates (
@@ -837,19 +858,65 @@ function parseMilestonesInput(body) {
 function milestoneSummaryText(ms) {
   return (ms || []).map(m => `${m.pct}% ${m.label} → ${m.status}`).join(' · ');
 }
-/** Read-only milestone rows with live unlock state (escrow panel). */
-function milestoneRowsHtml(ms, effIdx, confirmed) {
+/** Read-only milestone rows with live release state (escrow panel). releases = Map(ms_index -> milestone_releases row). */
+function milestoneRowsHtml(ms, effIdx, confirmed, releases) {
   return ms.map((m, i) => {
     const stIdx = DEAL_STATUSES.indexOf(m.status);
     let unlocked = effIdx >= 0 && stIdx >= 0 && effIdx >= stIdx;
     // A delivery-gated release only lands once the buyer has confirmed receipt.
     if (m.status === 'delivered' && !confirmed) unlocked = false;
-    return `<div class="ms-row ${unlocked ? 'is-unlocked' : ''}">
+    const rel = releases && releases.get(i);
+    let badge;
+    if (rel && rel.status === 'released') {
+      badge = `<span class="badge badge-contract">✅ release approved by admin</span>`;
+    } else if (rel && rel.status === 'denied') {
+      badge = `<span class="badge badge-sealed">⛔ release denied${rel.admin_note ? ` — ${esc(rel.admin_note)}` : ''}</span>`;
+    } else if (rel) {
+      badge = `<span class="badge">🛡️ awaiting admin approval</span>`;
+    } else {
+      badge = `<span class="badge ${unlocked ? 'badge-contract' : ''}">${unlocked ? '🔓 stage reached' : '⏳ locked'}</span>`;
+    }
+    return `<div class="ms-row ${rel && rel.status === 'released' ? 'is-unlocked' : ''}">
       <span class="ms-pct">${m.pct}%</span>
-      <span class="ms-body"><b>${esc(m.label)}</b><br><span class="muted">Unlocks at status: <b>${esc(m.status.toUpperCase())}</b>${m.status === 'delivered' ? ' + buyer receipt confirmation' : ''}</span></span>
-      <span class="badge ${unlocked ? 'badge-contract' : ''}">${unlocked ? '🔓 released (flow)' : '⏳ locked'}</span>
+      <span class="ms-body"><b>${esc(m.label)}</b>${rel && rel.amount ? ` <span class="muted">≈ ${esc(fmtAmount(rel.amount))} ${esc(rel.currency)}</span>` : ''}<br><span class="muted">Unlocks at status: <b>${esc(m.status.toUpperCase())}</b>${m.status === 'delivered' ? ' + buyer receipt confirmation' : ''} · admin approves each release</span></span>
+      ${badge}
     </div>`;
   }).join('');
+}
+
+/**
+ * Milestone release trigger — called after every deal-status change. When the new status
+ * reaches an AGREED milestone's stage (and none was requested yet), a release request is
+ * raised for the admin (approve/deny on the dashboard). Only agreed schedules trigger
+ * requests; the default 10/20/70 schedule stays purely visual. Delivery-gated milestones
+ * additionally need the buyer's receipt confirmation before the admin is asked.
+ */
+function triggerMilestoneReleases(deal, newStatus, user) {
+  const ms = parseMilestoneJson(deal.payment_milestones);
+  if (!ms) return;
+  const newIdx = DEAL_STATUSES.indexOf(newStatus);
+  if (newIdx < 0) return;
+  const dealNum = deal.deal_number || String(deal.id);
+  // Agreed value for the display amount: latest negotiation offer, falling back to the deal value.
+  let amountBase = NaN, cur = deal.currency || 'USD';
+  try {
+    const neg = db.prepare("SELECT offer_value, offer_currency FROM negotiations WHERE deal_id = ? AND offer_value IS NOT NULL AND offer_value != '' ORDER BY id DESC LIMIT 1").get(deal.id);
+    if (neg) { amountBase = parseFloat(String(neg.offer_value).replace(/[^0-9.]/g, '')); cur = neg.offer_currency || cur; }
+    else { amountBase = parseFloat(String(deal.value || '').replace(/[^0-9.]/g, '')); }
+  } catch (e) { /* amounts are decorative — never break the trigger */ }
+  const dealNow = db.prepare('SELECT buyer_received_confirmed_at FROM deals WHERE id = ?').get(deal.id);
+  const confirmed = !!(dealNow && dealNow.buyer_received_confirmed_at);
+  ms.forEach((m, i) => {
+    const stIdx = DEAL_STATUSES.indexOf(m.status);
+    if (stIdx < 0 || newIdx < stIdx) return;                       // stage not reached yet
+    if (m.status === 'delivered' && !confirmed) return;            // delivery gate: buyer must confirm receipt first
+    if (db.prepare('SELECT id FROM milestone_releases WHERE deal_id = ? AND ms_index = ?').get(deal.id, i)) return; // already requested
+    const amount = isFinite(amountBase) ? Math.round(amountBase * m.pct) / 100 : null;
+    db.prepare('INSERT INTO milestone_releases (deal_id, ms_index, label, pct, amount, currency, status, triggered_by, created_at) VALUES (?,?,?,?,?,?,?,?,?)')
+      .run(deal.id, i, m.label, m.pct, amount, cur, 'pending_admin', (user.isAdmin ? 'Admin' : user.name) || '', now());
+    audit('PAYMENT AGENT', 'milestone release requested', 'pass',
+      `Deal ${dealNum}: status "${newStatus.toUpperCase()}" unlocked milestone "${m.label}" (${m.pct}%${amount ? ` ≈ ${fmtAmount(amount)} ${cur}` : ''}) — awaiting admin release decision`);
+  });
 }
 
 /** (3)+(4) Escrow & payment protection panel — parties + admin only, clearly badged as a flow preview. */
@@ -888,10 +955,10 @@ function escrowPanelHtml(deal, user, isOwner, isBuyer) {
       <span class="muted">— the platform team has been alerted and will mediate between the parties.</span></p>`;
   } else if (confirmed) {
     confirmHtml = `<p style="margin-top:10px"><span class="badge badge-contract">✅ Buyer confirmed receipt of goods — ${esc(deal.buyer_received_confirmed_at.slice(0, 16).replace('T', ' '))} UTC</span>
-      <span class="muted">· final milestone released (flow preview)</span></p>`;
+      <span class="muted">· final milestone release awaits admin approval</span></p>`;
   } else if (delivered) {
     confirmHtml = `<div style="margin-top:10px">
-      ${isBuyer ? `<form method="POST" action="/deal/${deal.id}/confirm-receipt" style="display:inline" onsubmit="return confirm('Confirm you have received the goods in good order? This releases the final escrow milestone and is audit-logged.')">
+      ${isBuyer ? `<form method="POST" action="/deal/${deal.id}/confirm-receipt" style="display:inline" onsubmit="return confirm('Confirm you have received the goods in good order? This requests the final escrow release (admin approves) and is audit-logged.')">
         <button class="btn btn-green" type="submit">✅ Confirm receipt of goods</button>
       </form>` : `<p class="muted">Waiting for <b>${esc(names.get(buyerId) || 'the buyer')}</b> to confirm receipt of goods.</p>`}
       <form method="POST" action="/deal/${deal.id}/escrow-dispute" style="display:inline;margin-left:8px" onsubmit="return confirm('Raise a dispute on this deal? The platform team is alerted and the release is paused.')">
@@ -902,12 +969,18 @@ function escrowPanelHtml(deal, user, isOwner, isBuyer) {
     confirmHtml = `<p class="muted" style="margin-top:10px">The "Confirm receipt of goods" step activates for the buyer once the deal status reaches <b>delivered</b>.</p>`;
   }
 
+  // Live release requests raised by status changes (admin approves/denies each one).
+  const releases = new Map();
+  try {
+    for (const r of db.prepare('SELECT * FROM milestone_releases WHERE deal_id = ?').all(deal.id)) releases.set(r.ms_index, r);
+  } catch (e) { /* releases are additive — the panel works without them */ }
+
   return `<div class="card vault" data-reveal>
     <div class="feed-head" style="margin:0"><h3>🛡️ Escrow &amp; payment protection</h3>${FLOW_PREVIEW_BADGE}</div>
     <p class="muted" style="margin-top:6px">Dealzoin holds the buyer's funds and releases them only when the buyer confirms receipt.</p>
     ${pipeline}
     <h4 style="margin:14px 0 6px">📊 Release milestones ${agreedMs ? '<span class="muted" style="font-weight:400">(agreed during the commission-split step)</span>' : '<span class="muted" style="font-weight:400">(default schedule — none agreed yet)</span>'}</h4>
-    ${milestoneRowsHtml(ms, effIdx, confirmed)}
+    ${milestoneRowsHtml(ms, effIdx, confirmed, releases)}
     ${confirmHtml}
   </div>`;
 }
@@ -3074,6 +3147,8 @@ function page(title, body, user, msg, err, active, headExtra, opts) {
   const contractsUnread = (user && !user.isAdmin) ? unreadPrivateContracts(user.id) : 0;
   // Per-company palette (admin sessions always see the default Titan look).
   const palette = companyPalette(user);
+  // Logo-derived custom theme: a full CSS variable override block generated from the logo colors.
+  const customTheme = palette === 'custom' ? companyCustomTheme(user) : null;
   // Batch C (7): interface language — company preference wins; anonymous pages may pass opts.lang
   // (resolved from the dz_lang cookie by the route). Arabic flips the whole page to RTL.
   const lang = (user && !user.isAdmin && SUPPORTED_LANGS.includes(user.lang)) ? user.lang
@@ -3132,7 +3207,7 @@ function page(title, body, user, msg, err, active, headExtra, opts) {
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>${CSS}</style>
-${headExtra || ''}
+${customThemeStyle(customTheme)}${headExtra || ''}
 </head><body>
 <div class="dz-loader is-on" id="dz-loader" aria-hidden="true"><div class="dz-loader__stage"><div class="dz-loader__ring"></div><div class="dz-loader__coin">Dz</div><div class="dz-loader__tag">Dealzoin</div></div></div>
 <div class="bg-fx" aria-hidden="true"><div class="bg-grid"></div><div class="orb orb--gold"></div><div class="orb orb--mint"></div></div>
@@ -3587,16 +3662,88 @@ function optionsHtml(list, selected) {
 
 // ----- Deals 2.0: types, incoterms, status pipeline -----
 const DEAL_TYPES = ['sell', 'buy'];
-// Incoterms: CIF / FOB / CFR / FOP. ('CRF' was a historical typo for CFR — migrated at boot.)
-const DEAL_INCOTERMS = ['CIF', 'FOB', 'CFR', 'FOP'];
+// Incoterms: CIF / FOB / CFR — all platform-tracked. (FOP was removed; legacy values migrate to CIF at boot.)
+const DEAL_INCOTERMS = ['CIF', 'FOB', 'CFR'];
 const INCOTERM_EXPLAINERS = {
   CIF: 'CIF — Cost, Insurance & Freight: the seller pays shipping and insurance to the destination port. Platform tracking enabled.',
   FOB: 'FOB — Free on Board: the seller delivers the goods on board the vessel at the origin port; the buyer takes over from there. Platform tracking enabled.',
-  CFR: 'CFR — Cost & Freight: the seller pays freight to the destination port; insurance is on the buyer. Platform tracking enabled.',
-  FOP: 'FOP — Free on Plane/Point: the buyer arranges & pays main carriage. Shipment tracking is not available on the platform.'
+  CFR: 'CFR — Cost & Freight: the seller pays freight to the destination port; insurance is on the buyer. Platform tracking enabled.'
 };
 // Cargo capacity on deal publish (Batch A) — quantity + unit.
 const DEAL_CARGO_UNITS = ['MT', 'kg', 'containers/TEU', 'CBM', 'pallets', 'units', 'barrels'];
+
+// ============================= BRANDED DOCUMENT LETTERHEAD =============================
+// Every downloadable document (contracts, POs, private contracts, Terms & Conditions)
+// shares this beige-and-brown Dealzoin letterhead. The default logo is the built-in
+// brand mark; the admin can upload their own (Admin dashboard → Brand & documents).
+const BRAND_DOC = {
+  beige: '#F4EEE0', cream: '#FBF7EC', sand: '#EDE3CE',
+  brown: '#5C4033', bronze: '#B08D57', ink: '#3E2C1E', line: '#D9C9A8'
+};
+const DEFAULT_BRAND_LOGO = 'data:image/png;base64,' + "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";
+
+/** Current brand logo as a data URI — the admin upload wins over the built-in default. */
+function brandLogoDataUri() {
+  try {
+    const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('brand_logo');
+    if (row && /^data:image\/(png|jpeg);base64,/.test(String(row.value))) return row.value;
+  } catch (e) { /* settings table exists from boot; never break documents */ }
+  return DEFAULT_BRAND_LOGO;
+}
+
+/** Section heading inside a branded document body. */
+function docH(text) {
+  return `<div style="font-size:12px;letter-spacing:2px;color:${BRAND_DOC.bronze};text-transform:uppercase;font-weight:bold;margin:20px 0 6px">${esc(text)}</div>`;
+}
+/** Signature row for a branded document (two parties). */
+function brandSignatures(leftLabel, rightLabel) {
+  const cell = (l) => `<td style="width:45%;border-top:1px solid ${BRAND_DOC.brown};padding-top:6px;color:${BRAND_DOC.brown};font-size:12px">${esc(l)}</td>`;
+  return `<table width="100%" cellpadding="0" cellspacing="0" style="margin-top:40px"><tr>${cell(leftLabel)}<td style="width:10%"></td>${cell(rightLabel)}</tr></table>`;
+}
+
+/**
+ * Branded Word-compatible document shell (table-based — Word renders it reliably):
+ * beige header band with logo + wordmark, gold rule, cream body with meta block,
+ * brown footer with small print. rows = [[label, valueHtml], ...]; bodyHtml is trusted HTML.
+ */
+function brandedDoc(opts) {
+  const { title, docLabel, docNo, rows = [], bodyHtml = '', footnote = '' } = opts;
+  const B = BRAND_DOC;
+  const metaRows = rows.map(([k, v]) =>
+    `<tr><td style="padding:4px 16px 4px 0;color:${B.bronze};font-size:10px;letter-spacing:1.5px;text-transform:uppercase;font-weight:bold;white-space:nowrap;vertical-align:top">${esc(k)}</td>` +
+    `<td style="padding:4px 0;color:${B.ink};font-size:13px">${v}</td></tr>`).join('');
+  return `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word">
+<head><meta charset="utf-8"><title>${esc(title)}</title></head>
+<body style="font-family:Georgia,'Times New Roman',serif;background:#ffffff;margin:0">
+<table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid ${B.line}">
+  <tr><td style="background:${B.beige};padding:22px 30px;border-bottom:3px solid ${B.bronze}">
+    <table width="100%" cellpadding="0" cellspacing="0"><tr>
+      <td style="width:74px;vertical-align:middle"><img src="${brandLogoDataUri()}" width="62" height="62" alt="Dealzoin"></td>
+      <td style="vertical-align:middle;padding-left:14px">
+        <div style="font-size:25px;font-weight:bold;color:${B.brown};letter-spacing:4px">DEALZOIN</div>
+        <div style="font-size:10px;color:${B.bronze};letter-spacing:2px;margin-top:3px">THE B2B TRADE NETWORK &middot; DEALZOIN.COM</div>
+      </td>
+      <td style="vertical-align:middle;text-align:right">
+        <div style="font-size:11px;color:${B.bronze};letter-spacing:2px;text-transform:uppercase">${esc(docLabel)}</div>
+        <div style="font-size:17px;font-weight:bold;color:${B.brown};margin-top:3px">${esc(docNo)}</div>
+      </td>
+    </tr></table>
+  </td></tr>
+  <tr><td style="background:${B.cream};padding:26px 30px">
+    <h1 style="font-size:21px;color:${B.brown};margin:0">${esc(title)}</h1>
+    <div style="width:60px;height:3px;background:${B.bronze};margin:10px 0 18px"></div>
+    ${metaRows ? `<table cellpadding="0" cellspacing="0" style="margin-bottom:16px;border-left:3px solid ${B.sand};padding-left:14px">${metaRows}</table>` : ''}
+    <div style="color:${B.ink};font-size:13px;line-height:1.6">${bodyHtml}</div>
+  </td></tr>
+  <tr><td style="background:${B.brown};padding:12px 30px">
+    <table width="100%" cellpadding="0" cellspacing="0"><tr>
+      <td style="color:${B.beige};font-size:9px;letter-spacing:1.5px">DEALZOIN &middot; B2B TRADE NETWORK</td>
+      <td style="color:${B.bronze};font-size:9px;text-align:right">Generated ${esc(now())}${footnote ? ' &middot; ' + esc(footnote) : ''}</td>
+    </tr></table>
+  </td></tr>
+</table>
+</body></html>`;
+}
 
 // ----- Batch A: per-company platform palettes (composed with the dark/light toggle) -----
 // 'titan' = the default Titan Ledger look; each palette ships dark + light variable overrides
@@ -3607,13 +3754,133 @@ const THEME_PALETTES = {
   'midnight-mint': { label: 'Midnight Mint', hint: 'Deep teal-green accent',             dark: '#2FD6A5', light: '#0E6B54' },
   'royal-dune':    { label: 'Royal Dune',    hint: 'Deep navy + copper',                 dark: '#D08A52', light: '#9A4A1F' }
 };
+// ----- Logo-based custom themes: the client extracts the logo's dominant colors (canvas),
+// posts two hex values, and these helpers derive a full dark+light variable set from them. -----
+function hexToRgb(hex) {
+  const m = /^#([0-9a-f]{6})$/i.exec(String(hex || '').trim());
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+}
+function rgbToHsl(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  const l = (max + min) / 2;
+  if (max === min) return { h: 0, s: 0, l };
+  const d = max - min;
+  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+  let h;
+  if (max === r) h = ((g - b) / d + (g < b ? 6 : 0));
+  else if (max === g) h = (b - r) / d + 2;
+  else h = (r - g) / d + 4;
+  return { h: h * 60, s, l };
+}
+function hslToHex(h, s, l) {
+  h = ((h % 360) + 360) % 360; s = Math.min(1, Math.max(0, s)); l = Math.min(1, Math.max(0, l));
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = l - c / 2;
+  let r = 0, g = 0, b = 0;
+  if (h < 60) { r = c; g = x; } else if (h < 120) { r = x; g = c; }
+  else if (h < 180) { g = c; b = x; } else if (h < 240) { g = x; b = c; }
+  else if (h < 300) { r = x; b = c; } else { r = c; b = x; }
+  const to = v => Math.round((v + m) * 255).toString(16).padStart(2, '0');
+  return '#' + to(r) + to(g) + to(b);
+}
+function rgbaStr(rgb, a) { return `rgba(${rgb.r},${rgb.g},${rgb.b},${a})`; }
+
+/** Validated custom theme for a company row; null unless theme_choice='custom' and the primary color is valid. */
+function companyCustomTheme(user) {
+  if (!user || user.isAdmin || !user.id) return null;
+  try {
+    const row = db.prepare('SELECT theme_choice, theme_custom FROM companies WHERE id = ?').get(user.id);
+    if (!row || row.theme_choice !== 'custom') return null;
+    const p = JSON.parse(row.theme_custom || '');
+    if (!p || !hexToRgb(p.primary)) return null;
+    return { primary: String(p.primary).toLowerCase(), secondary: hexToRgb(p.secondary) ? String(p.secondary).toLowerCase() : null };
+  } catch (e) { return null; }
+}
+
 /** Validated palette key for a company row ('titan' default; admin sessions always Titan). */
 function companyPalette(user) {
   if (!user || user.isAdmin || !user.id) return 'titan';
   try {
-    const row = db.prepare('SELECT theme_choice FROM companies WHERE id = ?').get(user.id);
-    return row && THEME_PALETTES[row.theme_choice] ? row.theme_choice : 'titan';
+    const row = db.prepare('SELECT theme_choice, theme_custom FROM companies WHERE id = ?').get(user.id);
+    if (!row) return 'titan';
+    if (row.theme_choice === 'custom') {
+      try { const p = JSON.parse(row.theme_custom || ''); if (p && hexToRgb(p.primary)) return 'custom'; } catch (e) { /* fall through */ }
+      return 'titan';
+    }
+    return THEME_PALETTES[row.theme_choice] ? row.theme_choice : 'titan';
   } catch (e) { return 'titan'; }
+}
+
+/**
+ * Derive a complete dark + light CSS variable override block from the logo colors.
+ * Primary drives the --gold accent channel; secondary (or a complementary hue) drives --mint.
+ * Dark-mode accents are brightened for contrast; light-mode accents are darkened for beige paper.
+ * Backgrounds carry a whisper of the logo hue so the whole page feels branded.
+ */
+function customThemeStyle(theme) {
+  if (!theme) return '';
+  const p = hexToRgb(theme.primary);
+  const hsl = rgbToHsl(p.r, p.g, p.b);
+  const hue = hsl.h;
+  const sec = theme.secondary ? hexToRgb(theme.secondary) : null;
+  const secHsl = sec ? rgbToHsl(sec.r, sec.g, sec.b) : { h: (hue + 160) % 360, s: 0.45, l: 0.5 };
+  const clampL = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+  const clampS = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+  // Dark mode
+  const dSat = clampS(hsl.s, 0.45, 0.9), dLight = clampL(hsl.l, 0.55, 0.72);
+  const dAccent = hslToHex(hue, dSat, dLight);
+  const dDeep = hslToHex(hue, dSat, Math.max(0.38, dLight - 0.18));
+  const dBright = hslToHex(hue, clampS(hsl.s + 0.1, 0, 0.95), Math.min(0.8, dLight + 0.12));
+  const sSatD = clampS(secHsl.s, 0.35, 0.85), sLightD = clampL(secHsl.l, 0.5, 0.7);
+  const dMint = hslToHex(secHsl.h, sSatD, sLightD);
+  const dMintDeep = hslToHex(secHsl.h, sSatD, Math.max(0.34, sLightD - 0.14));
+  const dRgb = hexToRgb(dAccent);
+  const bg = (l) => hslToHex(hue, Math.min(0.32, dSat * 0.4), l);
+  // Light mode (warm paper, never white)
+  const lSat = clampS(hsl.s, 0.4, 0.85), lLight = clampL(hsl.l, 0.22, 0.38);
+  const lAccent = hslToHex(hue, lSat, lLight);
+  const lDeep = hslToHex(hue, lSat, Math.max(0.14, lLight - 0.1));
+  const lMint = hslToHex(secHsl.h, clampS(secHsl.s, 0.35, 0.8), clampL(secHsl.l, 0.2, 0.35));
+  const lRgb = hexToRgb(lAccent);
+  const lw = (l) => hslToHex(hue, Math.min(0.38, lSat * 0.45), l);
+  return `<style>
+  [data-palette="custom"] {
+    --bg-void: ${bg(0.07)}; --bg-elevated: ${bg(0.10)}; --bg-spotlight: ${bg(0.13)};
+    --surface-card: ${bg(0.095)}; --surface-deal: linear-gradient(165deg, ${bg(0.12)} 0%, ${bg(0.07)} 60%, ${bg(0.11)} 100%);
+    --gold: ${dAccent}; --gold-deep: ${dDeep}; --gold-bright: ${dBright}; --gold-glow: ${rgbaStr(dRgb, 0.14)};
+    --mint: ${dMint}; --mint-deep: ${dMintDeep};
+    --ink-primary: ${hslToHex(hue, 0.28, 0.92)}; --ink-muted: ${hslToHex(hue, 0.18, 0.68)}; --ink-faint: ${hslToHex(hue, 0.14, 0.52)};
+    --border-soft: ${hslToHex(hue, 0.25, 0.2)}; --border-gold: ${rgbaStr(dRgb, 0.42)};
+    --gradient-coin: linear-gradient(120deg, ${dDeep} 0%, ${dAccent} 45%, ${hslToHex(hue, dSat, Math.max(0.28, dLight - 0.3))} 100%);
+    --nav-bg: ${rgbaStr(hexToRgb(bg(0.07)), 0.85)};
+    --bg-glow: radial-gradient(1200px 600px at 50% -10%, ${rgbaStr(dRgb, 0.09)}, transparent 60%);
+    --bubble-mine-bg: linear-gradient(160deg, ${hslToHex(hue, dSat * 0.55, 0.2)} 0%, ${hslToHex(hue, dSat * 0.55, 0.14)} 100%);
+    --bubble-theirs-bg: ${bg(0.11)};
+    --gold-shadow-sm: 0 2px 12px ${rgbaStr(dRgb, 0.20)}; --gold-shadow-md: 0 4px 18px ${rgbaStr(dRgb, 0.16)};
+    --gold-shadow-lg: 0 8px 26px ${rgbaStr(dRgb, 0.26)}; --gold-shadow-plus: 0 4px 18px ${rgbaStr(dRgb, 0.20)};
+    --gold-shadow-plus-hover: 0 8px 26px ${rgbaStr(dRgb, 0.32)}; --shadow-gold: 0 6px 22px ${rgbaStr(dRgb, 0.24)};
+  }
+  [data-palette="custom"][data-theme="light"] {
+    --bg-void: ${lw(0.92)}; --bg-elevated: ${lw(0.88)}; --bg-spotlight: ${lw(0.95)};
+    --surface-card: ${lw(0.955)}; --surface-deal: linear-gradient(165deg, ${lw(0.965)} 0%, ${lw(0.915)} 55%, ${lw(0.94)} 100%);
+    --gold: ${lAccent}; --gold-deep: ${lDeep}; --gold-bright: ${lDeep}; --gold-glow: ${rgbaStr(lRgb, 0.14)};
+    --mint: ${lMint}; --mint-deep: ${lMint};
+    --ink-primary: ${hslToHex(hue, 0.35, 0.13)}; --ink-muted: ${hslToHex(hue, 0.22, 0.33)}; --ink-faint: ${hslToHex(hue, 0.16, 0.46)};
+    --border-soft: ${hslToHex(hue, 0.28, 0.79)}; --border-gold: ${rgbaStr(lRgb, 0.45)};
+    --gradient-coin: linear-gradient(120deg, ${lDeep} 0%, ${lAccent} 45%, ${lDeep} 100%);
+    --nav-bg: ${rgbaStr(hexToRgb(lw(0.955)), 0.88)};
+    --bg-glow: radial-gradient(1200px 600px at 50% -10%, ${rgbaStr(lRgb, 0.10)}, transparent 60%);
+    --bubble-mine-bg: linear-gradient(160deg, ${hslToHex(hue, lSat * 0.6, 0.85)} 0%, ${hslToHex(hue, lSat * 0.6, 0.78)} 100%);
+    --bubble-theirs-bg: ${lw(0.93)};
+    --gold-shadow-sm: 0 2px 12px ${rgbaStr(lRgb, 0.22)}; --gold-shadow-md: 0 4px 18px ${rgbaStr(lRgb, 0.18)};
+    --gold-shadow-lg: 0 8px 26px ${rgbaStr(lRgb, 0.28)}; --gold-shadow-plus: 0 4px 18px ${rgbaStr(lRgb, 0.22)};
+    --gold-shadow-plus-hover: 0 8px 26px ${rgbaStr(lRgb, 0.34)}; --shadow-gold: 0 6px 22px ${rgbaStr(lRgb, 0.26)};
+  }
+  </style>`;
 }
 const DEAL_STATUSES = ['open', 'production', 'dispatched', 'shipped', 'delivered'];
 /** Small status chip for feed cards and lists. */
@@ -4075,7 +4342,7 @@ function termsGateHtml(mode) {
     </div>
     <div class="terms-modal__body" tabindex="0" aria-label="Terms and Conditions text">
       ${termsClauses().map(c => `<p>${esc(c)}</p>`).join('')}
-      <p class="muted">— End of the Terms &amp; Conditions (v${TERMS_VERSION}). The signed copy can be downloaded from the <a href="/legal/terms/download">terms page</a>. —</p>
+      <p class="muted">— End of the Terms &amp; Conditions (v${TERMS_VERSION}). Accepting here is legally equivalent to signing. —</p>
     </div>
     <div class="terms-modal__foot">
       <span class="terms-scroll-hint">↓ Scroll to the end of the Terms &amp; Conditions to enable agreement</span>
@@ -4092,28 +4359,33 @@ app.get('/legal/terms', (req, res) => {
   <div class="card vault">
     <div class="kicker">Legal · Registration agreement</div>
     <h2 style="margin:6px 0 10px">📜 Dealzoin Terms &amp; Conditions</h2>
-    <p class="muted" style="margin-bottom:12px">These terms govern company registration on the Dealzoin B2B network. Every registering company must read, sign and upload a signed copy during registration.</p>
+    <p class="muted" style="margin-bottom:12px">These terms govern company registration on the Dealzoin B2B network. Every registering company reads and accepts them in the registration popup — the typed legal signature on the form acts as the signature on these Terms.</p>
     ${termsClauses().map(c => `<p style="margin-bottom:10px">${esc(c)}</p>`).join('')}
     <hr class="sep">
-    <p class="muted">Download this document, print it, sign it, and upload the signed copy during registration.</p>
     <div class="feed-actions" style="margin-top:12px">
-      <a class="btn" href="/legal/terms/download">Download Terms &amp; Conditions (.doc)</a>
       <a class="btn btn-outline" href="/signup">Back to registration</a>
     </div>
   </div>`;
   res.send(page('Terms & Conditions', body, currentUser(req), req.query.msg, req.query.err));
 });
 
-/** Download the Terms & Conditions as a Word-compatible .doc (same pattern as contracts). */
+/** Download the Terms & Conditions as a branded Word-compatible reference copy (acceptance happens in the popup — this is for records). */
 app.get('/legal/terms/download', (req, res) => {
-  const doc = `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word">
-<head><meta charset="utf-8"><title>Dealzoin Terms &amp; Conditions</title></head>
-<body style="font-family:Calibri,Arial,sans-serif">
-  <h1>Dealzoin — Registration Terms &amp; Conditions</h1>
-  <p><b>Generated:</b> ${esc(now())}</p>
-  ${termsClauses().map(c => `<p>${esc(c)}</p>`).join('')}
-  <p>__________________________<br>Authorized signatory — full legal name, signature &amp; date</p>
-</body></html>`;
+  const doc = brandedDoc({
+    title: 'Registration Terms & Conditions',
+    docLabel: 'Terms & Conditions',
+    docNo: 'Version ' + TERMS_VERSION,
+    rows: [
+      ['Version', 'v' + TERMS_VERSION],
+      ['Generated', esc(now())],
+      ['Applies to', 'All companies registering on the Dealzoin network']
+    ],
+    bodyHtml:
+      docH('The five pledges & terms') +
+      termsClauses().map(c => `<p style="margin-bottom:10px">${esc(c)}</p>`).join('') +
+      `<p style="margin-top:16px;font-style:italic">Acceptance is recorded digitally: companies read and accept these Terms in the scroll-to-agree registration popup, and the typed legal signature on the registration form acts as the signature on this document.</p>`,
+    footnote: 'Terms v' + TERMS_VERSION
+  });
   res.setHeader('Content-Type', 'application/msword');
   res.setHeader('Content-Disposition', 'attachment; filename="dealzoin-terms-and-conditions.doc"');
   res.send(doc);
@@ -4161,14 +4433,10 @@ app.get('/signup', (req, res) => {
       <hr class="sep">
       ${docInput('moa_authority', 'MOA & authority document — Memorandum of Association / authorization proving you may register this company', true)}
       ${docInput('bank_statement', 'Bank account statement / proof of funds', true)}
-      <label>Signed Terms &amp; Conditions (required, PDF)</label>
+      <label>Terms &amp; Conditions (required)</label>
       <p class="muted" style="margin-bottom:8px">
         <button type="button" class="btn btn-sm btn-outline js-terms-open" data-target="terms-signup" style="margin-bottom:8px">📜 Read &amp; accept the Terms &amp; Conditions (v${TERMS_VERSION})</button>
-        <span id="terms-status" class="muted" style="display:block;margin-bottom:6px">Opens a scroll-to-agree popup — accepting also checks the five pledges below.</span>
-        Download, print, sign, and upload the signed copy below.
-        <a href="/legal/terms">View on a page</a> · <a href="/legal/terms/download">Download (.doc)</a></p>
-      <label class="file-btn dropzone"><span class="file-btn-text" data-default="📎 Upload signed Terms &amp; Conditions">📎 Upload signed Terms &amp; Conditions</span>
-        <input type="file" class="file-input" name="signed_terms" accept="application/pdf,.pdf" required></label>
+        <span id="terms-status" class="muted" style="display:block;margin-bottom:6px">Opens a scroll-to-agree popup — accepting also checks the five pledges below. Your typed signature at the bottom of this form acts as your legal signature on the Terms.</span></p>
       ${docInput('activity_proof', 'Activity proof (e.g. portfolio, catalog, past invoices)', false)}
 
       <hr class="sep">
@@ -4248,7 +4516,7 @@ async function signupCompleteHandler(req, res) {
 
   // Required KYC documents (PDF-only, magic-byte checked).
   const files = req.files || {};
-  for (const docType of ['moa_authority', 'bank_statement', 'signed_terms']) {
+  for (const docType of ['moa_authority', 'bank_statement']) {
     const f = files[docType] && files[docType][0];
     if (!f) return fail(`Missing required document: ${DOC_TYPE_LABELS[docType]}.`);
     if (!isPdfBuffer(f.buffer)) return fail(`${DOC_TYPE_LABELS[docType]} must be a real PDF file.`);
@@ -5206,16 +5474,9 @@ app.get('/deal/:id', requireCompanyOrAdmin, async (req, res) => {
     </div>`;
   }
 
-  // ---- Status & shipment tracking (CIF/FOB/CFR only; FOP has no platform tracking) ----
-  const isFop = (deal.incoterm || 'CIF') === 'FOP';
+  // ---- Status & shipment tracking (CIF/FOB/CFR — all platform-tracked) ----
   let statusHtml;
-  if (isFop) {
-    statusHtml = `<div class="card" data-reveal>
-      <h3>📦 Deal status</h3>
-      <p style="margin-top:8px">${dealStatusChip(deal)}</p>
-      <p class="muted" style="margin-top:10px">FOP terms — shipment tracking is not available on the platform. The buyer arranges main carriage directly with the seller.</p>
-    </div>`;
-  } else {
+  {
     const tracking = (deal.tracking_number || deal.tracking_url) ? `
       <p style="margin-top:10px">🚚 <b>Tracking:</b> ${deal.tracking_number ? `<span class="deal-num">${esc(deal.tracking_number)}</span>` : ''}
         ${deal.tracking_url ? ` · <a href="${esc(deal.tracking_url)}" rel="noopener noreferrer nofollow">Track shipment →</a>` : ''}</p>` : '';
@@ -5249,7 +5510,7 @@ app.get('/deal/:id', requireCompanyOrAdmin, async (req, res) => {
   // owner, negotiating/contracted buyer, admin — same parties the status stepper controls serve).
   // Coordinates are geocoded lazily here (first map view), never on deal creation; failures render a placeholder.
   let mapHtml = '', mapHead = '';
-  if (!isFop && canViewDealTerms(req.user, deal)) {
+  if (canViewDealTerms(req.user, deal)) {
     if (deal.payment_status === 'pending_payment') {
       // Commission gate: the per-deal map stays hidden behind a lock card until the admin approves payment.
       mapHtml = `<div class="card map-placeholder" data-reveal><h3>🗺️ Shipment tracking map</h3>
@@ -5377,9 +5638,6 @@ app.post('/deal/:id/status', (req, res) => {
     audit('DEAL AGENT', 'status update guard', 'fail', `${user.name} attempted to update status on deal #${deal.id} without being a party`);
     return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Parties only</h2><p class="muted">Only the deal owner, the contracted buyer and the admin can advance the deal status.</p></div>', user));
   }
-  if ((deal.incoterm || 'CIF') === 'FOP') {
-    return res.redirect(back + '?err=' + encodeURIComponent('FOP terms — shipment tracking is not available on the platform.'));
-  }
   // Commission gate: finalized deals are locked until the admin approves the commission payment.
   if (deal.payment_status === 'pending_payment') {
     audit('PAYMENT AGENT', 'status update locked', 'fail', `${user.isAdmin ? 'Admin' : user.name} tried to advance deal ${deal.deal_number || '#' + deal.id} before commission payment approval`);
@@ -5402,6 +5660,8 @@ app.post('/deal/:id/status', (req, res) => {
   if (!trackingUrl) trackingUrl = deal.tracking_url || '';
   db.prepare('UPDATE deals SET status = ?, status_note = ?, tracking_number = ?, tracking_url = ? WHERE id = ?')
     .run(newStatus, note, trackingNumber, trackingUrl, deal.id);
+  // Payment-milestone hook: reaching an agreed milestone's stage raises an admin release request.
+  try { triggerMilestoneReleases(deal, newStatus, user); } catch (e) { /* never break the status update */ }
   audit('DEAL AGENT', 'status update', 'pass', `${user.isAdmin ? 'Admin' : user.name} advanced deal ${deal.deal_number || '#' + deal.id} to "${newStatus}"${note ? ` — note: ${note}` : ''}${trackingNumber ? ` — tracking ${trackingNumber}` : ''}`);
   // Notify the other party (admin updates notify both parties).
   const label = `${user.isAdmin ? 'The platform' : user.name} updated deal ${deal.deal_number || '#' + deal.id} ("${deal.title}") to "${newStatus.toUpperCase()}"${note ? ` — ${note}` : ''}`;
@@ -5521,9 +5781,12 @@ app.post('/deal/:id/confirm-receipt', requireCompany, (req, res) => {
   }
   const ts = now();
   db.prepare('UPDATE deals SET buyer_received_confirmed_at = ? WHERE id = ?').run(ts, deal.id);
-  audit('ESCROW AGENT', 'buyer confirmed receipt', 'pass', `${req.user.name} confirmed receipt of goods on deal ${deal.deal_number || '#' + deal.id} at ${ts} — final escrow milestone released (flow preview)`);
-  notify(deal.company_id, 'receipt_confirmed', `${req.user.name} confirmed receipt of goods on deal ${deal.deal_number || '#' + deal.id} ("${deal.title}") — the final escrow milestone is released (flow preview).`, back);
-  res.redirect(back + '?msg=' + encodeURIComponent('Receipt confirmed — thank you! The final escrow milestone is released (flow preview).'));
+  // Receipt confirmation is the delivery gate — re-run the milestone trigger so the
+  // final (delivered) milestone raises its admin release request now.
+  try { triggerMilestoneReleases(deal, 'delivered', req.user); } catch (e) { /* never break the confirmation */ }
+  audit('ESCROW AGENT', 'buyer confirmed receipt', 'pass', `${req.user.name} confirmed receipt of goods on deal ${deal.deal_number || '#' + deal.id} at ${ts} — final escrow milestone release requested (admin approves)`);
+  notify(deal.company_id, 'receipt_confirmed', `${req.user.name} confirmed receipt of goods on deal ${deal.deal_number || '#' + deal.id} ("${deal.title}") — the final milestone release now awaits admin approval.`, back);
+  res.redirect(back + '?msg=' + encodeURIComponent('Receipt confirmed — thank you! The final milestone release now awaits admin approval.'));
 });
 // ----- BATCH B (4): either party raises a dispute — pauses the release design and alerts the admin -----
 app.post('/deal/:id/escrow-dispute', requireCompany, (req, res) => {
@@ -5780,21 +6043,23 @@ app.get('/deal/:id/contract/download', requireCompanyOrAdmin, (req, res) => {
   const dealNum = deal.deal_number || String(deal.id);
   const counterpartyName = dealCounterpartyName(deal, names);
   const clauses = contractClauses().map(c => `<p>${esc(c)}</p>`).join('');
-  const doc = `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word">
-<head><meta charset="utf-8"><title>Contract — Deal № ${esc(dealNum)}</title></head>
-<body style="font-family:Calibri,Arial,sans-serif">
-  <h1>B2B Contract — Deal № ${esc(dealNum)}</h1>
-  <h2>${esc(deal.title)}</h2>
-  <p><b>Provider:</b> ${esc(owner ? owner.name : 'Unknown')}<br>
-     <b>Counterparty:</b> ${esc(counterpartyName)}<br>
-     ${deal.value ? `<b>Deal value:</b> ${esc(deal.value)} ${esc(deal.currency || 'USD')}<br>` : ''}
-     <b>${esc(feeLineText(deal))}</b><br>
-     <b>Generated:</b> ${esc(now())}</p>
-  <h3>Deal terms</h3><p>${esc(deal.description)}</p>
-  <h3>Standard B2B terms</h3>${clauses}
-  <p>__________________________&nbsp;&nbsp;&nbsp;__________________________<br>
-  Provider signature&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Counterparty signature</p>
-</body></html>`;
+  const doc = brandedDoc({
+    title: deal.title,
+    docLabel: 'B2B Contract',
+    docNo: '№ ' + dealNum,
+    rows: [
+      ['Provider', esc(owner ? owner.name : 'Unknown')],
+      ['Counterparty', esc(counterpartyName)],
+      ...(deal.value ? [['Deal value', `<b>${esc(deal.value)} ${esc(deal.currency || 'USD')}</b>`]] : []),
+      ['Commission', esc(feeLineText(deal))],
+      ['Generated', esc(now())]
+    ],
+    bodyHtml:
+      docH('Deal terms') + `<p style="white-space:pre-wrap">${esc(deal.description)}</p>` +
+      docH('Standard B2B terms') + clauses +
+      brandSignatures('Provider signature', 'Counterparty signature'),
+    footnote: 'Deal № ' + dealNum
+  });
   audit('CONTRACT AGENT', 'contract download access', 'pass', `Contract for deal ${dealNum} downloaded by ${req.user.isAdmin ? 'admin' : req.user.name}`);
   res.setHeader('Content-Type', 'application/msword');
   res.setHeader('Content-Disposition', `attachment; filename="contract-${String(dealNum).replace(/[^A-Za-z0-9._-]/g, '_')}.doc"`);
@@ -6663,7 +6928,7 @@ app.get('/negotiation/:id', requireCompanyOrAdmin, (req, res) => {
   let actionHtml = '';
   const waiting = (who) => `<div class="card" data-reveal><h3>⏳ Waiting for ${esc(who)}</h3><p class="muted">You'll be notified when the other party acts. Current state: ${statusBadge(st)}</p></div>`;
   // Batch A: the seller picks the governing incoterm on every (re-)offer — it flows to the
-  // PO, the deal page and the tracking logic (FOP = no platform tracking).
+  // PO, the deal page and the tracking logic.
   const curIncoterm = negIncoterm(neg, deal);
   const incotermFieldHtml = `
     <label>Incoterm *</label>
@@ -6880,9 +7145,9 @@ app.post('/negotiation/:id/offer', requireCompany, (req, res) => {
   const round = neg.round + 1; // the initial offer is round 1, the first re-offer after a counter is round 2, …
   db.prepare(`UPDATE negotiations SET state = 'OFFER_SENT', round = ?, offer_value = ?, offer_currency = ?, offer_terms = ?, offer_incoterm = ?, updated_at = ? WHERE id = ?`)
     .run(round, String(num), currency, terms, incoterm, now(), neg.id);
-  // The offer's incoterm governs the deal page + tracking logic (FOP = no platform tracking).
+  // The offer's incoterm governs the deal page + tracking logic.
   try { db.prepare('UPDATE deals SET incoterm = ? WHERE id = ?').run(incoterm, neg.deal_id); } catch (e) { /* incoterm column always present on current schema */ }
-  negEvent(neg.id, req.user.id, 'offer', { value: String(num), currency, terms, note: `${isReoffer ? `Re-offer — round ${round}` : 'Initial offer'} · Incoterm: ${incoterm}${incoterm === 'FOP' ? ' (no platform tracking)' : ''}` });
+  negEvent(neg.id, req.user.id, 'offer', { value: String(num), currency, terms, note: `${isReoffer ? `Re-offer — round ${round}` : 'Initial offer'} · Incoterm: ${incoterm}` });
   audit('DEAL AGENT', isReoffer ? 're-offer sent' : 'offer sent', 'pass', `${req.user.name} offered ${num} ${currency} on negotiation #${neg.id} (round ${round}, incoterm ${incoterm})`);
   notify(neg.buyer_id, 'offer', `${req.user.name} sent you a private offer (${fmtAmount(num)} ${currency}) on negotiation #${neg.id}. Approve or counter.`, `/negotiation/${neg.id}`);
   res.redirect(`/negotiation/${neg.id}?msg=` + encodeURIComponent('Offer sent to the buyer.'));
@@ -6987,23 +7252,25 @@ app.get('/negotiation/:id/po.doc', requireCompanyOrAdmin, (req, res) => {
   const feeClause = isFinite(f.fee)
     ? `PLATFORM COMMISSION. A platform commission of ${f.pct}% of the agreed deal value (${fmtAmount(f.fee)} ${f.cur}) is payable to Dealzoin before deal processing. Split: ${splitLabel} — Buyer: ${fmtAmount(f.buyer)} ${f.cur}, Seller: ${fmtAmount(f.seller)} ${f.cur}.`
     : `PLATFORM COMMISSION. A platform commission of ${f.pct}% of the agreed deal value is payable to Dealzoin before deal processing. Split: ${splitLabel}.`;
-  const doc = `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word">
-<head><meta charset="utf-8"><title>Purchase Order ${esc(dealNum)}</title></head>
-<body style="font-family:Calibri,Arial,sans-serif">
-  <h1>Purchase Order — Deal № ${esc(dealNum)}</h1>
-  <h2>${esc(deal ? deal.title : 'Deal')}</h2>
-  <p><b>Buyer:</b> ${esc(buyerName)}${neg.loi_location ? ` (${esc(neg.loi_location)})` : ''}<br>
-     <b>Seller:</b> ${esc(sellerName)}<br>
-     <b>Deal number:</b> ${esc(dealNum)}<br>
-     <b>Agreed value:</b> ${esc(neg.offer_value)} ${esc(neg.offer_currency || 'USD')}<br>
-     <b>Incoterm:</b> ${esc(negIncoterm(neg, deal))}<br>
-     <b>Negotiation rounds:</b> ${neg.round}<br>
-     <b>Issued:</b> ${esc(now())}</p>
-  <h3>Agreed terms</h3><p>${esc(neg.offer_terms)}</p>
-  <h3>Platform commission</h3><p><b>${esc(feeClause)}</b></p>
-  <p>__________________________&nbsp;&nbsp;&nbsp;__________________________<br>
-  Buyer signature&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Seller signature</p>
-</body></html>`;
+  const doc = brandedDoc({
+    title: deal ? deal.title : 'Deal',
+    docLabel: 'Purchase Order',
+    docNo: '№ ' + dealNum,
+    rows: [
+      ['Buyer', esc(buyerName) + (neg.loi_location ? ` (${esc(neg.loi_location)})` : '')],
+      ['Seller', esc(sellerName)],
+      ['Deal number', esc(dealNum)],
+      ['Agreed value', `<b>${esc(neg.offer_value)} ${esc(neg.offer_currency || 'USD')}</b>`],
+      ['Incoterm', esc(negIncoterm(neg, deal))],
+      ['Negotiation rounds', String(neg.round)],
+      ['Issued', esc(now())]
+    ],
+    bodyHtml:
+      docH('Agreed terms') + `<p style="white-space:pre-wrap">${esc(neg.offer_terms)}</p>` +
+      docH('Platform commission') + `<p>${esc(feeClause)}</p>` +
+      brandSignatures('Buyer signature', 'Seller signature'),
+    footnote: 'Deal № ' + dealNum
+  });
   audit('DEAL AGENT', 'PO download', 'pass', `PO for negotiation #${neg.id} downloaded by ${req.user.isAdmin ? 'admin' : req.user.name}`);
   res.setHeader('Content-Type', 'application/msword');
   res.setHeader('Content-Disposition', `attachment; filename="PO-${String(dealNum).replace(/[^A-Za-z0-9._-]/g, '_')}.doc"`);
@@ -7340,23 +7607,26 @@ app.get('/contracts/:id/download', (req, res) => {
     return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Private contract</h2><p class="muted">Only the sender, the recipient and the admin can download this contract.</p></div>', user));
   }
   const names = companyNameMap();
-  const doc = `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word">
-<head><meta charset="utf-8"><title>Private Contract #${pc.id}</title></head>
-<body style="font-family:Calibri,Arial,sans-serif">
-  <h1>Private Contract #${pc.id}</h1>
-  <h2>${esc(pc.title)}</h2>
-  <p><b>From (sender):</b> ${esc(names.get(pc.sender_company_id) || 'Unknown')}<br>
-     <b>To (recipient):</b> ${esc(names.get(pc.recipient_company_id) || 'Unknown')}<br>
-     ${Number(pc.value) > 0 ? `<b>Value:</b> ${esc(fmtAmount(Number(pc.value)))} ${esc(pc.currency || 'USD')}<br>` : ''}
-     <b>${esc(pcFeeLineText(pc))}</b><br>
-     <b>Status:</b> ${esc(pc.status.replace(/_/g, ' '))}<br>
-     <b>Sealed:</b> ${esc(pc.created_at)}${pc.signed_at ? `<br><b>Signed:</b> ${esc(pc.signed_at)}` : ''}${pc.decided_at ? `<br><b>Decided:</b> ${esc(pc.decided_at)}` : ''}</p>
-  <h3>Terms of the offer</h3><p>${esc(pc.terms)}</p>
-  <h3>Platform fee clause</h3>
-  <p>${esc(pcFeeClauseText())}</p>
-  <p>__________________________&nbsp;&nbsp;&nbsp;__________________________<br>
-  Sender signature&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Recipient signature</p>
-</body></html>`;
+  const doc = brandedDoc({
+    title: pc.title,
+    docLabel: 'Private Contract',
+    docNo: '№ PC-' + pc.id,
+    rows: [
+      ['From (sender)', esc(names.get(pc.sender_company_id) || 'Unknown')],
+      ['To (recipient)', esc(names.get(pc.recipient_company_id) || 'Unknown')],
+      ...(Number(pc.value) > 0 ? [['Value', `<b>${esc(fmtAmount(Number(pc.value)))} ${esc(pc.currency || 'USD')}</b>`]] : []),
+      ['Commission', esc(pcFeeLineText(pc))],
+      ['Status', esc(pc.status.replace(/_/g, ' '))],
+      ['Sealed', esc(pc.created_at)],
+      ...(pc.signed_at ? [['Signed', esc(pc.signed_at)]] : []),
+      ...(pc.decided_at ? [['Decided', esc(pc.decided_at)]] : [])
+    ],
+    bodyHtml:
+      docH('Terms of the offer') + `<p style="white-space:pre-wrap">${esc(pc.terms)}</p>` +
+      docH('Platform fee clause') + `<p>${esc(pcFeeClauseText())}</p>` +
+      brandSignatures('Sender signature', 'Recipient signature'),
+    footnote: 'Private Contract № PC-' + pc.id
+  });
   res.setHeader('Content-Type', 'application/msword');
   res.setHeader('Content-Disposition', `attachment; filename="private-contract-${pc.id}.doc"`);
   res.send(doc);
@@ -7678,6 +7948,77 @@ app.get('/profile', requireCompany, (req, res) => {
       </div>
       <button class="btn btn-sm" type="submit">Apply theme</button>
     </form>
+    <hr class="sep">
+    <h4 style="margin:0 0 6px">🖼️ Theme from my logo</h4>
+    <p class="muted" style="margin:0 0 10px">Upload your company logo (or any brand image) — Dealzoin reads its dominant colors and builds a theme around your brand. Works in both dark and light mode.${c.avatar_media_id ? ' You can also use the logo already on your profile.' : ''}</p>
+    <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+      ${c.avatar_media_id ? `<div style="text-align:center"><img src="/media/${c.avatar_media_id}" alt="My logo" style="width:64px;height:64px;object-fit:cover;border-radius:14px;border:1px solid var(--border-soft);display:block"><button type="button" class="btn btn-sm btn-outline" id="lt-use-avatar" data-src="/media/${c.avatar_media_id}" style="margin-top:6px">Use my profile logo</button></div>` : ''}
+      <label class="file-btn dropzone" style="flex:1;min-width:220px"><span class="file-btn-text" data-default="📎 Upload a logo image to read its colors">📎 Upload a logo image to read its colors</span>
+        <input type="file" class="file-input" id="lt-file" accept="image/png,image/jpeg,image/webp,image/gif"></label>
+    </div>
+    <div id="lt-preview" style="display:none;margin-top:12px">
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <span class="muted">Extracted brand colors:</span>
+        <span id="lt-sw1" style="width:44px;height:44px;border-radius:12px;border:1px solid var(--border-soft);display:inline-block"></span>
+        <span id="lt-sw2" style="width:44px;height:44px;border-radius:12px;border:1px solid var(--border-soft);display:inline-block"></span>
+        <span id="lt-hex" class="muted" style="font-size:12px"></span>
+      </div>
+      <form method="POST" action="/profile/theme/logo" style="margin-top:10px">
+        <input type="hidden" name="primary" id="lt-primary">
+        <input type="hidden" name="secondary" id="lt-secondary">
+        <button class="btn btn-sm" type="submit">✨ Apply my logo theme</button>
+      </form>
+    </div>
+    <div id="lt-none" class="muted" style="display:none;margin-top:10px">Couldn't find brand colors in that image (is it fully white/black?) — try a different picture.</div>
+    ${c.theme_choice === 'custom' ? `<p class="muted" style="margin-top:10px">✓ Your custom logo theme is active. Pick one of the palettes above and Apply to leave it.</p>` : ''}
+    <script>(function(){
+      var file=document.getElementById('lt-file');
+      var avatarBtn=document.getElementById('lt-use-avatar');
+      function hueOf(o){var r=o.r/255,g=o.g/255,b=o.b/255;var mx=Math.max(r,g,b),mn=Math.min(r,g,b);if(mx===mn)return 0;var d=mx-mn;var h;if(mx===r)h=((g-b)/d+(g<b?6:0));else if(mx===g)h=(b-r)/d+2;else h=(r-g)/d+4;return h*60;}
+      function hexOf(o){return '#'+[o.r,o.g,o.b].map(function(v){return Math.round(v).toString(16).padStart(2,'0');}).join('');}
+      function extract(srcUrl){
+        var img=new Image();
+        img.onload=function(){
+          try{
+            var cv=document.createElement('canvas');cv.width=64;cv.height=64;
+            var cx=cv.getContext('2d');cx.drawImage(img,0,0,64,64);
+            var d=cx.getImageData(0,0,64,64).data;
+            var buckets={},i,key;
+            for(i=0;i<d.length;i+=4){
+              var r=d[i],g=d[i+1],b=d[i+2],a=d[i+3];
+              if(a<128)continue;
+              var mx=Math.max(r,g,b),mn=Math.min(r,g,b);
+              if(mx>242||mx<18)continue;      // skip near-white / near-black
+              if(mx-mn<24)continue;            // skip greys
+              key=(r>>4)+','+(g>>4)+','+(b>>4);
+              var bk=buckets[key]||(buckets[key]={n:0,r:0,g:0,b:0});
+              bk.n++;bk.r+=r;bk.g+=g;bk.b+=b;
+            }
+            var arr=Object.keys(buckets).map(function(k){var o=buckets[k];return{n:o.n,r:o.r/o.n,g:o.g/o.n,b:o.b/o.n};});
+            var prev=document.getElementById('lt-preview'), none=document.getElementById('lt-none');
+            if(!arr.length){ if(prev)prev.style.display='none'; if(none)none.style.display='block'; return; }
+            arr.sort(function(a,b){return b.n-a.n;});
+            var primary=arr[0], pHue=hueOf(primary), secondary=null;
+            for(i=1;i<arr.length;i++){ var dh=Math.abs(hueOf(arr[i])-pHue); dh=Math.min(dh,360-dh); if(dh>40){secondary=arr[i];break;} }
+            document.getElementById('lt-primary').value=hexOf(primary);
+            document.getElementById('lt-secondary').value=secondary?hexOf(secondary):'';
+            document.getElementById('lt-sw1').style.background=hexOf(primary);
+            var sw2=document.getElementById('lt-sw2');
+            sw2.style.background=secondary?hexOf(secondary):'transparent';
+            sw2.style.border=secondary?'1px solid var(--border-soft)':'1px dashed var(--border-soft)';
+            document.getElementById('lt-hex').textContent=hexOf(primary)+(secondary?' + '+hexOf(secondary):' (single color)');
+            if(none)none.style.display='none'; if(prev)prev.style.display='block';
+          }catch(e){ var none=document.getElementById('lt-none'); if(none)none.style.display='block'; }
+        };
+        img.onerror=function(){ var none=document.getElementById('lt-none'); if(none)none.style.display='block'; };
+        img.src=srcUrl;
+      }
+      if(file){file.addEventListener('change',function(){
+        var f=file.files&&file.files[0]; if(!f)return;
+        extract(URL.createObjectURL(f));
+      });}
+      if(avatarBtn){avatarBtn.addEventListener('click',function(){ extract(avatarBtn.getAttribute('data-src')); });}
+    })();</script>
   </div>
   <div class="stats">
     <div class="stat card--cut js-tilt" data-reveal style="--i:0" data-num="01"><div class="num gold" data-count="${deals.length}">${deals.length}</div><div class="lbl">My deals</div></div>
@@ -7714,6 +8055,19 @@ app.post('/profile/info', requireCompany, (req, res) => {
   const about = String(req.body.about || '').trim().slice(0, 2000);
   db.prepare('UPDATE companies SET bio = ?, about = ? WHERE id = ?').run(bio, about, req.user.id);
   res.redirect('/profile?msg=' + encodeURIComponent('Profile updated.'));
+});
+
+// Logo-derived custom theme: the profile page extracts the logo's dominant colors client-side
+// (canvas) and posts up to two hex values; the server validates and derives the palette per page load.
+app.post('/profile/theme/logo', requireCompany, (req, res) => {
+  const primary = String(req.body.primary || '').trim().toLowerCase();
+  let secondary = String(req.body.secondary || '').trim().toLowerCase();
+  if (!hexToRgb(primary)) return res.redirect('/profile?err=' + encodeURIComponent('Invalid primary color — try extracting from the logo again.'));
+  if (!hexToRgb(secondary)) secondary = null;
+  db.prepare("UPDATE companies SET theme_choice = 'custom', theme_custom = ? WHERE id = ?")
+    .run(JSON.stringify(secondary ? { primary, secondary } : { primary }), req.user.id);
+  audit('THEME AGENT', 'logo theme applied', 'pass', `${req.user.name} applied a custom logo theme (primary ${primary}${secondary ? ', secondary ' + secondary : ''})`);
+  res.redirect('/profile?msg=' + encodeURIComponent('Your logo theme is live — every page now wears your brand colors.'));
 });
 
 // Batch A: per-company platform palette. Persisted on companies.theme_choice and applied
@@ -8977,7 +9331,7 @@ app.get('/tracking', requireCompanyOrAdmin, async (req, res) => {
   try {
     // Commission gate: deals awaiting commission payment approval never appear on the tracking map
     // ('none' = legacy/not-yet-finalized deals keep existing behavior; 'paid' = unlocked).
-    deals = db.prepare(`SELECT * FROM deals WHERE status IN ('dispatched','shipped') AND COALESCE(incoterm, 'CIF') != 'FOP' AND COALESCE(payment_status, 'none') != 'pending_payment' ORDER BY id DESC LIMIT 200`).all();
+    deals = db.prepare(`SELECT * FROM deals WHERE status IN ('dispatched','shipped') AND COALESCE(payment_status, 'none') != 'pending_payment' ORDER BY id DESC LIMIT 200`).all();
   } catch (e) { deals = []; }
   const markers = [];
   for (const d of deals) {
@@ -9230,6 +9584,28 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
   // ⚠️ Open escrow disputes (Batch B) — party-flagged deals surface here for mediation.
   let openDisputes = [];
   try { openDisputes = db.prepare('SELECT id, title, deal_number, escrow_dispute_at FROM deals WHERE escrow_dispute_at IS NOT NULL ORDER BY escrow_dispute_at DESC LIMIT 20').all(); } catch (e) { openDisputes = []; }
+  // 💸 Milestone payment release requests (raised when a deal's shipment status reaches an agreed milestone).
+  let pendingReleases = [];
+  try {
+    pendingReleases = db.prepare(`SELECT r.*, d.title AS deal_title, d.deal_number, d.company_id, d.buyer_received_confirmed_at
+      FROM milestone_releases r JOIN deals d ON d.id = r.deal_id
+      WHERE r.status = 'pending_admin' ORDER BY r.created_at DESC LIMIT 30`).all();
+  } catch (e) { pendingReleases = []; }
+  const namesForReleases = companyNameMap();
+  const releasesHtml = pendingReleases.length ? `<div class="card" data-reveal><h3>💸 Payment release requests</h3>
+    <p class="muted" style="margin:0 0 10px">A deal's shipment status reached an agreed payment milestone. Approve the escrow release or deny it with a reason — both parties are notified either way.</p>
+    <table><tr><th>Deal</th><th>Milestone</th><th>Amount (flow)</th><th>Triggered by</th><th>Receipt</th><th></th></tr>${pendingReleases.map(r => `<tr>
+      <td><a href="/deal/${r.deal_id}"><b>${esc(r.deal_title)}</b></a><br><span class="muted">№ ${esc(r.deal_number || String(r.deal_id))}</span></td>
+      <td><b>${esc(r.label)}</b> <span class="muted">(${r.pct}%)</span></td>
+      <td>${r.amount ? `<b>${esc(fmtAmount(r.amount))} ${esc(r.currency)}</b>` : '<span class="muted">—</span>'}</td>
+      <td class="muted">${esc(r.triggered_by || '—')}<br>${esc((r.created_at || '').slice(0, 16).replace('T', ' '))} UTC</td>
+      <td>${r.buyer_received_confirmed_at ? '<span class="badge badge-contract">✅ confirmed</span>' : '<span class="muted">not yet</span>'}</td>
+      <td style="white-space:nowrap">
+        <form method="POST" action="/admin/milestones/${r.id}/approve" style="display:inline" onsubmit="return confirm('Approve this escrow release? Both parties are notified.')"><button class="btn btn-sm btn-green">Approve</button></form>
+        <form method="POST" action="/admin/milestones/${r.id}/deny" style="display:inline-flex;gap:4px;margin-left:4px" onsubmit="return confirm('Deny this release? The note is shown to both parties.')"><input type="text" name="note" maxlength="200" placeholder="reason" required style="width:110px"><button class="btn btn-sm btn-danger">Deny</button></form>
+      </td>
+    </tr>`).join('')}</table></div>` : '';
+
   const disputesHtml = openDisputes.length ? `<div class="card" data-reveal><h3>⚠️ Open escrow disputes</h3>
     <table><tr><th>Deal</th><th>Raised (UTC)</th><th></th></tr>${openDisputes.map(d => `<tr>
       <td><b>${esc(d.title)}</b> <span class="muted">№ ${esc(d.deal_number || String(d.id))}</span></td>
@@ -9291,6 +9667,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
   <div class="card" data-reveal><h3>💰 Commission payments ${pendingPayCount ? `<span class="badge badge-sealed">${pendingPayCount} pending</span>` : ''}</h3>
     <p class="muted" style="margin-bottom:8px">Verify each bank transfer — open the receipt PDF first when one is attached — then approve. A deal's shipment tracking unlocks once every required share (per the agreed split) is approved.</p>
     <table><tr><th>Deal / contract</th><th>Company</th><th>Amount</th><th>Note</th><th>Proof</th><th>Date (UTC)</th><th>Actions</th></tr>${paymentsTableHtml}</table></div>
+  ${releasesHtml}
   ${disputesHtml}
   <div class="card" data-reveal><h3>All companies</h3>
     <table><tr><th>Company</th><th>Status</th><th>Reputation</th><th>Actions</th></tr>${companiesHtml}</table></div>
@@ -9331,9 +9708,88 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
       <button class="btn btn-sm" type="submit">Update bank details</button>
       <p class="muted" style="margin-top:8px">Changes are audit-logged. Parties copy each field with one click on the deal page.</p>
     </form></div>
+  <div class="card" data-reveal><h3>🎨 Brand &amp; documents</h3>
+    <p class="muted" style="margin:0 0 12px">This logo appears on the letterhead of every downloadable document — contracts, purchase orders, private contracts and the Terms &amp; Conditions. PNG or JPEG, max 1 MB.</p>
+    <div style="display:flex;gap:18px;align-items:center;flex-wrap:wrap">
+      <div style="background:#F4EEE0;border:1px solid var(--line);border-radius:16px;padding:14px;line-height:0"><img src="${brandLogoDataUri()}" alt="Brand logo" style="width:76px;height:76px;border-radius:12px"></div>
+      <form method="POST" action="/admin/settings/brand-logo" enctype="multipart/form-data" style="flex:1;min-width:240px">
+        <label class="file-btn dropzone"><span class="file-btn-text" data-default="📎 Upload your logo (PNG/JPEG, max 1 MB)">📎 Upload your logo (PNG/JPEG, max 1 MB)</span>
+          <input type="file" class="file-input" name="logo" accept="image/png,image/jpeg" required></label>
+        <button class="btn btn-sm" type="submit" style="margin-top:8px">Save logo</button>
+      </form>
+      <form method="POST" action="/admin/settings/brand-logo/reset" onsubmit="return confirm('Reset to the default Dealzoin logo?')">
+        <button class="btn btn-sm btn-outline" type="submit">Reset to default</button>
+      </form>
+    </div>
+    <p class="muted" style="margin-top:10px">The letterhead keeps the beige-and-brown Dealzoin theme; only the logo mark changes. Audit-logged.</p>
+  </div>
   <div class="card" data-reveal><h3>🤖 Agent activity (latest 50)</h3>
     <table><tr><th>Time (UTC)</th><th>Agent</th><th>Action</th><th>Result</th><th>Details</th></tr>${auditHtml}</table></div>`;
   res.send(page('Admin dashboard', body, req.user, req.query.msg, req.query.err));
+});
+
+// ----- Brand logo for documents: uploaded once, embedded in every .doc letterhead -----
+const logoUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 1024 * 1024, files: 1 } });
+app.post('/admin/settings/brand-logo', requireAdmin, (req, res) => {
+  logoUpload.single('logo')(req, res, (err) => {
+    if (err) return res.redirect('/admin/dashboard?err=' + encodeURIComponent(err.code === 'LIMIT_FILE_SIZE' ? 'Logo too large — max 1 MB.' : 'Logo upload failed.'));
+    const f = req.file;
+    if (!f) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Choose a PNG or JPEG logo file.'));
+    const buf = f.buffer;
+    const isPng = buf.length > 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47;
+    const isJpg = buf.length > 3 && buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF;
+    if (!isPng && !isJpg) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Logo must be a real PNG or JPEG image.'));
+    const uri = `data:image/${isPng ? 'png' : 'jpeg'};base64,${buf.toString('base64')}`;
+    db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run('brand_logo', uri);
+    audit('ADMIN', 'brand logo update', 'pass', 'Admin updated the document brand logo');
+    res.redirect('/admin/dashboard?msg=' + encodeURIComponent('Brand logo updated — it now appears on all downloadable documents.'));
+  });
+});
+app.post('/admin/settings/brand-logo/reset', requireAdmin, (req, res) => {
+  db.prepare('DELETE FROM settings WHERE key = ?').run('brand_logo');
+  audit('ADMIN', 'brand logo reset', 'pass', 'Document brand logo reset to the default Dealzoin mark');
+  res.redirect('/admin/dashboard?msg=' + encodeURIComponent('Logo reset to the default Dealzoin mark.'));
+});
+
+// ----- Milestone payment releases: the admin approves or denies each unlocked release -----
+app.post('/admin/milestones/:id/approve', requireAdmin, (req, res) => {
+  const rel = db.prepare('SELECT * FROM milestone_releases WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!rel) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Release request not found.'));
+  if (rel.status !== 'pending_admin') return res.redirect('/admin/dashboard?err=' + encodeURIComponent('This release was already decided.'));
+  const ts = now();
+  db.prepare("UPDATE milestone_releases SET status = 'released', decided_at = ?, admin_note = '' WHERE id = ?").run(ts, rel.id);
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(rel.deal_id);
+  const dealNum = deal ? (deal.deal_number || String(deal.id)) : String(rel.deal_id);
+  const amt = rel.amount ? ` ≈ ${fmtAmount(rel.amount)} ${rel.currency}` : '';
+  audit('PAYMENT AGENT', 'milestone release approved', 'pass', `Admin approved release of "${rel.label}" (${rel.pct}%${amt}) on deal ${dealNum}`);
+  // Notify BOTH parties.
+  const msg = `✅ Payment release approved: "${rel.label}" (${rel.pct}%${amt}) on deal ${dealNum}${deal ? ` ("${deal.title}")` : ''} — released from escrow (flow preview).`;
+  if (deal) {
+    notify(deal.company_id, 'milestone_release', msg, `/deal/${deal.id}`);
+    const buyerId = dealBuyerId(deal);
+    if (buyerId) notify(buyerId, 'milestone_release', msg, `/deal/${deal.id}`);
+  }
+  res.redirect('/admin/dashboard?msg=' + encodeURIComponent(`Release approved: ${rel.label} (${rel.pct}%).`));
+});
+app.post('/admin/milestones/:id/deny', requireAdmin, (req, res) => {
+  const rel = db.prepare('SELECT * FROM milestone_releases WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!rel) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Release request not found.'));
+  if (rel.status !== 'pending_admin') return res.redirect('/admin/dashboard?err=' + encodeURIComponent('This release was already decided.'));
+  const note = String(req.body.note || '').trim().slice(0, 200);
+  if (!note) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('A short reason is required when denying a release — the parties will see it.'));
+  const ts = now();
+  db.prepare("UPDATE milestone_releases SET status = 'denied', decided_at = ?, admin_note = ? WHERE id = ?").run(ts, note, rel.id);
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(rel.deal_id);
+  const dealNum = deal ? (deal.deal_number || String(deal.id)) : String(rel.deal_id);
+  const amt = rel.amount ? ` ≈ ${fmtAmount(rel.amount)} ${rel.currency}` : '';
+  audit('PAYMENT AGENT', 'milestone release denied', 'fail', `Admin denied release of "${rel.label}" (${rel.pct}%${amt}) on deal ${dealNum} — ${note}`);
+  const msg = `⛔ Payment release denied: "${rel.label}" (${rel.pct}%${amt}) on deal ${dealNum}${deal ? ` ("${deal.title}")` : ''} — reason: ${note}`;
+  if (deal) {
+    notify(deal.company_id, 'milestone_release', msg, `/deal/${deal.id}`);
+    const buyerId = dealBuyerId(deal);
+    if (buyerId) notify(buyerId, 'milestone_release', msg, `/deal/${deal.id}`);
+  }
+  res.redirect('/admin/dashboard?msg=' + encodeURIComponent(`Release denied: ${rel.label} — the parties were notified.`));
 });
 
 // ----- Company moderation -----
@@ -10000,7 +10456,7 @@ const ZO_KNOWLEDGE = [
       links: [{ label: 'Register company', href: '/signup' }, { label: 'Sign in', href: '/login' }], sug: ['Which KYC documents do I need?', 'Why is my account pending?'] }) },
   { id: 'kyc_documents', scope: 'public',
     kw: [['kyc', 5], ['documents do i need', 5], ['which documents', 4], ['what documents', 4], ['moa', 4], ['bank statement', 3], ['required documents', 4], ['signed terms', 3]],
-    reply: () => ({ text: 'For registration you need real PDF files (max 15 MB each):\n• MOA & authority document (required)\n• Bank account statement / proof of funds (required)\n• Signed Terms & Conditions (required — download, sign, upload)\n• Company profile PDF and activity proof (optional, but they speed up approval).\nEvery file is checked by the Document Authenticity Agent.',
+    reply: () => ({ text: 'For registration you need real PDF files (max 15 MB each):\n• MOA & authority document (required)\n• Bank account statement / proof of funds (required)\n• Company profile PDF and activity proof (optional, but they speed up approval).\nThe Terms & Conditions are accepted in the scroll-to-agree popup during registration — no download or signed upload needed. Every file is checked by the Document Authenticity Agent.',
       links: [{ label: 'Terms & Conditions', href: '/legal/terms' }, { label: 'Register', href: '/signup' }], sug: ['Why is my account pending?', 'How do I register?'] }) },
   { id: 'pending_approval', scope: 'public',
     kw: [['pending', 4], ['approval', 3], ['how long', 3], ['waiting', 2], ['approved yet', 3], ['not approved', 3], ['still pending', 4], ['when will', 2]],
@@ -10036,11 +10492,11 @@ const ZO_KNOWLEDGE = [
       links: [{ label: 'Tracking', href: '/tracking' }], sug: ['How does tracking work?', 'What are incoterms?'] }) },
   { id: 'tracking', scope: 'public',
     kw: [['tracking', 5], ['track', 3], ['shipment', 5], ['shipping', 4], ['vessel', 3], ['cargo', 3], ['map', 3], ['where is my', 3]],
-    reply: () => ({ text: 'The Tracking page shows live shipment maps for your finalized CIF/FOB/CFR deals once the commission payment is approved (the payment gate). Each deal page also has its own shipment tracking map with origin → destination. FOP deals are not tracked on-platform, because the buyer arranges the carriage.',
+    reply: () => ({ text: 'The Tracking page shows live shipment maps for your finalized deals once the commission payment is approved (the payment gate). Each deal page also has its own shipment tracking map with origin → destination. All incoterms (CIF/FOB/CFR) are tracked on-platform.',
       links: [{ label: 'Shipment tracking', href: '/tracking' }], sug: ['What are incoterms?', 'What is the commission?'] }) },
   { id: 'incoterms', scope: 'public',
-    kw: [['incoterm', 6], ['incoterms', 6], ['fop', 4], ['cif', 4], ['crf', 4], ['freight', 3], ['insurance', 2]],
-    reply: () => ({ text: 'Deals use four incoterms:\n• FOP — Free on Plane/Point: the buyer arranges & pays main carriage; no platform tracking.\n• CIF — Cost, Insurance & Freight: the seller pays shipping and insurance to the destination port; platform tracking enabled.\n• FOB — Free on Board: the seller delivers on board at the origin port; the buyer takes over from there; platform tracking enabled.\n• CFR — Cost & Freight: the seller pays freight to the destination port; insurance is on the buyer; platform tracking enabled.\nYou pick the incoterm when posting the deal, and the seller confirms or changes it on each private offer.',
+    kw: [['incoterm', 6], ['incoterms', 6], ['cif', 4], ['fob', 4], ['cfr', 4], ['freight', 3], ['insurance', 2]],
+    reply: () => ({ text: 'Deals use three incoterms, all with platform tracking:\n• CIF — Cost, Insurance & Freight: the seller pays shipping and insurance to the destination port.\n• FOB — Free on Board: the seller delivers on board at the origin port; the buyer takes over from there.\n• CFR — Cost & Freight: the seller pays freight to the destination port; insurance is on the buyer.\nYou pick the incoterm when posting the deal, and the seller confirms or changes it on each private offer.',
       links: [{ label: 'Create a deal', href: '/deals/new' }], sug: ['How does tracking work?', 'How do I post a deal?'] }) },
   { id: 'follow', scope: 'public',
     kw: [['follow', 4], ['unfollow', 4], ['followers', 3], ['following', 3]],
