@@ -141,7 +141,7 @@ CREATE TABLE IF NOT EXISTS conversation_members (
 CREATE TABLE IF NOT EXISTS messages (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
   conversation_id   INTEGER NOT NULL,
-  sender_company_id INTEGER NOT NULL,
+  sender_company_id INTEGER,
   body              TEXT NOT NULL,
   created_at        TEXT NOT NULL
 );
@@ -186,6 +186,27 @@ CREATE TABLE IF NOT EXISTS notifications (
   created_at TEXT NOT NULL
 );
 `);
+
+// Migration: messages.sender_company_id must allow NULL (management posts in dispute chats).
+try {
+  const msgCols = db.prepare('PRAGMA table_info(messages)').all();
+  const sc = msgCols.find(c => c.name === 'sender_company_id');
+  if (sc && sc.notnull) {
+    db.exec(`BEGIN;
+      CREATE TABLE messages_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id INTEGER NOT NULL,
+        sender_company_id INTEGER,
+        body TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO messages_new (id, conversation_id, sender_company_id, body, created_at)
+        SELECT id, conversation_id, sender_company_id, body, created_at FROM messages;
+      DROP TABLE messages;
+      ALTER TABLE messages_new RENAME TO messages;
+    COMMIT;`);
+  }
+} catch (e) { /* non-fatal */ }
 
 // Graceful upgrades for databases created before media support existed.
 try { db.exec('ALTER TABLE deals ADD COLUMN media_id INTEGER'); } catch (e) { /* column already exists */ }
@@ -514,6 +535,8 @@ db.exec(`CREATE TABLE IF NOT EXISTS warehouse_movements (
   created_at TEXT NOT NULL
 )`);
 try { db.exec('CREATE INDEX IF NOT EXISTS idx_wh_movements_item ON warehouse_movements(item_id, id)'); } catch (e) { /* index may already exist */ }
+try { db.exec("ALTER TABLE warehouse_movements ADD COLUMN reason TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE expenses ADD COLUMN deal_id INTEGER'); } catch (e) { /* column already exists */ }
 
 /** Next warehouse SKU for a company: DZ-<companyId>-<zero-padded seq> (per-company counter in settings). */
 function nextSku(companyId) {
@@ -950,20 +973,29 @@ function escrowPanelHtml(deal, user, isOwner, isBuyer) {
 
   // (4) Buyer receipt confirmation — REAL data: only the buyer, only once the deal is delivered.
   let confirmHtml = '';
+  const discussBtn = !user.isAdmin ? `<form method="POST" action="/deal/${deal.id}/discuss" style="display:inline;margin-left:8px">
+      <button class="btn btn-sm btn-outline" type="submit">💬 Discuss with management</button>
+    </form>` : '';
   if (deal.escrow_dispute_at) {
     confirmHtml = `<p style="margin-top:10px"><span class="badge badge-sealed">⚠️ Dispute raised ${esc(deal.escrow_dispute_at.slice(0, 16).replace('T', ' '))} UTC</span>
-      <span class="muted">— the platform team has been alerted and will mediate between the parties.</span></p>`;
+      <span class="muted">— the platform team has been alerted and will mediate between the parties.</span>${discussBtn}</p>`;
   } else if (confirmed) {
     confirmHtml = `<p style="margin-top:10px"><span class="badge badge-contract">✅ Buyer confirmed receipt of goods — ${esc(deal.buyer_received_confirmed_at.slice(0, 16).replace('T', ' '))} UTC</span>
-      <span class="muted">· final milestone release awaits admin approval</span></p>`;
+      <span class="muted">· final milestone release awaits admin approval</span>${discussBtn}</p>`;
   } else if (delivered) {
     confirmHtml = `<div style="margin-top:10px">
       ${isBuyer ? `<form method="POST" action="/deal/${deal.id}/confirm-receipt" style="display:inline" onsubmit="return confirm('Confirm you have received the goods in good order? This requests the final escrow release (admin approves) and is audit-logged.')">
         <button class="btn btn-green" type="submit">✅ Confirm receipt of goods</button>
       </form>` : `<p class="muted">Waiting for <b>${esc(names.get(buyerId) || 'the buyer')}</b> to confirm receipt of goods.</p>`}
+      ${user.isAdmin ? `<form method="POST" action="/deal/${deal.id}/admin-confirm-receipt" style="display:inline;margin-left:8px" onsubmit="return confirm('Confirm receipt ON BEHALF OF THE BUYER? This raises the final escrow release request and both parties are notified.')">
+        <button class="btn btn-sm" type="submit">🛡️ Confirm receipt (admin overtake)</button>
+      </form>` : ''}
       <form method="POST" action="/deal/${deal.id}/escrow-dispute" style="display:inline;margin-left:8px" onsubmit="return confirm('Raise a dispute on this deal? The platform team is alerted and the release is paused.')">
         <button class="btn btn-sm btn-danger" type="submit">⚠️ Dispute</button>
       </form>
+      ${!user.isAdmin ? `<form method="POST" action="/deal/${deal.id}/discuss" style="display:inline;margin-left:8px">
+        <button class="btn btn-sm btn-outline" type="submit">💬 Discuss with management</button>
+      </form>` : ''}
     </div>`;
   } else {
     confirmHtml = `<p class="muted" style="margin-top:10px">The "Confirm receipt of goods" step activates for the buyer once the deal status reaches <b>delivered</b>.</p>`;
@@ -1528,7 +1560,7 @@ const LANG_LABELS = { en: 'English', ar: 'العربية', zh: '中文' };
 const I18N = {
   en: {
     'nav.home': 'Home', 'nav.chats': 'Chats', 'nav.contracts': 'Contracts', 'nav.calendar': 'Calendar',
-    'nav.tracking': 'Tracking', 'nav.notifications': 'Notifications', 'nav.search': 'Search',
+    'nav.tracking': 'Tracking', 'nav.tenders': 'Tenders', 'nav.notifications': 'Notifications', 'nav.search': 'Search',
     'nav.profile': 'Profile', 'nav.dashboard': 'Dashboard', 'nav.create': 'Create', 'nav.logout': 'Log out',
     'nav.signin': 'Sign in', 'nav.register': 'Register company', 'nav.theme': 'Toggle light/dark theme',
     'nav.language': 'Interface language',
@@ -3113,6 +3145,7 @@ const CSS = `
 /** Inline SVG icons for the company nav (no emoji in the nav bar). */
 const NAV_ICONS = {
   home: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M9.5 21v-6h5v6"/></svg>',
+  tenders: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 4h6v3H9z"/><path d="M9 6H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-2"/><path d="M9 12h6M9 16h4"/></svg>',
   chats: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11.5a7.5 7.5 0 0 1-7.5 7.5c-1.2 0-2.4-.27-3.4-.78L4 20l1.7-4.4A7.5 7.5 0 1 1 21 11.5z"/><path d="M8.5 10.5h7M8.5 13.5h4"/></svg>',
   search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m20 20-4.8-4.8"/></svg>',
   profile: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="7.5" r="3.5"/><path d="M3.5 20v-1.5a5.5 5.5 0 0 1 5.5-5.5h0a5.5 5.5 0 0 1 5.5 5.5V20"/><path d="M16 4h5v7h-5z"/><path d="M17.5 7.5h1"/></svg>',
@@ -3175,6 +3208,7 @@ function page(title, body, user, msg, err, active, headExtra, opts) {
          ${navIcon('contracts', '/contracts', tt('nav.contracts'), active, contractsUnread)}
          ${navIcon('calendar', '/calendar', tt('nav.calendar'), active)}
          ${navIcon('globe', '/tracking', tt('nav.tracking'), active)}
+         ${navIcon('tenders', '/tenders', tt('nav.tenders'), active)}
          ${navIcon('bell', '/notifications', tt('nav.notifications'), active, notifUnread)}
          ${navIcon('search', '/search', tt('nav.search'), active)}
          ${navIcon('profile', '/profile', tt('nav.profile'), active)}
@@ -3268,6 +3302,20 @@ ${termsGate ? `<noscript><div class="card" style="position:fixed;left:16px;right
   }
   // Flash messages: auto-dismiss after 5s (matches the CSS countdown bar).
   setTimeout(function(){document.querySelectorAll('.flash-ok,.flash-err').forEach(function(e){e.style.transition='opacity .4s';e.style.opacity='0';setTimeout(function(){e.remove();},400);});},5000);
+  /* "Other" dropdowns: reveal a free-text field when the Other option is chosen. */
+  function dzSyncOther(sel){
+    if(!sel.querySelector('option[value="Other"]'))return; /* only selects that actually offer "Other" */
+    var wrap=sel.parentElement; if(!wrap)return;
+    var inp=wrap.querySelector('.dz-other-input'); if(!inp)return;
+    var on=(sel.value==='Other');
+    inp.style.display=on?'':'none';
+    if(on){inp.setAttribute('required','required');}
+    else{inp.removeAttribute('required');}
+  }
+  document.addEventListener('change',function(ev){
+    if(ev.target&&ev.target.tagName==='SELECT')dzSyncOther(ev.target);
+  });
+  document.querySelectorAll('select').forEach(dzSyncOther);
   /* ===== BATCH C — shared toasts + direct translator + ticker polling ===== */
   window.dzToast=function(msg,isErr){
     var box=document.getElementById('dz-toasts');
@@ -3670,7 +3718,12 @@ const INCOTERM_EXPLAINERS = {
   CFR: 'CFR — Cost & Freight: the seller pays freight to the destination port; insurance is on the buyer. Platform tracking enabled.'
 };
 // Cargo capacity on deal publish (Batch A) — quantity + unit.
-const DEAL_CARGO_UNITS = ['MT', 'kg', 'containers/TEU', 'CBM', 'pallets', 'units', 'barrels'];
+const DEAL_CARGO_UNITS = ['MT', 'kg', 'g', 'lbs', 'oz', 'pieces', 'units', 'boxes', 'pallets', 'containers/TEU', 'CBM', 'L', 'mL', 'barrels']
+
+/** Warehouse units of measure (Zoho-style UoM list) — 'Other' reveals a free-text field. */
+const WAREHOUSE_UNITS = ['units', 'pieces', 'kg', 'g', 'lbs', 'oz', 'MT', 'L', 'mL', 'm3', 'boxes', 'pallets', 'containers', 'barrels', 'Other'];
+/** Zoho-style stock movement reason codes — every adjustment is auditable. */
+const MOVEMENT_REASONS = ['Sale / delivery', 'Purchase / restock', 'Stock adjustment', 'Damage / loss', 'Return', 'Other'];;
 
 // ============================= BRANDED DOCUMENT LETTERHEAD =============================
 // Every downloadable document (contracts, POs, private contracts, Terms & Conditions)
@@ -4161,7 +4214,8 @@ function dealFormFieldsHtml(pre) {
   const preOrigin = String(pre.origin || '').slice(0, 160);
   const preDest = String(pre.destination || '').slice(0, 160);
   const preDesc = String(pre.description || '').slice(0, 4000);
-  const preCat = COMPANY_CATEGORIES.includes(pre.category) ? pre.category : '';
+  const preCatCustom = (!COMPANY_CATEGORIES.includes(pre.category) && String(pre.category || '').trim()) ? String(pre.category).trim().slice(0, 60) : '';
+  const preCat = COMPANY_CATEGORIES.includes(pre.category) ? pre.category : (preCatCustom ? 'Other' : '');
   const preInco = DEAL_INCOTERMS.includes(pre.incoterm) ? pre.incoterm : 'CIF';
   const preCargoQty = (pre.cargo_qty != null && pre.cargo_qty !== '' && isFinite(Number(pre.cargo_qty)) && Number(pre.cargo_qty) > 0) ? String(Number(pre.cargo_qty)) : '';
   const preCargoUnit = DEAL_CARGO_UNITS.includes(pre.cargo_unit) ? pre.cargo_unit : 'MT';
@@ -4175,7 +4229,7 @@ function dealFormFieldsHtml(pre) {
       </div>
       <label>Deal title</label><input type="text" name="title" required maxlength="160" value="${esc(preTitle)}">
       <div class="grid2" style="gap:10px">
-        <div><label>Category (required)</label><select name="category" required><option value="">— choose —</option>${optionsHtml(COMPANY_CATEGORIES, preCat)}</select></div>
+        <div><label>Category (required)</label><select name="category" required><option value="">— choose —</option>${optionsHtml(COMPANY_CATEGORIES, preCat)}</select>${otherInputHtml('category', preCatCustom)}</div>
         <div><label>Origin location (required)</label><input type="text" name="origin" required maxlength="160" value="${esc(preOrigin)}" placeholder="e.g. Rotterdam, NL"></div>
       </div>
       <label>Destination (optional)</label><input type="text" name="destination" maxlength="160" value="${esc(preDest)}" placeholder="e.g. Jebel Ali, Dubai">
@@ -4474,7 +4528,7 @@ app.get('/signup', (req, res) => {
       <label>Description</label><textarea name="description" rows="4" maxlength="2000"></textarea>
       <label>Field of activity (required)</label><input type="text" name="activity" id="f-activity" required maxlength="300" placeholder="e.g. Wholesale electronics trading">
       <div class="grid2">
-        <div><label>Category (required)</label><select name="category" required><option value="">— choose —</option>${optionsHtml(COMPANY_CATEGORIES, '')}</select></div>
+        <div><label>Category (required)</label><select name="category" required><option value="">— choose —</option>${optionsHtml(COMPANY_CATEGORIES, '')}</select>${otherInputHtml('category')}</div>
         <div><label>Trade license number (required)</label><input type="text" name="trade_license" required minlength="4" maxlength="80" placeholder="e.g. TL-9988"></div>
       </div>
 
@@ -4548,7 +4602,8 @@ async function signupCompleteHandler(req, res) {
   if (site && !/^https?:\/\//i.test(site)) site = 'https://' + site.replace(/^[a-z][a-z0-9+.-]*:/i, '');
   if (site && !/^https:\/\/[^\s]+$/i.test(site)) site = '';
   const activity = String(b.activity || '').trim().slice(0, 300);
-  const category = COMPANY_CATEGORIES.includes(b.category) ? b.category : '';
+  const category = resolveOther(b.category, b.category_other, COMPANY_CATEGORIES);
+  if (category === null) return fail('You chose "Other" as the category — please type it in the field that appeared.');
   const tradeLicense = String(b.trade_license || '').trim().slice(0, 80);
   const signatureName = String(b.signature_name || '').trim().slice(0, 120);
 
@@ -5026,7 +5081,8 @@ app.post('/deals', requireCompany, dealUpload, async (req, res) => {
   const currency = DEAL_CURRENCIES.includes(req.body.currency) ? req.body.currency : 'USD';
   const timePeriod = DEAL_TIME_PERIODS.includes(req.body.time_period) ? req.body.time_period : '30 days';
   const dealType = DEAL_TYPES.includes(req.body.deal_type) ? req.body.deal_type : 'sell';
-  const category = COMPANY_CATEGORIES.includes(req.body.category) ? req.body.category : '';
+  const category = resolveOther(req.body.category, req.body.category_other, COMPANY_CATEGORIES);
+  if (category === null) return res.redirect('/deals/new?err=' + encodeURIComponent('You chose "Other" as the category — please type it in the field that appeared.'));
   const origin = String(req.body.origin || '').trim().slice(0, 160);
   const destination = String(req.body.destination || '').trim().slice(0, 160);
   const incoterm = DEAL_INCOTERMS.includes(req.body.incoterm) ? req.body.incoterm : 'CIF';
@@ -5555,6 +5611,11 @@ app.get('/deal/:id', requireCompanyOrAdmin, async (req, res) => {
           <div><label>Origin pin (optional, lat,lng)</label><input type="text" name="origin_pin" maxlength="60" placeholder="e.g. ${deal.origin_lat != null && deal.origin_lng != null ? esc(deal.origin_lat + ',' + deal.origin_lng) : '25.2048,55.2708'}"></div>
           <div><label>Destination pin (optional, lat,lng)</label><input type="text" name="dest_pin" maxlength="60" placeholder="e.g. ${deal.dest_lat != null && deal.dest_lng != null ? esc(deal.dest_lat + ',' + deal.dest_lng) : '51.5074,-0.1278'}"></div>
         </div>
+        ${isOwner ? `<div class="grid2" style="gap:10px">
+          <div><label>Deduct from warehouse on delivery (optional)</label><select name="stockout_item"><option value="">— no stock change —</option>${db.prepare('SELECT id, sku, name, quantity, unit FROM warehouse_items WHERE company_id = ? ORDER BY name LIMIT 100').all(deal.company_id).map(wi => `<option value="${wi.id}">${esc(wi.sku)} — ${esc(wi.name)} (${fmtAmount(wi.quantity)} ${esc(wi.unit)})</option>`).join('')}</select></div>
+          <div><label>Quantity to deduct</label><input type="number" name="stockout_qty" min="0" step="any" placeholder="0" inputmode="decimal"></div>
+        </div>
+        <p class="muted" style="margin:-6px 0 10px">When you set the status to <b>delivered</b>, the chosen quantity is booked out of your warehouse automatically (reason: Sale / delivery, linked to this deal).</p>` : ''}
         <button class="btn btn-sm" type="submit">Update status</button>
         <p class="muted" style="margin-top:6px">The other party is notified and the update is audit-logged. Pins override map geocoding when a city is not found automatically.</p>
       </form>` : '';
@@ -5737,6 +5798,26 @@ app.post('/deal/:id/status', (req, res) => {
       deal.dest_lat = dPin ? dPin.lat : deal.dest_lat; deal.dest_lng = dPin ? dPin.lng : deal.dest_lng;
     }
   } catch (e) { /* pin update is best-effort — never break the status update */ }
+  // WAREHOUSE CONNECTION: delivering can book stock out of the seller's warehouse automatically.
+  let stockMsg = '';
+  if (newStatus === 'delivered' && isOwner) {
+    try {
+      const wiId = parseInt(req.body.stockout_item, 10) || 0;
+      const wiQty = parseFloat(req.body.stockout_qty) || 0;
+      if (wiId && wiQty > 0) {
+        const wi = db.prepare('SELECT * FROM warehouse_items WHERE id = ? AND company_id = ?').get(wiId, user.id);
+        if (wi) {
+          const applied = Math.min(wiQty, wi.quantity);
+          db.prepare('UPDATE warehouse_items SET quantity = ? WHERE id = ?').run(wi.quantity - applied, wi.id);
+          db.prepare('INSERT INTO warehouse_movements (item_id, company_id, direction, quantity, note, deal_id, reason, created_at) VALUES (?,?,?,?,?,?,?,?)')
+            .run(wi.id, user.id, 'OUT', applied, `Delivered on deal ${deal.deal_number || '#' + deal.id}`, deal.id, 'Sale / delivery', now());
+          stockMsg = ` ${fmtAmount(applied)} ${wi.unit} of ${wi.sku} booked out of the warehouse.`;
+          agentInsight(user.id, 'WAREHOUSE AGENT', 'info', `${fmtAmount(applied)} ${wi.unit} of ${wi.sku} "${wi.name}" shipped on deal ${deal.deal_number || '#' + deal.id} — ${fmtAmount(wi.quantity - applied)} ${wi.unit} remaining.`);
+          if (applied < wiQty) stockMsg += ` (requested ${fmtAmount(wiQty)} — capped at available stock.)`;
+        }
+      }
+    } catch (e) { /* stock-out is best-effort — never break the status update */ }
+  }
   // Payment-milestone hook: reaching an agreed milestone's stage raises an admin release request.
   try { triggerMilestoneReleases(deal, newStatus, user); } catch (e) { /* never break the status update */ }
   audit('DEAL AGENT', 'status update', 'pass', `${user.isAdmin ? 'Admin' : user.name} advanced deal ${deal.deal_number || '#' + deal.id} to "${newStatus}"${note ? ` — note: ${note}` : ''}${trackingNumber ? ` — tracking ${trackingNumber}` : ''}`);
@@ -5744,7 +5825,7 @@ app.post('/deal/:id/status', (req, res) => {
   const label = `${user.isAdmin ? 'The platform' : user.name} updated deal ${deal.deal_number || '#' + deal.id} ("${deal.title}") to "${newStatus.toUpperCase()}"${note ? ` — ${note}` : ''}`;
   if (user.isAdmin || isBuyer) notify(deal.company_id, 'deal_status', label, `/deal/${deal.id}`);
   if (user.isAdmin || isOwner) { if (buyerId) notify(buyerId, 'deal_status', label, `/deal/${deal.id}`); }
-  res.redirect(back + '?msg=' + encodeURIComponent(`Deal status updated to "${newStatus}".`));
+  res.redirect(back + '?msg=' + encodeURIComponent(`Deal status updated to "${newStatus}".${stockMsg}`));
 });
 
 // ----- POST /deal/:id/payment-confirm — a deal party confirms it sent its commission share (bank transfer) -----
@@ -5865,6 +5946,29 @@ app.post('/deal/:id/confirm-receipt', requireCompany, (req, res) => {
   notify(deal.company_id, 'receipt_confirmed', `${req.user.name} confirmed receipt of goods on deal ${deal.deal_number || '#' + deal.id} ("${deal.title}") — the final milestone release now awaits admin approval.`, back);
   res.redirect(back + '?msg=' + encodeURIComponent('Receipt confirmed — thank you! The final milestone release now awaits admin approval.'));
 });
+// ----- POST /deal/:id/admin-confirm-receipt — admin overtakes the buyer's receipt confirmation -----
+// (delivered goods, buyer unresponsive — management confirms on the buyer's behalf; fully audit-logged).
+app.post('/deal/:id/admin-confirm-receipt', requireAdmin, (req, res) => {
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!deal) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Deal not found.'));
+  const back = `/deal/${deal.id}`;
+  if (deal.status !== 'delivered') {
+    return res.redirect(back + '?err=' + encodeURIComponent('Receipt can only be confirmed once the deal status is "delivered".'));
+  }
+  if (deal.buyer_received_confirmed_at) {
+    return res.redirect(back + '?err=' + encodeURIComponent('Receipt was already confirmed for this deal.'));
+  }
+  const ts = now();
+  db.prepare('UPDATE deals SET buyer_received_confirmed_at = ? WHERE id = ?').run(ts, deal.id);
+  try { triggerMilestoneReleases(deal, 'delivered', req.user); } catch (e) { /* never break the confirmation */ }
+  audit('ESCROW AGENT', 'admin overtook receipt confirmation', 'pass', `Admin confirmed receipt on behalf of the buyer for deal ${deal.deal_number || '#' + deal.id} ("${deal.title}")`);
+  const msg = `🛡️ Management confirmed receipt of goods on the buyer's behalf for deal ${deal.deal_number || '#' + deal.id} ("${deal.title}") — the final milestone release request was raised.`;
+  notify(deal.company_id, 'escrow_admin_confirm', msg, `/deal/${deal.id}`);
+  const buyerId = dealBuyerId(deal);
+  if (buyerId) notify(buyerId, 'escrow_admin_confirm', msg, `/deal/${deal.id}`);
+  res.redirect(back + '?msg=' + encodeURIComponent('Receipt confirmed on behalf of the buyer — delivery-phase payment release is now in your approval queue.'));
+});
+
 // ----- BATCH B (4): either party raises a dispute — pauses the release design and alerts the admin -----
 app.post('/deal/:id/escrow-dispute', requireCompany, (req, res) => {
   const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
@@ -5884,9 +5988,73 @@ app.post('/deal/:id/escrow-dispute', requireCompany, (req, res) => {
   db.prepare('UPDATE deals SET escrow_dispute_at = ? WHERE id = ?').run(ts, deal.id);
   audit('ESCROW AGENT', 'dispute raised', 'flag', `${req.user.name} raised a dispute on deal ${deal.deal_number || '#' + deal.id} at ${ts} — escrow release paused (flow preview)`);
   const other = isOwner ? buyerId : deal.company_id;
-  if (other) notify(other, 'escrow_dispute', `${req.user.name} raised a dispute on deal ${deal.deal_number || '#' + deal.id} ("${deal.title}"). The platform team has been alerted and will mediate.`, back);
-  res.redirect(back + '?msg=' + encodeURIComponent('Dispute raised — the platform team has been alerted (admin dashboard + audit log).'));
+  // Auto-open the management discussion chat so the parties can talk it through with the platform team.
+  let chatLink = back;
+  try { chatLink = '/chat/' + disputeChatFor(deal); } catch (e) { /* chat creation is best-effort */ }
+  if (other) notify(other, 'escrow_dispute', `${req.user.name} raised a dispute on deal ${deal.deal_number || '#' + deal.id} ("${deal.title}"). The platform team has been alerted — a management discussion is open.`, chatLink);
+  res.redirect(back + '?msg=' + encodeURIComponent('Dispute raised — the platform team has been alerted and a management discussion chat is now open for this deal.'));
 });
+/** Find-or-create the management discussion chat for a deal (buyer + seller + Dealzoin management). */
+function disputeChatFor(deal) {
+  const buyerId = dealBuyerId(deal);
+  const existing = db.prepare(`SELECT id FROM conversations WHERE type = 'dispute' AND name = ?`).get('deal:' + deal.id);
+  if (existing) return existing.id;
+  const ts = now();
+  const convId = db.prepare(`INSERT INTO conversations (type, name, created_at) VALUES ('dispute', ?, ?)`)
+    .run('deal:' + deal.id, ts).lastInsertRowid;
+  db.prepare('INSERT INTO conversation_members (conversation_id, company_id, last_read_at) VALUES (?,?,?)').run(convId, deal.company_id, ts);
+  if (buyerId && buyerId !== deal.company_id) {
+    db.prepare('INSERT INTO conversation_members (conversation_id, company_id, last_read_at) VALUES (?,?,?)').run(convId, buyerId, ts);
+  }
+  db.prepare('INSERT INTO messages (conversation_id, sender_company_id, body, created_at, author_name) VALUES (?,?,?,?,?)')
+    .run(convId, null, `🛡️ Dealzoin management opened this discussion for deal ${deal.deal_number || '#' + deal.id} ("${String(deal.title).slice(0, 80)}"). Both parties and the platform team can talk here — delivered-goods issues, damaged products, release questions. Everything is audit-logged.`, ts, 'Dealzoin Management');
+  return Number(convId);
+}
+
+// ----- POST /deal/:id/discuss — a party opens the management discussion chat (delivered / harmed goods) -----
+app.post('/deal/:id/discuss', requireCompany, (req, res) => {
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!deal) return res.redirect('/timeline?err=' + encodeURIComponent('Deal not found.'));
+  const buyerId = dealBuyerId(deal);
+  const isOwner = req.user.id === deal.company_id;
+  const isBuyer = !!buyerId && buyerId === req.user.id;
+  if (!isOwner && !isBuyer) {
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Parties only</h2><p class="muted">Only the deal parties can open a management discussion.</p></div>', req.user));
+  }
+  const convId = disputeChatFor(deal);
+  audit('ESCROW AGENT', 'management discussion opened', 'pass', `${req.user.name} opened the management discussion for deal ${deal.deal_number || '#' + deal.id} (chat #${convId})`);
+  const other = isOwner ? buyerId : deal.company_id;
+  if (other) notify(other, 'dispute_chat', `${req.user.name} opened a management discussion on deal ${deal.deal_number || '#' + deal.id} ("${deal.title}").`, `/chat/${convId}`);
+  res.redirect('/chat/' + convId);
+});
+
+// ----- POST /chat/:id/admin-send — management replies inside a dispute discussion -----
+app.post('/chat/:id/admin-send', requireAdmin, (req, res) => {
+  const convId = parseInt(req.params.id, 10);
+  const conv = db.prepare('SELECT * FROM conversations WHERE id = ?').get(convId);
+  if (!conv || conv.type !== 'dispute') {
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Dispute discussions only</h2><p class="muted">Management can only post inside deal dispute discussions.</p></div>', req.user));
+  }
+  const txt = String(req.body.body || '').trim();
+  if (!txt) return res.redirect('/chat/' + convId + '?err=' + encodeURIComponent('Message cannot be empty.'));
+  const ts = now();
+  const info = db.prepare('INSERT INTO messages (conversation_id, sender_company_id, body, created_at, author_name) VALUES (?,?,?,?,?)')
+    .run(convId, null, txt.slice(0, 2000), ts, 'Dealzoin Management');
+  sseBroadcast(convId, {
+    id: Number(info.lastInsertRowid), conversation_id: convId,
+    sender_company_id: null, sender_name: 'Dealzoin Management',
+    author_name: 'Dealzoin Management', body: txt.slice(0, 2000), created_at: ts,
+    cid: String(req.get('x-dz-client') || '')
+  });
+  try {
+    for (const m of db.prepare('SELECT company_id FROM conversation_members WHERE conversation_id = ?').all(convId)) {
+      notify(m.company_id, 'dispute_chat', `🛡️ Dealzoin management replied in the dispute discussion: "${txt.slice(0, 80)}${txt.length > 80 ? '…' : ''}"`, `/chat/${convId}`);
+    }
+  } catch (e) { /* notifications are best-effort */ }
+  audit('ESCROW AGENT', 'management message sent', 'pass', `Admin posted in dispute chat #${convId}: "${txt.slice(0, 80)}"`);
+  res.redirect('/chat/' + convId);
+});
+
 
 // ----- BATCH B (6): receiving-country shipment agent — nominate / remove / log updates -----
 /** Guard helper: load deal + require a party (owner/buyer) or admin. Returns { deal, isOwner, buyerId } or null. */
@@ -6943,6 +7111,9 @@ app.get('/deal/:id/loi', requireCompany, (req, res) => {
       </div>
       <label>Wishes / conditions (optional)</label>
       <textarea name="loi_wishes" rows="3" maxlength="2000" placeholder="Delivery windows, inspection, certificates…"></textarea>
+      <label>Split payment schedule (optional — escrow milestones)</label>
+      <p class="muted" style="margin:-6px 0 8px">Propose how the payment is released (e.g. 10% before loading, 20% after loading, 70% on delivery). The seller sees this with your LOI and it prefills the split step later — percentages must sum to 100.</p>
+      ${milestoneFormRowsHtml(null)}
       <label>Seller response deadline *</label>
       <select name="loi_deadline_days" required>${optionsHtml(LOI_DEADLINE_DAYS.map(d => String(d)), '7')}</select>
       <p class="muted" style="margin:-6px 0 12px">Days the seller has to respond (3 / 7 / 14 / 30). If the deadline passes before a Purchase Order, the negotiation expires and you can re-issue the LOI.</p>
@@ -6973,11 +7144,19 @@ app.post('/deal/:id/loi', requireCompany, (req, res) => {
   if (!loiLoc) return res.redirect(`/deal/${deal.id}/loi?err=` + encodeURIComponent('Your location is required.'));
   const loiDays = LOI_DEADLINE_DAYS.includes(Number(req.body.loi_deadline_days)) ? Number(req.body.loi_deadline_days) : 7;
   const loiExpiresAt = loiExpiryFrom(loiDays);
+  // Optional split-payment schedule proposed inside the LOI — only validated when at least one row is filled.
+  const anyMsRow = [1, 2, 3, 4].some(k => String(req.body['ms_pct_' + k] || '').trim() !== '');
+  let loiMsJson = null;
+  if (anyMsRow) {
+    const parsed = parseMilestonesInput(req.body);
+    if (parsed.error) return res.redirect(`/deal/${deal.id}/loi?err=` + encodeURIComponent('Split schedule: ' + parsed.error));
+    loiMsJson = JSON.stringify(parsed.milestones);
+  }
   const ts = now();
-  const negId = db.prepare(`INSERT INTO negotiations (deal_id, buyer_id, seller_id, state, round, loi_text, loi_location, loi_quantity, loi_wishes, commission_split, loi_expires_at, created_at, updated_at)
-    VALUES (?,?,?, 'LOI_SENT', 0, ?,?,?,?, '50-50', ?, ?, ?)`)
-    .run(deal.id, req.user.id, deal.company_id, loiText, loiLoc, loiQty, loiWishes, loiExpiresAt, ts, ts).lastInsertRowid;
-  negEvent(negId, req.user.id, 'loi', { note: `Location: ${loiLoc}${loiQty ? ` · Quantity: ${loiQty}` : ''} · Response deadline: ${loiDays} days (${loiExpiresAt.slice(0, 16).replace('T', ' ')} UTC)`, terms: loiText + (loiWishes ? `\nWishes: ${loiWishes}` : '') });
+  const negId = db.prepare(`INSERT INTO negotiations (deal_id, buyer_id, seller_id, state, round, loi_text, loi_location, loi_quantity, loi_wishes, commission_split, loi_expires_at, milestone_proposal, created_at, updated_at)
+    VALUES (?,?,?, 'LOI_SENT', 0, ?,?,?,?, '50-50', ?, ?, ?, ?)`)
+    .run(deal.id, req.user.id, deal.company_id, loiText, loiLoc, loiQty, loiWishes, loiExpiresAt, loiMsJson, ts, ts).lastInsertRowid;
+  negEvent(negId, req.user.id, 'loi', { note: `Location: ${loiLoc}${loiQty ? ` · Quantity: ${loiQty}` : ''} · Response deadline: ${loiDays} days (${loiExpiresAt.slice(0, 16).replace('T', ' ')} UTC)${loiMsJson ? ' · Split proposed: ' + milestoneSummaryText(JSON.parse(loiMsJson)) : ''}`, terms: loiText + (loiWishes ? `\nWishes: ${loiWishes}` : '') });
   audit('DEAL AGENT', 'LOI sent', 'pass', `${req.user.name} sent an LOI on deal ${deal.deal_number || '#' + deal.id} (negotiation #${negId}, location: ${loiLoc}, deadline ${loiDays}d)`);
   notify(deal.company_id, 'loi', `${req.user.name} expressed interest in your deal "${deal.title}" (LOI, from ${loiLoc}). Review and send a private offer.`, `/negotiation/${negId}`);
   res.redirect(`/negotiation/${negId}?msg=` + encodeURIComponent('Letter of Intent sent — the seller has been notified.'));
@@ -8367,6 +8546,11 @@ function isMember(convId, companyId) {
 /** Display name for a conversation: group name, or the other party's company name for private chats. */
 function convDisplayName(conv, viewerId, names) {
   if (conv.type === 'group') return conv.name || 'Group chat';
+  if (conv.type === 'dispute') {
+    const dealId = parseInt(String(conv.name || '').replace('deal:', ''), 10);
+    const d = dealId ? db.prepare('SELECT deal_number, title FROM deals WHERE id = ?').get(dealId) : null;
+    return `🛡️ Management — deal ${d ? (d.deal_number || '#' + dealId) : (conv.name || '')}`;
+  }
   const other = db.prepare('SELECT company_id FROM conversation_members WHERE conversation_id = ? AND company_id != ? LIMIT 1').get(conv.id, viewerId);
   if (other) return names.get(other.company_id) || 'Unknown';
   return names.get(viewerId) || 'Chat';
@@ -8514,7 +8698,7 @@ app.get('/chat/:id', (req, res) => {
   const msgs = db.prepare('SELECT * FROM messages WHERE conversation_id = ? ORDER BY id ASC LIMIT 500').all(convId);
   const bubbles = msgs.length ? msgs.map(m => {
     const mine = !user.isAdmin && m.sender_company_id === user.id;
-    const sender = names.get(m.sender_company_id) || 'Unknown';
+    const sender = names.get(m.sender_company_id) || (m.author_name === 'Dealzoin Management' ? '🛡️ Dealzoin Management' : 'Unknown');
     const senderLine = (conv.type === 'group' || m.author_name) && !mine
       ? `<div class="bubble-sender">${esc(sender)}${m.author_name ? ` — by ${esc(m.author_name)}` : ''}</div>`
       : (mine && m.author_name ? `<div class="bubble-sender">— by ${esc(m.author_name)}</div>` : '');
@@ -8529,7 +8713,13 @@ app.get('/chat/:id', (req, res) => {
   }).join('') : '<p class="muted">No messages yet — say hello.</p>';
 
   const sendForm = user.isAdmin
-    ? '<p class="muted">Admin view — conversations are read-only for admins.</p>'
+    ? (conv.type === 'dispute'
+      ? `<form method="POST" action="/chat/${conv.id}/admin-send" class="chat-send" id="chatform">
+         <input type="text" name="body" required maxlength="2000" placeholder="Reply as Dealzoin Management…">
+         <button class="btn btn-green" type="submit">Send</button>
+       </form>
+       <p class="muted" style="margin-top:6px">🛡️ You are posting as <b>Dealzoin Management</b> — both parties are notified.</p>`
+      : '<p class="muted">Admin view — conversations are read-only for admins.</p>')
     : `<form method="POST" action="/chat/${conv.id}/send" class="chat-send" id="chatform">
          <input type="text" name="body" required maxlength="2000" placeholder="Write a message…" autocomplete="off">
          <button class="btn js-send" type="submit">Send</button>
@@ -9945,6 +10135,27 @@ app.post('/admin/milestones/:id/approve', requireAdmin, (req, res) => {
   const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(rel.deal_id);
   const dealNum = deal ? (deal.deal_number || String(deal.id)) : String(rel.deal_id);
   const amt = rel.amount ? ` ≈ ${fmtAmount(rel.amount)} ${rel.currency}` : '';
+  // ACCOUNTING CONNECTION: the release posts itself into both parties' ledgers — an invoice for the
+  // seller (paid, linked to the deal) and a matching Purchases expense for the buyer. Idempotent per release id.
+  if (deal && rel.amount && rel.amount > 0) {
+    try {
+      const token = `[ms-rel-${rel.id}]`;
+      const buyerId2 = dealBuyerId(deal);
+      const buyerName = buyerId2 ? (db.prepare('SELECT name FROM companies WHERE id = ?').get(buyerId2) || {}).name || 'Buyer' : 'Buyer';
+      const sellerName = (db.prepare('SELECT name FROM companies WHERE id = ?').get(deal.company_id) || {}).name || 'Seller';
+      const invNote = `${token} Escrow milestone release — "${rel.label}" (${rel.pct}%) on deal ${dealNum}`;
+      if (!db.prepare('SELECT id FROM invoices WHERE company_id = ? AND deal_id = ? AND notes LIKE ?').get(deal.company_id, deal.id, token + '%')) {
+        db.prepare(`INSERT INTO invoices (company_id, client, amount, currency, due_date, notes, deal_id, status, created_at) VALUES (?,?,?,?,?,?,?,'paid',?)`)
+          .run(deal.company_id, buyerName, rel.amount, rel.currency || deal.currency || 'USD', ts.slice(0, 10), invNote, deal.id, ts);
+        agentInsight(deal.company_id, 'ACCOUNTING AGENT', 'info', `Invoice auto-posted: ${fmtAmount(rel.amount)} ${rel.currency || 'USD'} from ${buyerName} — escrow milestone "${rel.label}" on deal ${dealNum}.`);
+      }
+      if (buyerId2 && !db.prepare('SELECT id FROM expenses WHERE company_id = ? AND deal_id = ? AND notes LIKE ?').get(buyerId2, deal.id, token + '%')) {
+        db.prepare('INSERT INTO expenses (company_id, category, amount, currency, spent_on, notes, deal_id, created_at) VALUES (?,?,?,?,?,?,?,?)')
+          .run(buyerId2, 'Purchases', rel.amount, rel.currency || deal.currency || 'USD', ts.slice(0, 10), `${token} Escrow milestone payment to ${sellerName} — "${rel.label}" (${rel.pct}%) on deal ${dealNum}`, deal.id, ts);
+        agentInsight(buyerId2, 'ACCOUNTING AGENT', 'info', `Purchase expense auto-posted: ${fmtAmount(rel.amount)} ${rel.currency || 'USD'} to ${sellerName} — escrow milestone "${rel.label}" on deal ${dealNum}.`);
+      }
+    } catch (e) { /* ledger posting is best-effort — the release itself already succeeded */ }
+  }
   audit('PAYMENT AGENT', 'milestone release approved', 'pass', `Admin approved release of "${rel.label}" (${rel.pct}%${amt}) on deal ${dealNum}`);
   // Notify BOTH parties.
   const msg = `✅ Payment release approved: "${rel.label}" (${rel.pct}%${amt}) on deal ${dealNum}${deal ? ` ("${deal.title}")` : ''} — released from escrow (flow preview).`;
@@ -11083,7 +11294,22 @@ app.post('/profile/bank', requireCompany, (req, res) => {
 
 // ----- (4) ACCOUNTING AGENT (lite Odoo): invoices, expenses, ledger, CSV export -----
 const INVOICE_STATUSES = ['draft', 'sent', 'paid', 'overdue'];
-const EXPENSE_CATEGORIES = ['General', 'Logistics', 'Salaries', 'Marketing', 'Operations', 'Travel', 'Software', 'Customs & duties', 'Other'];
+const EXPENSE_CATEGORIES = ['General', 'Purchases', 'Logistics', 'Salaries', 'Marketing', 'Operations', 'Travel', 'Software', 'Customs & duties', 'Other'];
+
+/** "Other" dropdown resolution: when a select submits 'Other', the companion <input name="<field>_other">
+ *  free-text becomes the stored value. Returns the typed text, null when Other was chosen but left blank
+ *  (caller shows its required-field error), or '' when the submitted value is not in the allowed list. */
+function resolveOther(value, otherText, allowed, maxLen) {
+  if (value === 'Other') {
+    const typed = String(otherText || '').trim().slice(0, maxLen || 60);
+    return typed || null;
+  }
+  return allowed.includes(value) ? value : '';
+}
+/** Hidden companion input rendered right after an "Other"-capable <select>; toggled by the global page() script. */
+function otherInputHtml(fieldName, prefill) {
+  return `<input type="text" name="${fieldName}_other" class="dz-other-input" maxlength="60" placeholder="✏️ Type it here…" value="${esc(String(prefill || '').slice(0, 60))}" style="display:none;margin-top:6px">`;
+}
 /** Lazy status maintenance: sent invoices past their due date flip to overdue (date-only compare). */
 function accountingSweep(companyId) {
   const today = now().slice(0, 10);
@@ -11145,6 +11371,22 @@ app.get('/accounting', requireCompany, (req, res) => {
     return Object.entries(m).sort().map(([c, v]) => `${fmtAmount(v)} ${esc(c)}`).join('<br>') || '—';
   })();
 
+  // ---- Odoo-style aged receivables: unpaid invoices bucketed by days past due (per currency) ----
+  const todayStr = now().slice(0, 10);
+  const ageBuckets = [['current', 0], ['1–30 days', 0], ['31–60 days', 0], ['61+ days', 0]].map(([label]) => ({ label, byCur: {} }));
+  for (const inv of invoices) {
+    if (inv.status !== 'sent' && inv.status !== 'overdue') continue;
+    const due = /^\d{4}-\d{2}-\d{2}$/.test(inv.due_date || '') ? inv.due_date : inv.created_at.slice(0, 10);
+    const days = Math.floor((Date.parse(todayStr) - Date.parse(due)) / 864e5);
+    const bucket = days <= 0 ? 0 : days <= 30 ? 1 : days <= 60 ? 2 : 3;
+    ageBuckets[bucket].byCur[inv.currency] = (ageBuckets[bucket].byCur[inv.currency] || 0) + inv.amount;
+  }
+  const fmtBucket = (b) => Object.entries(b.byCur).sort().map(([c, v]) => `${fmtAmount(Math.round(v * 100) / 100)} ${esc(c)}`).join('<br>') || '—';
+  const agedHtml = `<div class="card" data-reveal><h3>⏳ Aged receivables</h3>
+    <p class="muted" style="margin:0 0 8px">Unpaid invoices by days past due — chase the oldest buckets first.</p>
+    <table><tr><th>Current (not due)</th><th>1–30 days</th><th>31–60 days</th><th>61+ days</th></tr>
+    <tr>${ageBuckets.map((b, bi) => `<td class="qty" ${bi === 3 ? 'style="color:var(--danger)"' : bi === 2 ? 'style="color:var(--warn,#c9a227)"' : ''}>${fmtBucket(b)}</td>`).join('')}</tr></table></div>`;
+
   const invoiceRows = invoices.length ? invoices.map(i => {
     const actions = [];
     if (i.status === 'draft') actions.push(['sent', 'sent']);
@@ -11159,7 +11401,7 @@ app.get('/accounting', requireCompany, (req, res) => {
   }).join('') : `<tr><td colspan="5" class="muted">${esc(t(lang, 'common.none'))}</td></tr>`;
 
   const expenseRows = expenses.length ? expenses.map(e => `<tr>
-      <td><b>${esc(e.category)}</b>${e.notes ? `<br><span class="muted">${esc(e.notes)}</span>` : ''}</td>
+      <td><b>${esc(e.category)}</b>${e.deal_id ? ` <a class="muted" href="/deal/${e.deal_id}">🔗 deal</a>` : ''}${e.notes ? `<br><span class="muted">${esc(e.notes)}</span>` : ''}</td>
       <td class="qty">−${fmtAmount(e.amount)} ${esc(e.currency)}</td>
       <td class="muted">${esc(e.spent_on || e.created_at.slice(0, 10))}</td>
     </tr>`).join('') : `<tr><td colspan="3" class="muted">${esc(t(lang, 'common.none'))}</td></tr>`;
@@ -11192,6 +11434,7 @@ app.get('/accounting', requireCompany, (req, res) => {
     <div class="stat card--cut" data-reveal style="--i:3" data-num="04"><div class="num" style="font-size:1.15rem">${expenseSum}</div><div class="lbl">${esc(t(lang, 'acct.expenses'))}</div></div>
     <div class="stat card--cut" data-reveal style="--i:4" data-num="05"><div class="num gold" style="font-size:1.15rem">${netSum}</div><div class="lbl">${esc(t(lang, 'acct.net'))}</div></div>
   </div>
+  ${agedHtml}
   ${insightsHtml}
   <div class="grid2" style="align-items:start">
     <div class="card" data-reveal><h3>🧾 ${esc(t(lang, 'acct.newinvoice'))}</h3>
@@ -11209,7 +11452,7 @@ app.get('/accounting', requireCompany, (req, res) => {
     </div>
     <div class="card" data-reveal><h3>💸 ${esc(t(lang, 'acct.recordexpense'))}</h3>
       <form method="POST" action="/accounting/expenses">
-        <label>${esc(t(lang, 'common.category'))} *</label><select name="category">${optionsHtml(EXPENSE_CATEGORIES, 'General')}</select>
+        <label>${esc(t(lang, 'common.category'))} *</label><select name="category">${optionsHtml(EXPENSE_CATEGORIES, 'General')}</select>${otherInputHtml('category')}
         <div class="grid2" style="gap:10px">
           <div><label>${esc(t(lang, 'common.amount'))} *</label><input type="number" name="amount" min="0.01" step="any" required></div>
           <div><label>${esc(t(lang, 'common.currency'))}</label><select name="currency">${optionsHtml(DEAL_CURRENCIES, 'USD')}</select></div>
@@ -11258,7 +11501,8 @@ app.post('/accounting/invoices/:id/status', requireCompany, (req, res) => {
 });
 
 app.post('/accounting/expenses', requireCompany, (req, res) => {
-  const category = String(req.body.category || '').trim().slice(0, 60) || 'General';
+  const resolvedCat = resolveOther(req.body.category, req.body.category_other, EXPENSE_CATEGORIES);
+  const category = resolvedCat === null ? 'Other' : (resolvedCat || 'General');
   const amount = parseFloat(req.body.amount);
   if (!isFinite(amount) || amount <= 0) return res.redirect('/accounting?err=' + encodeURIComponent('A positive amount is required.'));
   const currency = DEAL_CURRENCIES.includes(req.body.currency) ? req.body.currency : 'USD';
@@ -11289,6 +11533,290 @@ app.get('/accounting/export.csv', requireCompany, (req, res) => {
 });
 
 // ----- (5) WAREHOUSE AGENT (lite Zoho): items, stock movements, low-stock alerts -----
+// ============================ TRADING TENDERS ============================
+// A company posts a BUY tender (what it needs, how much, where, by when).
+// Suppliers are connected two ways: (1) every approved company whose category matches
+// the tender category gets an instant notification invite, (2) the Tenders board is
+// open to all companies. Suppliers place bids; the tender owner awards one bid and the
+// platform auto-creates the winner's SELL deal + an LOI negotiation — the award flows
+// straight into the standard LOI → offer → contract → escrow pipeline.
+db.exec(`
+CREATE TABLE IF NOT EXISTS tenders (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  company_id      INTEGER NOT NULL,
+  tender_number   TEXT DEFAULT '',
+  title           TEXT NOT NULL,
+  category        TEXT DEFAULT '',
+  description     TEXT DEFAULT '',
+  quantity        REAL DEFAULT 0,
+  unit            TEXT DEFAULT 'MT',
+  destination     TEXT DEFAULT '',
+  incoterm        TEXT DEFAULT 'CIF',
+  deadline        TEXT DEFAULT '',
+  status          TEXT NOT NULL DEFAULT 'open',
+  awarded_bid_id  INTEGER,
+  awarded_deal_id INTEGER,
+  created_at      TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tender_bids (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  tender_id      INTEGER NOT NULL,
+  company_id     INTEGER NOT NULL,
+  price          REAL NOT NULL,
+  currency       TEXT DEFAULT 'USD',
+  delivery_days  INTEGER DEFAULT 0,
+  note           TEXT DEFAULT '',
+  status         TEXT NOT NULL DEFAULT 'pending',
+  created_at     TEXT NOT NULL,
+  updated_at     TEXT NOT NULL,
+  UNIQUE(tender_id, company_id)
+);
+CREATE INDEX IF NOT EXISTS idx_tender_bids_tender ON tender_bids(tender_id);
+CREATE INDEX IF NOT EXISTS idx_tenders_company ON tenders(company_id, status);
+`);
+
+function tenderExpired(t) { return !!(t.deadline && t.deadline.slice(0, 10) < now().slice(0, 10)); }
+function tenderBadge(t) {
+  if (t.status === 'awarded') return '<span class="badge badge-approved">AWARDED</span>';
+  if (tenderExpired(t)) return '<span class="badge badge-rejected">EXPIRED</span>';
+  return '<span class="badge badge-pass">OPEN</span>';
+}
+
+app.get('/tenders', requireCompany, (req, res) => {
+  const myId = req.user.id;
+  const open = db.prepare(`
+    SELECT t.*, c.name AS poster_name,
+      (SELECT COUNT(*) FROM tender_bids b WHERE b.tender_id = t.id) AS bids
+    FROM tenders t JOIN companies c ON c.id = t.company_id
+    WHERE t.status = 'open' ORDER BY t.created_at DESC LIMIT 60`).all();
+  const mine = db.prepare(`
+    SELECT t.*, (SELECT COUNT(*) FROM tender_bids b WHERE b.tender_id = t.id) AS bids
+    FROM tenders t WHERE t.company_id = ? ORDER BY t.created_at DESC LIMIT 30`).all(myId);
+  const myBids = db.prepare(`
+    SELECT b.*, t.title AS tender_title, t.tender_number, t.status AS tender_status, t.deadline
+    FROM tender_bids b JOIN tenders t ON t.id = b.tender_id
+    WHERE b.company_id = ? ORDER BY b.created_at DESC LIMIT 30`).all(myId);
+
+  const rowHtml = (t) => `
+    <div class="card" style="margin-bottom:10px" data-reveal>
+      <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center">
+        <div>
+          <b><a href="/tenders/${t.id}">${esc(t.title)}</a></b>
+          <span class="muted"> № ${esc(t.tender_number || ('DZ-TND-' + t.id))}</span><br>
+          <span class="muted">${esc(t.category || '—')} · ${t.quantity ? fmtAmount(t.quantity) + ' ' + esc(t.unit) : 'qty open'} · ${esc(t.incoterm || 'CIF')} → ${esc(t.destination || 'anywhere')}</span><br>
+          <span class="muted">by ${esc(t.poster_name || '')}${t.company_id === myId ? ' <span class="badge badge-agent">YOUR TENDER</span>' : ''} · deadline ${esc(t.deadline || '—')} · ${t.bids} bid${t.bids === 1 ? '' : 's'}</span>
+        </div>
+        <div style="text-align:right">${tenderBadge(t)}<br><a class="btn btn-sm btn-outline" style="margin-top:6px" href="/tenders/${t.id}">${t.company_id === myId ? 'Review bids' : 'View & bid'}</a></div>
+      </div>
+    </div>`;
+
+  const body = `
+  <div class="kicker">Trading tenders</div>
+  <h2 style="margin:4px 0 14px">📋 Tenders board</h2>
+  <div class="card" data-reveal>
+    <h3>➕ Post a buy tender</h3>
+    <p class="muted">Describe what you need — suppliers in the matching category are notified instantly, and any company can bid. When you award a bid, the deal + negotiation open automatically.</p>
+    <form method="POST" action="/tenders">
+      <label>Tender title *</label><input type="text" name="title" required maxlength="160" placeholder="e.g. 500 MT copper cathodes, CIF Rotterdam">
+      <div class="grid2" style="gap:10px">
+        <div><label>Category *</label><select name="category" required><option value="">— choose —</option>${optionsHtml(COMPANY_CATEGORIES, '')}</select>${otherInputHtml('category', '')}</div>
+        <div><label>Bid deadline *</label><input type="date" name="deadline" required min="${now().slice(0, 10)}"></div>
+      </div>
+      <div class="grid2" style="gap:10px">
+        <div><label>Quantity</label><input type="number" name="quantity" min="0" step="any" placeholder="e.g. 500"></div>
+        <div><label>Unit</label><select name="unit">${optionsHtml(DEAL_CARGO_UNITS, 'MT')}</select></div>
+      </div>
+      <div class="grid2" style="gap:10px">
+        <div><label>Destination</label><input type="text" name="destination" maxlength="160" placeholder="e.g. Rotterdam, NL"></div>
+        <div><label>Incoterm</label><select name="incoterm">${optionsHtml(DEAL_INCOTERMS, 'CIF')}</select></div>
+      </div>
+      <label>Specification / notes</label><textarea name="description" rows="3" maxlength="4000" placeholder="Grades, packaging, inspection, payment expectations…"></textarea>
+      <button class="btn" type="submit">Publish tender 📣</button>
+    </form>
+  </div>
+  <h3 style="margin:18px 0 8px">🔥 Open tenders</h3>
+  ${open.length ? open.map(rowHtml).join('') : '<div class="card muted">No open tenders yet — be the first to post one.</div>'}
+  <h3 style="margin:18px 0 8px">🗂️ My tenders</h3>
+  ${mine.length ? mine.map((t) => `
+    <div class="card" style="margin-bottom:10px" data-reveal>
+      <b><a href="/tenders/${t.id}">${esc(t.title)}</a></b> ${tenderBadge(t)}
+      <span class="muted"> · ${t.bids} bid${t.bids === 1 ? '' : 's'}${t.awarded_deal_id ? ` · <a href="/deal/${t.awarded_deal_id}">deal opened</a>` : ''}</span>
+    </div>`).join('') : '<div class="card muted">You have not posted any tenders.</div>'}
+  <h3 style="margin:18px 0 8px">💰 My bids</h3>
+  ${myBids.length ? myBids.map((b) => `
+    <div class="card" style="margin-bottom:10px" data-reveal>
+      <b><a href="/tenders/${b.tender_id}">${esc(b.tender_title)}</a></b>
+      <span class="muted"> № ${esc(b.tender_number || '')}</span><br>
+      Your bid: <b>${fmtAmount(b.price)} ${esc(b.currency)}</b> · ${b.delivery_days} days ·
+      ${b.status === 'accepted' ? '<span class="badge badge-approved">WON 🎉</span>' : b.status === 'rejected' ? '<span class="badge badge-rejected">Not selected</span>' : '<span class="badge badge-pending">Pending</span>'}
+    </div>`).join('') : '<div class="card muted">You have not placed any bids.</div>'}
+  `;
+  res.send(page('Tenders', body, req.user, req.query.msg, req.query.err, 'tenders'));
+});
+
+app.post('/tenders', requireCompany, (req, res) => {
+  const b = req.body || {};
+  const title = String(b.title || '').trim().slice(0, 160);
+  if (!title) return res.redirect('/tenders?err=' + encodeURIComponent('Tender title is required.'));
+  const category = resolveOther(b.category, b.category_other, COMPANY_CATEGORIES);
+  if (category === null) return res.redirect('/tenders?err=' + encodeURIComponent('Please type your category in the field below "Other".'));
+  if (!category) return res.redirect('/tenders?err=' + encodeURIComponent('Please choose a category.'));
+  const deadline = String(b.deadline || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(deadline)) return res.redirect('/tenders?err=' + encodeURIComponent('Please pick a valid bid deadline.'));
+  if (deadline < now().slice(0, 10)) return res.redirect('/tenders?err=' + encodeURIComponent('The deadline must be today or later.'));
+  const quantity = Math.max(0, parseFloat(b.quantity) || 0);
+  const unit = DEAL_CARGO_UNITS.includes(b.unit) ? b.unit : 'MT';
+  const incoterm = DEAL_INCOTERMS.includes(b.incoterm) ? b.incoterm : 'CIF';
+  const destination = String(b.destination || '').trim().slice(0, 160);
+  const description = String(b.description || '').trim().slice(0, 4000);
+  const ts = now();
+  const id = db.prepare(`INSERT INTO tenders (company_id, title, category, description, quantity, unit, destination, incoterm, deadline, status, created_at)
+                         VALUES (?,?,?,?,?,?,?,?,?, 'open', ?)`)
+    .run(req.user.id, title, category, description, quantity, unit, destination, incoterm, deadline, ts).lastInsertRowid;
+  db.prepare('UPDATE tenders SET tender_number = ? WHERE id = ?').run('DZ-TND-' + id, id);
+  // CONNECT SUPPLIERS: approved companies in the same category get an instant invite.
+  try {
+    const matches = db.prepare(`SELECT id FROM companies WHERE id != ? AND status = 'approved' AND lower(category) = lower(?) LIMIT 100`).all(req.user.id, category);
+    for (const m of matches) notify(m.id, 'tender', `📋 New tender DZ-TND-${id} in ${category}: "${title}"${quantity ? ` — ${fmtAmount(quantity)} ${unit}` : ''}. Place your bid!`, `/tenders/${id}`);
+    if (matches.length) agentInsight(req.user.id, 'DEAL AGENT', 'info', `Tender DZ-TND-${id} published — ${matches.length} supplier${matches.length === 1 ? '' : 's'} in ${category} notified.`);
+  } catch (e) { /* invites are best-effort */ }
+  audit('DEAL AGENT', 'tender published', 'pass', `${req.user.name} published tender DZ-TND-${id} ("${title}", ${category})`);
+  res.redirect(`/tenders/${id}?msg=` + encodeURIComponent(`Tender DZ-TND-${id} published — matching suppliers have been notified.`));
+});
+
+app.get('/tenders/:id', requireCompany, (req, res) => {
+  const t = db.prepare(`SELECT t.*, c.name AS poster_name FROM tenders t JOIN companies c ON c.id = t.company_id WHERE t.id = ?`).get(parseInt(req.params.id, 10));
+  if (!t) return res.redirect('/tenders?err=' + encodeURIComponent('Tender not found.'));
+  const myId = req.user.id;
+  const isOwner = t.company_id === myId;
+  const expired = tenderExpired(t);
+  const bids = db.prepare(`SELECT b.*, c.name AS bidder_name FROM tender_bids b JOIN companies c ON c.id = b.company_id WHERE b.tender_id = ? ORDER BY b.price ASC`).all(t.id);
+  const myBid = bids.find((x) => x.company_id === myId) || null;
+  const awardedBid = t.awarded_bid_id ? bids.find((x) => x.id === t.awarded_bid_id) : null;
+
+  const bidRows = bids.length ? bids.map((x) => `
+    <tr>
+      <td><b>${esc(x.bidder_name)}</b>${x.company_id === myId ? ' <span class="badge badge-agent">YOU</span>' : ''}</td>
+      <td class="qty">${fmtAmount(x.price)} ${esc(x.currency)}</td>
+      <td>${x.delivery_days} days</td>
+      <td class="muted">${esc(x.note || '—')}</td>
+      <td>${x.status === 'accepted' ? '<span class="badge badge-approved">WINNER</span>' : x.status === 'rejected' ? '<span class="badge badge-rejected">—</span>' : '<span class="badge badge-pending">pending</span>'}</td>
+      ${isOwner && t.status === 'open' ? `<td><form method="POST" action="/tenders/${t.id}/award" onsubmit="return confirm('Award this tender to ${esc(x.bidder_name)} for ${fmtAmount(x.price)} ${esc(x.currency)}? This opens a deal and negotiation automatically.');"><input type="hidden" name="bid_id" value="${x.id}"><button class="btn btn-sm" type="submit">Award 🏆</button></form></td>` : '<td></td>'}
+    </tr>`).join('') : '<tr><td colspan="6" class="muted">No bids yet.</td></tr>';
+
+  const bidForm = (!isOwner && t.status === 'open' && !expired) ? `
+    <div class="card" data-reveal>
+      <h3>${myBid ? '✏️ Update your bid' : '💰 Place your bid'}</h3>
+      <form method="POST" action="/tenders/${t.id}/bid">
+        <div class="grid2" style="gap:10px">
+          <div><label>Total price *</label><input type="number" name="price" required min="0.01" step="any" value="${myBid ? myBid.price : ''}"></div>
+          <div><label>Currency</label><select name="currency">${optionsHtml(DEAL_CURRENCIES, myBid ? myBid.currency : 'USD')}</select></div>
+        </div>
+        <div class="grid2" style="gap:10px">
+          <div><label>Delivery time (days)</label><input type="number" name="delivery_days" min="0" max="3650" value="${myBid ? myBid.delivery_days : '30'}"></div>
+          <div><label>Note</label><input type="text" name="note" maxlength="500" value="${myBid ? esc(myBid.note || '') : ''}" placeholder="Optional — specs, terms…"></div>
+        </div>
+        <button class="btn" type="submit">${myBid ? 'Update bid' : 'Submit bid'} 📨</button>
+      </form>
+    </div>` : '';
+
+  const body = `
+  <div class="kicker">Tender ${esc(t.tender_number || ('DZ-TND-' + t.id))}</div>
+  <h2 style="margin:4px 0 12px">📋 ${esc(t.title)}</h2>
+  <div class="card" data-reveal>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px">
+      ${tenderBadge(t)}
+      <span class="badge badge-flow">${esc(t.category || '—')}</span>
+      <span class="badge badge-contract">${esc(t.incoterm || 'CIF')}</span>
+      ${t.quantity ? `<span class="badge badge-agent">${fmtAmount(t.quantity)} ${esc(t.unit)}</span>` : ''}
+    </div>
+    <p class="muted" style="margin:0 0 6px">Posted by <b>${esc(t.poster_name)}</b> · destination <b>${esc(t.destination || '—')}</b> · bid deadline <b>${esc(t.deadline || '—')}</b>${expired && t.status === 'open' ? ' <span class="badge badge-rejected">deadline passed</span>' : ''}</p>
+    ${t.description ? `<p style="white-space:pre-wrap">${esc(t.description)}</p>` : ''}
+    ${t.status === 'awarded' && awardedBid ? `<p class="ok" style="margin:8px 0 0">🏆 Awarded to <b>${esc(awardedBid.bidder_name)}</b> for ${fmtAmount(awardedBid.price)} ${esc(awardedBid.currency)}.${t.awarded_deal_id && (isOwner || awardedBid.company_id === myId) ? ` <a href="/deal/${t.awarded_deal_id}">Open the deal →</a>` : ''}</p>` : ''}
+  </div>
+  ${bidForm}
+  <div class="card" data-reveal>
+    <h3>💰 Bids (${bids.length})</h3>
+    ${isOwner || t.status === 'awarded' ? `<table><tr><th>Supplier</th><th>Price</th><th>Delivery</th><th>Note</th><th>Status</th><th></th></tr>${bidRows}</table>`
+      : (myBid ? `<p>Your bid: <b>${fmtAmount(myBid.price)} ${esc(myBid.currency)}</b> · ${myBid.delivery_days} days — ${myBid.status === 'accepted' ? '<span class="badge badge-approved">WINNER 🎉</span>' : myBid.status === 'rejected' ? '<span class="badge badge-rejected">Not selected</span>' : '<span class="badge badge-pending">under review</span>'}</p><p class="muted">Other bids are private until the award.</p>` : '<p class="muted">Bids are private — only the tender owner sees them until the award.</p>')}
+  </div>
+  <p><a href="/tenders">← Back to the tenders board</a></p>
+  `;
+  res.send(page('Tender ' + (t.tender_number || t.id), body, req.user, req.query.msg, req.query.err, 'tenders'));
+});
+
+app.post('/tenders/:id/bid', requireCompany, (req, res) => {
+  const t = db.prepare('SELECT * FROM tenders WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!t) return res.redirect('/tenders?err=' + encodeURIComponent('Tender not found.'));
+  if (t.company_id === req.user.id) return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('You cannot bid on your own tender.'));
+  if (t.status !== 'open') return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('This tender is no longer open.'));
+  if (tenderExpired(t)) return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('The bid deadline has passed.'));
+  const b = req.body || {};
+  const price = parseFloat(b.price);
+  if (!(price > 0)) return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('Please enter a valid price.'));
+  const currency = DEAL_CURRENCIES.includes(b.currency) ? b.currency : 'USD';
+  const days = Math.min(3650, Math.max(0, parseInt(b.delivery_days, 10) || 0));
+  const note = String(b.note || '').trim().slice(0, 500);
+  const ts = now();
+  db.prepare(`INSERT INTO tender_bids (tender_id, company_id, price, currency, delivery_days, note, status, created_at, updated_at)
+              VALUES (?,?,?,?,?,?, 'pending', ?, ?)
+              ON CONFLICT(tender_id, company_id) DO UPDATE SET price=excluded.price, currency=excluded.currency,
+                delivery_days=excluded.delivery_days, note=excluded.note, updated_at=excluded.updated_at`)
+    .run(t.id, req.user.id, price, currency, days, note, ts, ts);
+  notify(t.company_id, 'tender', `💰 New bid on tender ${t.tender_number || ('DZ-TND-' + t.id)} ("${t.title}") from ${req.user.name}.`, `/tenders/${t.id}`);
+  audit('DEAL AGENT', 'tender bid', 'pass', `${req.user.name} bid ${price} ${currency} on tender ${t.tender_number || t.id}`);
+  res.redirect(`/tenders/${t.id}?msg=` + encodeURIComponent('Your bid was submitted — the tender owner has been notified.'));
+});
+
+app.post('/tenders/:id/award', requireCompany, (req, res) => {
+  const t = db.prepare('SELECT * FROM tenders WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!t) return res.redirect('/tenders?err=' + encodeURIComponent('Tender not found.'));
+  if (t.company_id !== req.user.id) return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('Only the tender owner can award it.'));
+  if (t.status !== 'open') return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('This tender was already awarded.'));
+  const bid = db.prepare('SELECT * FROM tender_bids WHERE id = ? AND tender_id = ?').get(parseInt((req.body || {}).bid_id, 10), t.id);
+  if (!bid) return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('Bid not found.'));
+  const winner = db.prepare('SELECT * FROM companies WHERE id = ?').get(bid.company_id);
+  if (!winner) return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('The bidding company no longer exists.'));
+
+  const ts = now();
+  const tNum = t.tender_number || ('DZ-TND-' + t.id);
+  const tx = db.transaction(() => {
+    db.prepare("UPDATE tenders SET status = 'awarded', awarded_bid_id = ? WHERE id = ?").run(bid.id, t.id);
+    db.prepare("UPDATE tender_bids SET status = 'accepted', updated_at = ? WHERE id = ?").run(ts, bid.id);
+    db.prepare("UPDATE tender_bids SET status = 'rejected', updated_at = ? WHERE tender_id = ? AND id != ?").run(ts, t.id, bid.id);
+    // Auto-create the winner's SELL deal, prefilled from tender + bid.
+    const dealId = db.prepare(`INSERT INTO deals (company_id, title, description, value, created_at, currency, time_period,
+                deal_type, deal_number, category, origin, destination, incoterm, status, cargo_qty, cargo_unit)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?, ?)`)
+      .run(winner.id, t.title.slice(0, 160),
+        `Won tender ${tNum} awarded by ${req.user.name}.\n\n${t.description || ''}`.slice(0, 4000),
+        String(bid.price), ts, bid.currency, `${bid.delivery_days} days`,
+        'sell', nextDealNumber(), t.category || 'Trading', '', t.destination || '', t.incoterm || 'CIF',
+        t.quantity || 0, t.unit || 'MT').lastInsertRowid;
+    db.prepare('UPDATE tenders SET awarded_deal_id = ? WHERE id = ?').run(dealId, t.id);
+    // Auto-open the negotiation: the award counts as the buyer's LOI — pipeline starts immediately.
+    const loiExpires = new Date(Date.now() + 7 * 86400000).toISOString();
+    const negId = db.prepare(`INSERT INTO negotiations (deal_id, buyer_id, seller_id, state, round, loi_text, loi_location, loi_quantity, loi_wishes, commission_split, loi_expires_at, created_at, updated_at)
+              VALUES (?,?,?, 'LOI_SENT', 0, ?,?,?,?, '50-50', ?, ?, ?)`)
+      .run(dealId, t.company_id, winner.id,
+        `Tender award ${tNum}: ${req.user.name} accepts ${winner.name}'s bid of ${fmtAmount(bid.price)} ${bid.currency} (delivery ~${bid.delivery_days} days). Please send your formal offer.`,
+        t.destination || '', t.quantity ? `${fmtAmount(t.quantity)} ${t.unit}` : '', bid.note || '', loiExpires, ts, ts).lastInsertRowid;
+    negEvent(negId, t.company_id, 'loi', { note: `Tender ${tNum} awarded — auto-opened from bid #${bid.id} (${fmtAmount(bid.price)} ${bid.currency}).` });
+    return { dealId, negId };
+  });
+  const { dealId, negId } = tx();
+
+  notify(winner.id, 'tender', `🏆 You WON tender ${tNum} ("${t.title}") — ${fmtAmount(bid.price)} ${bid.currency}! A deal + negotiation opened automatically — send your formal offer.`, `/negotiation/${negId}`);
+  try {
+    const losers = db.prepare("SELECT company_id FROM tender_bids WHERE tender_id = ? AND status = 'rejected'").all(t.id);
+    for (const l of losers) notify(l.company_id, 'tender', `Tender ${tNum} ("${t.title}") was awarded to another supplier. Thanks for bidding!`, `/tenders/${t.id}`);
+  } catch (e) { /* best-effort */ }
+  agentInsight(winner.id, 'DEAL AGENT', 'info', `Tender ${tNum} won — deal + negotiation opened automatically at ${fmtAmount(bid.price)} ${bid.currency}.`);
+  agentInsight(req.user.id, 'DEAL AGENT', 'info', `Tender ${tNum} awarded to ${winner.name} — negotiation #${negId} opened on the auto-created deal.`);
+  audit('DEAL AGENT', 'tender awarded', 'pass', `${req.user.name} awarded tender ${tNum} to ${winner.name} (${fmtAmount(bid.price)} ${bid.currency}); deal #${dealId}, negotiation #${negId}`);
+  res.redirect(`/tenders/${t.id}?msg=` + encodeURIComponent(`Awarded to ${winner.name} — deal and negotiation opened automatically. The supplier has been notified.`));
+});
+
 app.get('/warehouse', requireCompany, (req, res) => {
   const lang = req.user.lang || 'en';
   const myId = req.user.id;
@@ -11312,6 +11840,7 @@ app.get('/warehouse', requireCompany, (req, res) => {
       <td>
         <form method="POST" action="/warehouse/items/${i.id}/move" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
           <select name="direction" style="margin:0"><option value="IN">${esc(t(lang, 'wh.in'))}</option><option value="OUT">${esc(t(lang, 'wh.out'))}</option></select>
+          <select name="reason" style="margin:0" title="Reason (auditable)"><option value="">— reason —</option>${optionsHtml(MOVEMENT_REASONS, '')}</select>
           <input type="number" name="quantity" min="0.01" step="any" required placeholder="0" style="width:90px;margin:0">
           <input type="text" name="note" maxlength="200" placeholder="${esc(t(lang, 'common.notes'))} (${esc(t(lang, 'common.optional'))})" style="width:150px;margin:0">
           <select name="deal_id" style="margin:0">${dealOpts}</select>
@@ -11325,7 +11854,7 @@ app.get('/warehouse', requireCompany, (req, res) => {
   const moveRows = moves.length ? moves.map(m => `<tr>
       <td class="muted">${esc(m.created_at.slice(0, 16).replace('T', ' '))}</td>
       <td><b>${esc(m.sku)}</b> ${esc(m.item_name)}</td>
-      <td><span class="badge ${m.direction === 'IN' ? 'badge-pass' : 'badge-sealed'}">${m.direction === 'IN' ? '⬆ IN' : '⬇ OUT'}</span> ${fmtAmount(m.quantity)}</td>
+      <td><span class="badge ${m.direction === 'IN' ? 'badge-pass' : 'badge-sealed'}">${m.direction === 'IN' ? '⬆ IN' : '⬇ OUT'}</span> ${fmtAmount(m.quantity)}${m.reason ? `<br><span class="badge badge-agent" style="margin-top:2px">${esc(m.reason)}</span>` : ''}</td>
       <td>${m.deal_id ? `<a href="/deal/${m.deal_id}">🔗 deal</a> ` : ''}<span class="muted">${esc(m.note || '')}</span></td>
     </tr>`).join('') : `<tr><td colspan="4" class="muted">${esc(t(lang, 'common.none'))}</td></tr>`;
 
@@ -11396,7 +11925,7 @@ app.get('/warehouse', requireCompany, (req, res) => {
     <form method="POST" action="/warehouse/items">
       <div class="grid2" style="gap:10px">
         <div><label>${esc(t(lang, 'wh.name'))} *</label><input type="text" name="name" required maxlength="160"></div>
-        <div><label>${esc(t(lang, 'wh.unit'))}</label><input type="text" name="unit" maxlength="30" value="units" placeholder="units / kg / pallets…"></div>
+        <div><label>${esc(t(lang, 'wh.unit'))}</label><select name="unit">${optionsHtml(WAREHOUSE_UNITS, 'units')}</select>${otherInputHtml('unit')}</div>
       </div>
       <div class="grid2" style="gap:10px">
         <div><label>${esc(t(lang, 'wh.quantity'))} (initial)</label><input type="number" name="quantity" min="0" step="any" value="0"></div>
@@ -11417,7 +11946,8 @@ app.get('/warehouse', requireCompany, (req, res) => {
 app.post('/warehouse/items', requireCompany, (req, res) => {
   const name = String(req.body.name || '').trim().slice(0, 160);
   if (!name) return res.redirect('/warehouse?err=' + encodeURIComponent('Item name is required.'));
-  const unit = String(req.body.unit || 'units').trim().slice(0, 30) || 'units';
+  const resolvedUnit = resolveOther(req.body.unit, req.body.unit_other, WAREHOUSE_UNITS, 30);
+  const unit = (resolvedUnit === null ? 'units' : resolvedUnit) || 'units';
   const qty = Math.max(0, parseFloat(req.body.quantity) || 0);
   const reorder = Math.max(0, parseFloat(req.body.reorder_level) || 0);
   const location = String(req.body.location || '').trim().slice(0, 160);
@@ -11439,14 +11969,15 @@ app.post('/warehouse/items/:id/move', requireCompany, (req, res) => {
   if (!isFinite(qty) || qty <= 0) return res.redirect('/warehouse?err=' + encodeURIComponent('A positive quantity is required.'));
   if (dir === 'OUT' && qty > item.quantity) return res.redirect('/warehouse?err=' + encodeURIComponent(`Not enough stock — only ${fmtAmount(item.quantity)} ${item.unit} available.`));
   const note = String(req.body.note || '').trim().slice(0, 200);
+  const reason = MOVEMENT_REASONS.includes(req.body.reason) ? req.body.reason : '';
   const dealId = parseInt(req.body.deal_id, 10);
   const linked = dealId && db.prepare('SELECT id FROM deals WHERE id = ? AND company_id = ?').get(dealId, req.user.id) ? dealId : null;
   const before = item.quantity;
   const after = dir === 'IN' ? before + qty : before - qty;
   const tx = db.transaction(() => {
     db.prepare('UPDATE warehouse_items SET quantity = ? WHERE id = ?').run(after, item.id);
-    db.prepare('INSERT INTO warehouse_movements (item_id, company_id, direction, quantity, note, deal_id, created_at) VALUES (?,?,?,?,?,?,?)')
-      .run(item.id, req.user.id, dir, qty, note, linked, now());
+    db.prepare('INSERT INTO warehouse_movements (item_id, company_id, direction, quantity, note, deal_id, reason, created_at) VALUES (?,?,?,?,?,?,?,?)')
+      .run(item.id, req.user.id, dir, qty, note, linked, reason, now());
   });
   tx();
   // WAREHOUSE AGENT: low-stock alert + unusual-movement flag.
