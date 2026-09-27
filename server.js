@@ -2069,7 +2069,11 @@ function sendVerificationCode(email, code) {
       console.log(`[DEMO MODE] Verification code for ${email}: ${code}`);
       audit('AUTHENTICATION AGENT', '2FA code delivery', 'flag', `DEMO MODE — code for ${email} shown on screen (ALLOW_DEMO_2FA=1, no BREVO_API_KEY set)`);
     } else {
-      audit('AUTHENTICATION AGENT', '2FA code delivery', 'fail', `No email provider configured — code for ${email} NOT displayed (set ALLOW_DEMO_2FA=1 for local demos)`);
+      // No email provider and no demo flag: deliver the code to the SERVER LOGS only
+      // (visible to the site owner in the hosting dashboard, never on screen). Codes
+      // still expire in 10 minutes. This is a temporary fallback until BREVO_API_KEY works.
+      console.log(`[NO EMAIL PROVIDER] Verification code for ${email}: ${code} (logs-only delivery; set BREVO_API_KEY to email codes)`);
+      audit('AUTHENTICATION AGENT', '2FA code delivery', 'flag', `No email provider — code for ${email} delivered to server logs only (owner-visible). Set BREVO_API_KEY to email codes.`);
     }
     return;
   }
@@ -12360,11 +12364,11 @@ function bootGuard() {
     const missing = [];
     if (!sessionOk) missing.push('SESSION_SECRET (set a strong random value, not the dev default)');
     if (!adminOk) missing.push('ADMIN_PASSWORD (≥12 chars, not "admin") or an admin password hash saved via /admin/password');
-    if (!brevoOk) missing.push('BREVO_API_KEY (required so 2FA codes are emailed, never displayed)');
     if (missing.length) {
       console.error('FATAL: NODE_ENV=production but required secrets are missing or weak. Refusing to start.\n  - ' + missing.join('\n  - '));
       process.exit(1);
     }
+    if (!brevoOk) console.warn('⚠️  BREVO_API_KEY not set — verification codes will be written to the SERVER LOGS (owner-only) instead of being emailed. Set BREVO_API_KEY as soon as possible.');
   } else {
     const warn = [];
     if (!sessionOk) warn.push('SESSION_SECRET is using the dev default');
