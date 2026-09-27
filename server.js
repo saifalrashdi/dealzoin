@@ -26,6 +26,82 @@ const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 app.disable('x-powered-by');
+app.set('trust proxy', 1); // behind Render's proxy — needed so req.ip reflects the real client (rate limiting / lockouts)
+
+// ============================= SECURITY MIDDLEWARE =============================
+// ----- Security headers (one middleware, every response) -----
+// NOTE: script-src 'unsafe-inline' MUST stay for now — pages render inline <script> blocks
+// and inline event handlers (onclick= etc.); a strict nonce-based CSP is a later phase.
+// style-src 'unsafe-inline' likewise (hundreds of inline style attributes).
+// camera/microphone are allowed for SELF because voice/video calls use getUserMedia.
+// CSP is extended beyond the minimal baseline ONLY for the app's real external dependencies:
+// Google Fonts (style + font files), Chart.js (cdn.jsdelivr.net), OSM map tiles (Leaflet).
+app.use((req, res, next) => {
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(self), microphone=(self), geolocation=()');
+  if (isSecureReq(req)) res.setHeader('Strict-Transport-Security', 'max-age=15552000; includeSubDomains');
+  res.setHeader('Content-Security-Policy',
+    "default-src 'self'; img-src 'self' data: blob: https://tile.openstreetmap.org; media-src 'self' blob:; " +
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; " +
+    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; connect-src 'self' ws: wss:; " +
+    "object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'");
+  next();
+});
+
+// ----- CSRF defense-in-depth: Origin/Referer host check on state-changing requests -----
+// SameSite=Lax session cookies already block most cross-site POSTs; this adds a second layer:
+// any POST/PUT/PATCH/DELETE whose Origin (or, failing that, Referer) host does not match the
+// Host header is rejected, as are requests browsers explicitly mark Sec-Fetch-Site: cross-site.
+// Requests with neither header (same-origin form posts, curl, server-to-server) are allowed.
+app.use((req, res, next) => {
+  if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
+  const denied = (why) => {
+    try { audit('SECURITY AGENT', 'CSRF check', 'fail', `Blocked ${req.method} ${req.path} from ${req.ip} — ${why}`); } catch (e) { /* never break on audit */ }
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Forbidden</h2><p class="muted">Cross-site request blocked.</p></div>', currentUser(req)));
+  };
+  if (String(req.headers['sec-fetch-site'] || '').toLowerCase() === 'cross-site') return denied('Sec-Fetch-Site: cross-site');
+  const source = req.headers.origin || req.headers.referer || '';
+  if (source) {
+    let srcHost = '';
+    try { srcHost = new URL(source).host.toLowerCase(); } catch (e) { srcHost = ''; }
+    const host = String(req.headers.host || '').toLowerCase();
+    if (!srcHost || srcHost !== host) return denied(`origin host "${srcHost || source}" != "${host}"`);
+  }
+  next();
+});
+
+// ----- In-memory sliding-window rate limiting (single Render instance; no new deps) -----
+const rateBuckets = new Map(); // key -> array of hit timestamps (ms)
+/** Record a hit for key; return true when the key is OVER the limit for the window. */
+function rateLimitHit(key, limit, windowMs) {
+  const nowMs = Date.now();
+  let arr = rateBuckets.get(key);
+  if (!arr) { arr = []; rateBuckets.set(key, arr); }
+  while (arr.length && arr[0] <= nowMs - windowMs) arr.shift(); // prune expired
+  if (arr.length >= limit) return true;                          // over limit — do not record
+  arr.push(nowMs);
+  if (rateBuckets.size > 5000) { // best-effort memory hygiene
+    for (const [k, v] of rateBuckets) { if (!v.length || v[v.length - 1] <= nowMs - windowMs) rateBuckets.delete(k); }
+  }
+  return false;
+}
+/** Express middleware: throttle a route by IP. redirectTo: path for form posts, 'json' for APIs, null for a 429 page. */
+function rateLimitRoute(routeKey, limit, windowMs, redirectTo) {
+  return (req, res, next) => {
+    if (rateLimitHit(`${routeKey}|${req.ip}`, limit, windowMs)) {
+      try { audit('SECURITY AGENT', 'rate limit', 'fail', `Rate limit hit on ${routeKey} from ${req.ip}`); } catch (e) { /* never break on audit */ }
+      const msg = 'Too many attempts. Please wait and try again.';
+      if (redirectTo === 'json') return res.status(429).json({ ok: false, error: msg });
+      if (redirectTo) return res.redirect(redirectTo + '?err=' + encodeURIComponent(msg));
+      return res.status(429).send(page('Too many requests', `<div class="card"><h2>429 — Too many attempts</h2><p class="muted">${esc(msg)}</p></div>`, currentUser(req)));
+    }
+    next();
+  };
+}
+/** Wrap async route handlers so rejections reach the global error handler instead of crashing. */
+const ah = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 // ============================= DATABASE SETUP =============================
 const db = new Database(path.join(process.cwd(), 'dealzoin.db'));
@@ -229,6 +305,7 @@ try { db.exec("ALTER TABLE companies ADD COLUMN field TEXT DEFAULT ''"); } catch
 try { db.exec("ALTER TABLE companies ADD COLUMN employees TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
 try { db.exec("ALTER TABLE companies ADD COLUMN research_source TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
 try { db.exec("ALTER TABLE verification_codes ADD COLUMN payload TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE verification_codes ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0'); } catch (e) { /* column already exists */ }
 // v5 upgrades (Trust & KYC): compliance-grade registration fields on companies.
 try { db.exec("ALTER TABLE companies ADD COLUMN category TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
 try { db.exec("ALTER TABLE companies ADD COLUMN activity TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
@@ -537,6 +614,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS warehouse_movements (
 try { db.exec('CREATE INDEX IF NOT EXISTS idx_wh_movements_item ON warehouse_movements(item_id, id)'); } catch (e) { /* index may already exist */ }
 try { db.exec("ALTER TABLE warehouse_movements ADD COLUMN reason TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
 try { db.exec('ALTER TABLE expenses ADD COLUMN deal_id INTEGER'); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE deals ADD COLUMN warehouse_item_id INTEGER'); } catch (e) { /* column already exists */ }
 
 /** Next warehouse SKU for a company: DZ-<companyId>-<zero-padded seq> (per-company counter in settings). */
 function nextSku(companyId) {
@@ -1125,11 +1203,14 @@ function pcPaymentCardHtml(pc, user) {
       <h4 style="margin-bottom:8px">Confirm your payment (${isFinite(myShare) ? `${fmtAmount(myShare)} ${esc(pcb.cur)}` : 'amount per instructions'})</h4>
       ${mine && mine.status === 'rejected' ? '<p class="flag-note">Your previous confirmation was rejected by the administrator. You can re-confirm once the transfer is made.</p>' : ''}
       <div class="feed-actions" style="margin:0 0 10px">${applePayHtml()}</div>
-      <form method="POST" action="/contracts/${pc.id}/payment-confirm">
+      <form method="POST" action="/contracts/${pc.id}/payment-confirm" enctype="multipart/form-data">
         <label>Payment reference / note (optional)</label>
         <input type="text" name="note" maxlength="300" placeholder="e.g. Bank transfer ref #TRX-12345, sent today">
+        <label style="margin-top:8px">Payment proof — PDF receipt (optional)</label>
+        <label class="file-btn file-btn-sm"><span class="file-btn-text" data-default="📎 Attach bank-transfer receipt (PDF)">📎 Attach bank-transfer receipt (PDF)</span>
+          <input type="file" class="file-input" name="proof" accept="application/pdf,.pdf"></label>
         <button class="btn btn-sm btn-green" type="submit">Confirm payment sent</button>
-        <p class="muted" style="margin-top:6px">After confirming you can attach the bank-transfer receipt (PDF) as payment proof for the admin.</p>
+        <p class="muted" style="margin-top:6px">The admin verifies your reference + PDF receipt, then approves. You can replace the PDF while it awaits review.</p>
       </form>`;
     }
   }
@@ -1979,12 +2060,17 @@ function runOnboardingAgent(name, email, opts) {
 /**
  * Dual-mode code delivery.
  *  - BREVO_API_KEY set   -> send via Brevo HTTPS API (global fetch, no SMTP/nodemailer).
- *  - BREVO_API_KEY unset -> DEMO MODE: code shown on the verify page + console.log.
+ *  - BREVO_API_KEY unset -> codes are NEVER printed unless ALLOW_DEMO_2FA=1 is explicitly set
+ *                           (local demo mode); otherwise the code simply cannot be delivered.
  */
 function sendVerificationCode(email, code) {
   if (!BREVO_API_KEY) {
-    console.log(`[DEMO MODE] Verification code for ${email}: ${code}`);
-    audit('AUTHENTICATION AGENT', '2FA code delivery', 'flag', `DEMO MODE — code for ${email} shown on screen (no BREVO_API_KEY set)`);
+    if (process.env.ALLOW_DEMO_2FA === '1') {
+      console.log(`[DEMO MODE] Verification code for ${email}: ${code}`);
+      audit('AUTHENTICATION AGENT', '2FA code delivery', 'flag', `DEMO MODE — code for ${email} shown on screen (ALLOW_DEMO_2FA=1, no BREVO_API_KEY set)`);
+    } else {
+      audit('AUTHENTICATION AGENT', '2FA code delivery', 'fail', `No email provider configured — code for ${email} NOT displayed (set ALLOW_DEMO_2FA=1 for local demos)`);
+    }
     return;
   }
   fetch('https://api.brevo.com/v3/smtp/email', {
@@ -4208,7 +4294,7 @@ function dealMapSection(deal, geo) {
 }
 
 /** Shared deal composer fields (used by /deals/new and /new). */
-function dealFormFieldsHtml(pre) {
+function dealFormFieldsHtml(pre, user) {
   pre = pre || {};
   const preTitle = String(pre.title || '').slice(0, 160);
   const preOrigin = String(pre.origin || '').slice(0, 160);
@@ -4219,6 +4305,23 @@ function dealFormFieldsHtml(pre) {
   const preInco = DEAL_INCOTERMS.includes(pre.incoterm) ? pre.incoterm : 'CIF';
   const preCargoQty = (pre.cargo_qty != null && pre.cargo_qty !== '' && isFinite(Number(pre.cargo_qty)) && Number(pre.cargo_qty) > 0) ? String(Number(pre.cargo_qty)) : '';
   const preCargoUnit = DEAL_CARGO_UNITS.includes(pre.cargo_unit) ? pre.cargo_unit : 'MT';
+  // Warehouse products the deal owner can pick from (SELL deals): autofills title, qty and unit,
+  // and links the deal to the item so delivery can deduct stock with one click.
+  let whPickHtml = '';
+  if (user && user.id && !user.isAdmin) {
+    try {
+      const whItems = db.prepare('SELECT id, sku, name, quantity, unit FROM warehouse_items WHERE company_id = ? ORDER BY name LIMIT 100').all(user.id);
+      if (whItems.length) {
+        whPickHtml = `
+      <label>📦 From your warehouse (optional — SELL deals)</label>
+      <select name="warehouse_item" id="dz-wh-pick">
+        <option value="">— pick a registered product to autofill —</option>
+        ${whItems.map(wi => `<option value="${wi.id}" data-name="${esc(wi.name)}" data-qty="${wi.quantity}" data-unit="${esc(wi.unit)}" data-sku="${esc(wi.sku)}">${esc(wi.sku)} · ${esc(wi.name)} — ${fmtAmount(wi.quantity)} ${esc(wi.unit)} in stock</option>`).join('')}
+      </select>
+      <p class="muted" style="margin:-6px 0 12px">Picking a product autofills the title, quantity and unit, and links this deal to your stock — when you mark it delivered, Dealzoin offers to deduct the shipped amount automatically.</p>`;
+      }
+    } catch (e) { whPickHtml = ''; }
+  }
   return `
       <label>I want to…</label>
       <div style="display:flex;gap:16px;margin-bottom:12px">
@@ -4227,6 +4330,7 @@ function dealFormFieldsHtml(pre) {
         <label style="display:flex;gap:8px;align-items:center;margin:0;font-weight:600;color:var(--ink-primary)">
           <input type="radio" name="deal_type" value="buy" style="width:auto;margin:0" ${pre.deal_type === 'buy' ? 'checked' : ''}> 🛒 BUY</label>
       </div>
+      ${whPickHtml}
       <label>Deal title</label><input type="text" name="title" required maxlength="160" value="${esc(preTitle)}">
       <div class="grid2" style="gap:10px">
         <div><label>Category (required)</label><select name="category" required><option value="">— choose —</option>${optionsHtml(COMPANY_CATEGORIES, preCat)}</select>${otherInputHtml('category', preCatCustom)}</div>
@@ -4278,6 +4382,21 @@ function dealFormFieldsHtml(pre) {
         }
         document.querySelectorAll('input[name=deal_type],input[name=proof_mode]').forEach(function(r){r.addEventListener('change',sync);});
         sync();
+        var wp=document.getElementById('dz-wh-pick');
+        if(wp){wp.addEventListener('change',function(){
+          var o=wp.options[wp.selectedIndex];
+          if(!o||!o.value)return;
+          var f=wp.closest('form'); if(!f)return;
+          var t=f.querySelector('[name=title]');
+          if(t&&!t.value.trim())t.value=o.getAttribute('data-name')||'';
+          var q=f.querySelector('[name=cargo_qty]');
+          if(q&&!q.value)q.value=o.getAttribute('data-qty')||'';
+          var u=f.querySelector('[name=cargo_unit]');
+          if(u){var w=o.getAttribute('data-unit');for(var k=0;k<u.options.length;k++){if(u.options[k].value===w){u.value=w;break;}}}
+          var d=f.querySelector('[name=description]');
+          var sk=o.getAttribute('data-sku');
+          if(d&&sk&&d.value.indexOf(sk)===-1){d.value=(d.value?d.value+'\\n':'')+'Warehouse SKU: '+sk;}
+        });}
       })();</script>`;
 }
 
@@ -4579,7 +4698,7 @@ app.get('/signup', (req, res) => {
 });
 
 /** AJAX helper: parse an uploaded company-profile PDF and return auto-fill guesses as JSON. */
-app.post('/signup/parse-profile', (req, res) => {
+app.post('/signup/parse-profile', rateLimitRoute('signup-parse-profile', 10, 60 * 60 * 1000, 'json'), (req, res) => {
   pdfUpload.single('profile')(req, res, async (err) => {
     if (err) return res.json({ ok: false, error: err.code === 'LIMIT_FILE_SIZE' ? 'PDF too large (max 15 MB).' : PDF_RULES_MSG });
     if (!req.file) return res.json({ ok: false, error: 'No PDF received.' });
@@ -4665,9 +4784,9 @@ async function signupCompleteHandler(req, res) {
 
   res.redirect('/login?msg=' + encodeURIComponent('Registration received! Your company and documents are pending admin approval.'));
 }
-app.post('/signup/complete', signupDocsUpload, signupCompleteHandler);
+app.post('/signup/complete', rateLimitRoute('signup', 5, 60 * 60 * 1000, '/signup'), signupDocsUpload, ah(signupCompleteHandler));
 // Legacy entry point: the old simple POST /signup now routes through the same compliance-grade handler.
-app.post('/signup', signupDocsUpload, signupCompleteHandler);
+app.post('/signup', rateLimitRoute('signup', 5, 60 * 60 * 1000, '/signup'), signupDocsUpload, ah(signupCompleteHandler));
 
 // ============================= AUTH ROUTES (login + 2FA + logout) =============================
 app.get('/login', (req, res) => {
@@ -4687,7 +4806,7 @@ app.get('/login', (req, res) => {
   res.send(page('Sign in', body, null, req.query.msg, req.query.err, undefined, undefined, { lang }));
 });
 
-app.post('/login', (req, res) => {
+app.post('/login', rateLimitRoute('login', 10, 10 * 60 * 1000, '/login'), (req, res) => {
   const em = String(req.body.email || '').trim().toLowerCase();
   const pw = String(req.body.password || '');
   const company = db.prepare('SELECT * FROM companies WHERE email = ?').get(em);
@@ -4750,10 +4869,14 @@ app.get('/verify-login', (req, res) => {
   const row = db.prepare(`SELECT * FROM verification_codes WHERE token = ? AND purpose = 'login'`).get(token);
   if (!row) return res.redirect('/login?err=' + encodeURIComponent('Verification expired. Please sign in again.'));
 
-  // DEMO MODE: without BREVO_API_KEY the code is shown on-screen (and console.logged).
-  const demo = BREVO_API_KEY ? '' : `
+  // Demo banner ONLY when explicitly opted in via ALLOW_DEMO_2FA=1 — the real code is never
+  // displayed by default; without an email provider we show a configuration notice instead.
+  const demo = BREVO_API_KEY ? ''
+    : process.env.ALLOW_DEMO_2FA === '1' ? `
     <div class="demo-banner">⚠️ <b>DEMO MODE</b> — no BREVO_API_KEY configured, so the email was not sent.
-    Your verification code is: <b style="font-size:18px;letter-spacing:3px">${esc(row.code)}</b></div>`;
+    Your verification code is: <b style="font-size:18px;letter-spacing:3px">${esc(row.code)}</b></div>`
+    : `
+    <div class="demo-banner">⚠️ Email provider not configured — contact the administrator.</div>`;
 
   const body = `
   <div class="card" style="max-width:440px;margin:0 auto">
@@ -4769,7 +4892,7 @@ app.get('/verify-login', (req, res) => {
   res.send(page('Verify login', body, null, req.query.msg, req.query.err));
 });
 
-app.post('/verify-login', (req, res) => {
+app.post('/verify-login', rateLimitRoute('verify-login', 10, 10 * 60 * 1000, '/verify-login'), (req, res) => {
   const token = readSignedCookie(req, 'dz_verify');
   const code = String(req.body.code || '').trim();
   if (!token) return res.redirect('/login?err=' + encodeURIComponent('No verification in progress. Please sign in again.'));
@@ -4787,7 +4910,17 @@ app.post('/verify-login', (req, res) => {
   const a = Buffer.from(code.padEnd(6, ' '));
   const b = Buffer.from(row.code.padEnd(6, ' '));
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
-    audit('AUTHENTICATION AGENT', '2FA verify', 'fail', `Wrong code for ${company.email}`);
+    // Brute-force protection: count wrong attempts on the code row; at 5 the code is burned
+    // and the user must sign in again (fresh code).
+    const attempts = (row.attempts || 0) + 1;
+    if (attempts >= 5) {
+      db.prepare('DELETE FROM verification_codes WHERE id = ?').run(row.id);
+      res.setHeader('Set-Cookie', 'dz_verify=; HttpOnly; Path=/; Max-Age=0');
+      audit('AUTHENTICATION AGENT', '2FA verify', 'fail', `2FA locked after 5 attempts for ${company.email}`);
+      return res.redirect('/login?err=' + encodeURIComponent('Too many incorrect codes — please sign in again.'));
+    }
+    db.prepare('UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ?').run(row.id);
+    audit('AUTHENTICATION AGENT', '2FA verify', 'fail', `Wrong code for ${company.email} (attempt ${attempts}/5)`);
     return res.redirect('/verify-login?err=' + encodeURIComponent('Incorrect code. Try again.'));
   }
 
@@ -5065,7 +5198,7 @@ app.get('/deals/new', requireCompany, (req, res) => {
     <h2>📦 Post a new deal</h2>
     <p class="muted" style="margin-bottom:12px">Deals go live on every company's timeline immediately. Deal values stay private — only counterparties see them.</p>
     <form method="POST" action="/deals" enctype="multipart/form-data">
-      ${dealFormFieldsHtml(pre)}
+      ${dealFormFieldsHtml(pre, req.user)}
       <label>Photo or video (optional — image ≤ 5 MB, video ≤ 25 MB)</label>
       ${fileButtonHtml()}
       <button class="btn js-magnet" type="submit">Publish deal</button>
@@ -5074,7 +5207,7 @@ app.get('/deals/new', requireCompany, (req, res) => {
   res.send(page('New deal', body, req.user, req.query.msg, req.query.err, 'new'));
 });
 
-app.post('/deals', requireCompany, dealUpload, async (req, res) => {
+app.post('/deals', requireCompany, dealUpload, ah(async (req, res) => {
   const title = String(req.body.title || '').trim();
   const desc = String(req.body.description || '').trim();
   const value = String(req.body.value || '').trim().slice(0, 80);
@@ -5124,16 +5257,25 @@ app.post('/deals', requireCompany, dealUpload, async (req, res) => {
   }
 
   const number = nextDealNumber();
+  // Optional link to a warehouse product (SELL deals): enables one-click stock deduction on delivery.
+  let whItemId = null;
+  if (dealType === 'sell') {
+    const wId = parseInt(req.body.warehouse_item, 10) || 0;
+    if (wId) {
+      const wRow = db.prepare('SELECT id FROM warehouse_items WHERE id = ? AND company_id = ?').get(wId, req.user.id);
+      if (wRow) whItemId = wRow.id;
+    }
+  }
   db.prepare(`INSERT INTO deals (company_id, title, description, value, created_at, media_id, currency, time_period,
-              deal_type, deal_number, category, origin, destination, incoterm, product_proof, product_proof_doc_id, status, author_name, cargo_qty, cargo_unit)
-              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?, ?, ?)`)
+              deal_type, deal_number, category, origin, destination, incoterm, product_proof, product_proof_doc_id, status, author_name, cargo_qty, cargo_unit, warehouse_item_id)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?, ?, ?, ?)`)
     .run(req.user.id, title.slice(0, 160), desc.slice(0, 4000), value, now(), mediaId, currency, timePeriod,
          dealType, number, category, origin, destination, incoterm,
          dealType === 'sell' && proofMode === 'manual' ? proofText : '', proofDocId, req.user.memberName || null,
-         cargoQty, cargoQty !== null ? cargoUnit : '');
+         cargoQty, cargoQty !== null ? cargoUnit : '', whItemId);
   audit('DEAL AGENT', 'deal published', 'pass', `${req.user.name} posted ${dealType.toUpperCase()} deal ${number} "${title.slice(0, 60)}" (${category}, ${incoterm}, origin ${origin}${cargoQty !== null ? `, cargo ${cargoQty} ${cargoUnit}` : ''})`);
   res.redirect('/timeline?msg=' + encodeURIComponent(`Deal ${number} published to all timelines!`));
-});
+}));
 
 // ============================= SOCIAL ROUTES (likes, comments, reposts, follows) =============================
 app.post('/like/:type/:id', requireCompany, (req, res) => {
@@ -5485,7 +5627,7 @@ function dealCounterpartyName(deal, names) {
   return 'To be determined via negotiation';
 }
 
-app.get('/deal/:id', requireCompanyOrAdmin, async (req, res) => {
+app.get('/deal/:id', requireCompanyOrAdmin, ah(async (req, res) => {
   const deal = getDealOr404(req, res);
   if (!deal) return;
   const owner = db.prepare('SELECT id, name, avatar_media_id FROM companies WHERE id = ?').get(deal.company_id);
@@ -5566,11 +5708,14 @@ app.get('/deal/:id', requireCompanyOrAdmin, async (req, res) => {
           <h4 style="margin-bottom:8px">Confirm your payment (${isFinite(myShare) ? `${fmtAmount(myShare)} ${esc(bd.cur)}` : 'amount per instructions'})</h4>
           ${mine && mine.status === 'rejected' ? '<p class="flag-note">Your previous confirmation was rejected by the administrator. You can re-confirm once the transfer is made.</p>' : ''}
           <div class="feed-actions" style="margin:0 0 10px">${applePayHtml()}</div>
-          <form method="POST" action="/deal/${deal.id}/payment-confirm">
+          <form method="POST" action="/deal/${deal.id}/payment-confirm" enctype="multipart/form-data">
             <label>Payment reference / note (optional)</label>
             <input type="text" name="note" maxlength="300" placeholder="e.g. Bank transfer ref #TRX-12345, sent today">
+            <label style="margin-top:8px">Payment proof — PDF receipt (optional)</label>
+            <label class="file-btn file-btn-sm"><span class="file-btn-text" data-default="📎 Attach bank-transfer receipt (PDF)">📎 Attach bank-transfer receipt (PDF)</span>
+              <input type="file" class="file-input" name="proof" accept="application/pdf,.pdf"></label>
             <button class="btn btn-sm btn-green" type="submit">Confirm payment sent</button>
-            <p class="muted" style="margin-top:6px">After confirming you can attach the bank-transfer receipt (PDF) as payment proof. The administrator verifies the bank transfer and approves — shipment tracking unlocks once all required shares are approved.</p>
+            <p class="muted" style="margin-top:6px">The admin verifies your reference + PDF receipt and approves — shipment tracking unlocks once all required shares are approved. You can replace the PDF while it awaits review.</p>
           </form>`;
         }
       } else {
@@ -5612,8 +5757,8 @@ app.get('/deal/:id', requireCompanyOrAdmin, async (req, res) => {
           <div><label>Destination pin (optional, lat,lng)</label><input type="text" name="dest_pin" maxlength="60" placeholder="e.g. ${deal.dest_lat != null && deal.dest_lng != null ? esc(deal.dest_lat + ',' + deal.dest_lng) : '51.5074,-0.1278'}"></div>
         </div>
         ${isOwner ? `<div class="grid2" style="gap:10px">
-          <div><label>Deduct from warehouse on delivery (optional)</label><select name="stockout_item"><option value="">— no stock change —</option>${db.prepare('SELECT id, sku, name, quantity, unit FROM warehouse_items WHERE company_id = ? ORDER BY name LIMIT 100').all(deal.company_id).map(wi => `<option value="${wi.id}">${esc(wi.sku)} — ${esc(wi.name)} (${fmtAmount(wi.quantity)} ${esc(wi.unit)})</option>`).join('')}</select></div>
-          <div><label>Quantity to deduct</label><input type="number" name="stockout_qty" min="0" step="any" placeholder="0" inputmode="decimal"></div>
+          <div><label>Deduct from warehouse on delivery (optional)</label><select name="stockout_item"><option value="">— no stock change —</option>${db.prepare('SELECT id, sku, name, quantity, unit FROM warehouse_items WHERE company_id = ? ORDER BY name LIMIT 100').all(deal.company_id).map(wi => `<option value="${wi.id}"${deal.warehouse_item_id === wi.id ? ' selected' : ''}>${esc(wi.sku)} — ${esc(wi.name)} (${fmtAmount(wi.quantity)} ${esc(wi.unit)})${deal.warehouse_item_id === wi.id ? ' 🔗 linked to this deal' : ''}</option>`).join('')}</select></div>
+          <div><label>Quantity to deduct</label><input type="number" name="stockout_qty" min="0" step="any" placeholder="0" inputmode="decimal" value="${deal.warehouse_item_id && deal.cargo_qty ? String(deal.cargo_qty) : ''}"></div>
         </div>
         <p class="muted" style="margin:-6px 0 10px">When you set the status to <b>delivered</b>, the chosen quantity is booked out of your warehouse automatically (reason: Sale / delivery, linked to this deal).</p>` : ''}
         <button class="btn btn-sm" type="submit">Update status</button>
@@ -5726,6 +5871,7 @@ app.get('/deal/:id', requireCompanyOrAdmin, async (req, res) => {
       <span class="chip" title="${esc(INCOTERM_EXPLAINERS[deal.incoterm] || INCOTERM_EXPLAINERS.CIF)}">⚓ ${esc(deal.incoterm || 'CIF')}</span>
       ${deal.origin ? ` <span class="chip">📍 ${esc(deal.origin)}</span>` : ''}
       ${canSeeValue && Number(deal.cargo_qty) > 0 ? ` <span class="chip chip-cargo" title="Cargo capacity — visible to deal parties only">📦 ${esc(fmtAmount(Number(deal.cargo_qty)))} ${esc(DEAL_CARGO_UNITS.includes(deal.cargo_unit) ? deal.cargo_unit : 'units')}</span>` : ''}
+      ${deal.warehouse_item_id ? (() => { const wi = db.prepare('SELECT sku, name, quantity, unit FROM warehouse_items WHERE id = ?').get(deal.warehouse_item_id); return wi ? ` <span class="chip" title="Linked warehouse product">🔗 ${esc(wi.sku)} · ${esc(wi.name)}</span>` : ''; })() : ''}
     </div>
     <p class="muted">by ${avatarHtml(owner ? owner.name : '?', owner ? owner.avatar_media_id : null)}<a href="/company/${deal.company_id}"><b>${esc(owner ? owner.name : 'Unknown')}</b></a> ${starsHtml(companyReputation(deal.company_id), true)}</p>
     <div data-dz-tr><p style="margin-top:12px;white-space:pre-wrap" class="dz-tr-text">${esc(deal.description)}</p>
@@ -5743,7 +5889,7 @@ app.get('/deal/:id', requireCompanyOrAdmin, async (req, res) => {
   ${contractHtml}
   ${docsHtml}`;
   res.send(page(deal.title, body, req.user, req.query.msg, req.query.err, undefined, mapHead));
-});
+}));
 
 // ----- POST /deal/:id/status — owner, contracted buyer or admin advances the pipeline (CIF/FOB/CFR only) -----
 app.post('/deal/:id/status', (req, res) => {
@@ -5829,7 +5975,7 @@ app.post('/deal/:id/status', (req, res) => {
 });
 
 // ----- POST /deal/:id/payment-confirm — a deal party confirms it sent its commission share (bank transfer) -----
-app.post('/deal/:id/payment-confirm', requireCompany, (req, res) => {
+app.post('/deal/:id/payment-confirm', requireCompany, proofUploadMw, (req, res) => {
   const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
   if (!deal) return res.redirect('/timeline?err=' + encodeURIComponent('Deal not found.'));
   const back = `/deal/${deal.id}`;
@@ -5854,12 +6000,22 @@ app.post('/deal/:id/payment-confirm', requireCompany, (req, res) => {
     return res.redirect(back + '?err=' + encodeURIComponent('Your payment confirmation is already awaiting admin review.'));
   }
   const note = String(req.body.note || '').trim().slice(0, 300);
+  // Optional PDF receipt attached in the same form — validated BEFORE the row is created.
+  if (req.file && !isPdfBuffer(req.file.buffer)) {
+    audit('PAYMENT AGENT', 'proof upload check', 'fail', `"${req.file.originalname || 'file'}" rejected on deal ${deal.deal_number || '#' + deal.id} — not a real PDF`);
+    return res.redirect(back + '?err=' + encodeURIComponent('Upload rejected: the payment proof must be a real PDF file.'));
+  }
   const amount = isFinite(myShare) ? Math.round(myShare * 100) / 100 : 0; // computed server-side — never trusted from the client
-  db.prepare(`INSERT INTO commission_payments (deal_id, private_contract_id, company_id, amount, currency, note, status, created_at)
+  const payId = db.prepare(`INSERT INTO commission_payments (deal_id, private_contract_id, company_id, amount, currency, note, status, created_at)
               VALUES (?, NULL, ?, ?, ?, ?, 'pending', ?)`)
-    .run(deal.id, req.user.id, amount, bd.cur, note, now());
-  audit('PAYMENT AGENT', 'payment confirmation submitted', 'pass', `${req.user.name} confirmed a commission payment of ${isFinite(myShare) ? `${fmtAmount(amount)} ${bd.cur}` : 'amount TBC'} on deal ${deal.deal_number || '#' + deal.id}${note ? ` — note: ${note}` : ''}`);
-  res.redirect(back + '?msg=' + encodeURIComponent('Payment confirmation submitted — the administrator will verify your transfer and approve it.'));
+    .run(deal.id, req.user.id, amount, bd.cur, note, now()).lastInsertRowid;
+  if (req.file) {
+    const mediaId = saveMedia(req.user.id, req.file);
+    db.prepare('UPDATE commission_payments SET proof_media_id = ?, proof_filename = ? WHERE id = ?')
+      .run(mediaId, String(req.file.originalname || 'receipt.pdf').slice(0, 120), payId);
+  }
+  audit('PAYMENT AGENT', 'payment confirmation submitted', 'pass', `${req.user.name} confirmed a commission payment of ${isFinite(myShare) ? `${fmtAmount(amount)} ${bd.cur}` : 'amount TBC'} on deal ${deal.deal_number || '#' + deal.id}${note ? ` — note: ${note}` : ''}${req.file ? ' — PDF receipt attached' : ''}`);
+  res.redirect(back + '?msg=' + encodeURIComponent(`Payment confirmation submitted${req.file ? ' with your PDF receipt' : ''} — the administrator will verify your transfer and approve it.`));
 });
 
 // ----- BATCH B (1a): payment-proof PDF upload — the paying party attaches a bank-transfer receipt -----
@@ -6153,7 +6309,7 @@ app.post('/deal/:id/request-docs', requireCompany, (req, res) => {
 });
 
 // ----- POST /deal/:id/documents — the owner uploads a response document (PDF or image) -----
-app.post('/deal/:id/documents', requireCompany, dealDocUploadMw, async (req, res) => {
+app.post('/deal/:id/documents', requireCompany, dealDocUploadMw, ah(async (req, res) => {
   const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
   if (!deal) return res.redirect('/timeline?err=' + encodeURIComponent('Deal not found.'));
   if (deal.company_id !== req.user.id) {
@@ -6195,7 +6351,7 @@ app.post('/deal/:id/documents', requireCompany, dealDocUploadMw, async (req, res
     notify(cid, 'deal_document', `${req.user.name} shared a document on deal "${deal.title}"${note ? `: "${note.slice(0, 100)}"` : ''}. Open the deal page to download it.`, `/deal/${deal.id}`);
   }
   res.redirect(`/deal/${deal.id}?msg=` + encodeURIComponent('Document shared with the requesting parties.'));
-});
+}));
 
 // ----- GET /deal-docs/:id/download — owner, requesting/contracted parties, admin only -----
 app.get('/deal-docs/:id/download', (req, res) => {
@@ -6522,9 +6678,12 @@ app.get('/deal/:id/sign/verify', requireCompany, (req, res) => {
   const ctx = loadOtpContext(req, 'dz_sign', 'sign', deal.id);
   if (!ctx) return res.redirect(`/deal/${deal.id}/sign?err=` + encodeURIComponent('No signing verification in progress. Please start again.'));
 
-  const demo = BREVO_API_KEY ? '' : `
+  const demo = BREVO_API_KEY ? ''
+    : process.env.ALLOW_DEMO_2FA === '1' ? `
     <div class="demo-banner">⚠️ <b>DEMO MODE</b> — no BREVO_API_KEY configured, so the email was not sent.
-    Your signing code is: <b style="font-size:18px;letter-spacing:3px">${esc(ctx.row.code)}</b></div>`;
+    Your signing code is: <b style="font-size:18px;letter-spacing:3px">${esc(ctx.row.code)}</b></div>`
+    : `
+    <div class="demo-banner">⚠️ Email provider not configured — contact the administrator.</div>`;
   const body = `
   <div class="card vault" style="max-width:480px;margin:0 auto">
     <div class="kicker" style="margin-bottom:6px">Step 2 of 2 · signing code</div>
@@ -6656,9 +6815,12 @@ app.get('/deal/:id/counter/verify', requireCompany, (req, res) => {
   const ctx = loadOtpContext(req, 'dz_counter', 'counter', deal.id);
   if (!ctx) return res.redirect(`/deal/${deal.id}/sign?tab=counter&err=` + encodeURIComponent('No counter-offer verification in progress. Please start again.'));
 
-  const demo = BREVO_API_KEY ? '' : `
+  const demo = BREVO_API_KEY ? ''
+    : process.env.ALLOW_DEMO_2FA === '1' ? `
     <div class="demo-banner">⚠️ <b>DEMO MODE</b> — no BREVO_API_KEY configured, so the email was not sent.
-    Your confirmation code is: <b style="font-size:18px;letter-spacing:3px">${esc(ctx.row.code)}</b></div>`;
+    Your confirmation code is: <b style="font-size:18px;letter-spacing:3px">${esc(ctx.row.code)}</b></div>`
+    : `
+    <div class="demo-banner">⚠️ Email provider not configured — contact the administrator.</div>`;
   const body = `
   <div class="card vault" style="max-width:480px;margin:0 auto">
     <div class="kicker" style="margin-bottom:6px">Step 2 of 2 · confirmation code</div>
@@ -7826,7 +7988,7 @@ app.get('/contracts/:id', (req, res) => {
 });
 
 // ----- POST /contracts/:id/payment-confirm — sender/recipient confirms their 50% commission share -----
-app.post('/contracts/:id/payment-confirm', requireCompany, (req, res) => {
+app.post('/contracts/:id/payment-confirm', requireCompany, proofUploadMw, (req, res) => {
   const pc = getPrivateContract(req.params.id);
   if (!pc) return res.redirect('/contracts?err=' + encodeURIComponent('Contract not found.'));
   const back = `/contracts/${pc.id}`;
@@ -7845,11 +8007,21 @@ app.post('/contracts/:id/payment-confirm', requireCompany, (req, res) => {
   const pcb = pcPaymentBreakdown(pc);
   const myShare = req.user.id === pc.sender_company_id ? pcb.senderShare : pcb.recipientShare;
   const note = String(req.body.note || '').trim().slice(0, 300);
+  // Optional PDF receipt attached in the same form — validated BEFORE the row is created.
+  if (req.file && !isPdfBuffer(req.file.buffer)) {
+    audit('PAYMENT AGENT', 'proof upload check', 'fail', `"${req.file.originalname || 'file'}" rejected on private contract #${pc.id} — not a real PDF`);
+    return res.redirect(back + '?err=' + encodeURIComponent('Upload rejected: the payment proof must be a real PDF file.'));
+  }
   const amount = isFinite(myShare) ? Math.round(myShare * 100) / 100 : 0; // computed server-side
-  db.prepare(`INSERT INTO commission_payments (deal_id, private_contract_id, company_id, amount, currency, note, status, created_at)
+  const payId = db.prepare(`INSERT INTO commission_payments (deal_id, private_contract_id, company_id, amount, currency, note, status, created_at)
               VALUES (NULL, ?, ?, ?, ?, ?, 'pending', ?)`)
-    .run(pc.id, req.user.id, amount, pcb.cur, note, now());
-  audit('PAYMENT AGENT', 'payment confirmation submitted', 'pass', `${req.user.name} confirmed a commission payment of ${isFinite(myShare) ? `${fmtAmount(amount)} ${pcb.cur}` : 'amount TBC'} on private contract #${pc.id}${note ? ` — note: ${note}` : ''}`);
+    .run(pc.id, req.user.id, amount, pcb.cur, note, now()).lastInsertRowid;
+  if (req.file) {
+    const mediaId = saveMedia(req.user.id, req.file);
+    db.prepare('UPDATE commission_payments SET proof_media_id = ?, proof_filename = ? WHERE id = ?')
+      .run(mediaId, String(req.file.originalname || 'receipt.pdf').slice(0, 120), payId);
+  }
+  audit('PAYMENT AGENT', 'payment confirmation submitted', 'pass', `${req.user.name} confirmed a commission payment of ${isFinite(myShare) ? `${fmtAmount(amount)} ${pcb.cur}` : 'amount TBC'} on private contract #${pc.id}${note ? ` — note: ${note}` : ''}${req.file ? ' — PDF receipt attached' : ''}`);
   res.redirect(back + '?msg=' + encodeURIComponent('Payment confirmation submitted — the administrator will verify your transfer and approve it.'));
 });
 
@@ -7952,9 +8124,12 @@ app.get('/contracts/:id/sign/verify', requireCompany, (req, res) => {
   const ctx = loadPcOtpContext(req, pc.id);
   if (!ctx) return res.redirect(`/contracts/${pc.id}?err=` + encodeURIComponent('No signing verification in progress. Please start again.'));
 
-  const demo = BREVO_API_KEY ? '' : `
+  const demo = BREVO_API_KEY ? ''
+    : process.env.ALLOW_DEMO_2FA === '1' ? `
     <div class="demo-banner">⚠️ <b>DEMO MODE</b> — no BREVO_API_KEY configured, so the email was not sent.
-    Your signing code is: <b style="font-size:18px;letter-spacing:3px">${esc(ctx.row.code)}</b></div>`;
+    Your signing code is: <b style="font-size:18px;letter-spacing:3px">${esc(ctx.row.code)}</b></div>`
+    : `
+    <div class="demo-banner">⚠️ Email provider not configured — contact the administrator.</div>`;
   const body = `
   <div class="card vault" style="max-width:480px;margin:0 auto">
     <div class="kicker" style="margin-bottom:6px">Step 2 of 2 · signing code</div>
@@ -8039,6 +8214,14 @@ app.get('/media/:id', (req, res) => {
   if (!user) return res.redirect('/login?err=' + encodeURIComponent('Please sign in to view media.'));
   const m = db.prepare('SELECT * FROM media WHERE id = ?').get(parseInt(req.params.id, 10));
   if (!m) return res.status(404).send(page('Not found', '<div class="card"><h2>Media not found</h2></div>', user));
+  // IDOR fix: media used as a commission payment proof (sensitive PDF) is private —
+  // only the owning company or an admin may download it. All other media (avatars, post
+  // attachments, headers) stays visible to any logged-in user, by design.
+  const proofUse = db.prepare('SELECT id, company_id FROM commission_payments WHERE proof_media_id = ?').get(m.id);
+  if (proofUse && !user.isAdmin && proofUse.company_id !== user.id) {
+    audit('DOCUMENT AGENT', 'media access', 'fail', `Unauthorized payment-proof media access attempt: media #${m.id} (payment #${proofUse.id}) by ${user.name}`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Private document</h2><p class="muted">Only the owning company and the admin can download this document.</p></div>', user));
+  }
   res.setHeader('Content-Type', m.mime);
   res.setHeader('Content-Length', m.data.length);
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -8086,7 +8269,7 @@ app.get('/new', requireCompany, (req, res) => {
       <h2>Post a deal</h2>
       <p class="muted">Title, value, description — plus an optional photo or video.</p>
       <form method="POST" action="/deals" enctype="multipart/form-data" style="margin-top:14px;text-align:left">
-        ${dealFormFieldsHtml()}
+        ${dealFormFieldsHtml(null, req.user)}
         <label>Photo or video (optional — image ≤ 5 MB, video ≤ 25 MB)</label>${mediaInput}
         <button class="btn js-magnet" type="submit">Publish deal</button>
       </form>
@@ -9602,7 +9785,7 @@ const TRACKING_MAP_SCRIPT = `<script>(function(){
 
 // Full-width tracking map: every in-transit (dispatched/shipped) CIF/FOB/CFR deal as a pulsing marker.
 // Logged-in companies + admin. Coordinates are geocoded lazily; deal values are never shown.
-app.get('/tracking', requireCompanyOrAdmin, async (req, res) => {
+app.get('/tracking', requireCompanyOrAdmin, ah(async (req, res) => {
   let deals = [];
   try {
     // Commission gate: deals awaiting commission payment approval never appear on the tracking map
@@ -9655,7 +9838,7 @@ app.get('/tracking', requireCompanyOrAdmin, async (req, res) => {
   ${strip}
   ${mapHtml}`;
   res.send(page('Shipment tracking', body, req.user, req.query.msg, req.query.err, 'globe', markers.length ? LEAFLET_HEAD : ''));
-});
+}));
 
 // ============================= ADMIN ROUTES =============================
 /** Verify admin credentials: settings-table password override wins, env var is fallback. */
@@ -9683,13 +9866,34 @@ app.get('/admin', (req, res) => {
   res.redirect('/admin/dashboard');
 });
 
-app.post('/admin/login', (req, res) => {
+// ----- Admin login lockout: per email+IP, 5 failures within 15 min locks for 15 min -----
+const adminLoginFails = new Map(); // key "email|ip" -> { fails: number[], lockedUntil: number }
+const ADMIN_LOCK_WINDOW_MS = 15 * 60 * 1000;
+const ADMIN_LOCK_MAX_FAILS = 5;
+
+app.post('/admin/login', rateLimitRoute('admin-login', 5, ADMIN_LOCK_WINDOW_MS, '/admin'), (req, res) => {
   const em = String(req.body.email || '').trim().toLowerCase();
   const pw = String(req.body.password || '');
+  const lockKey = `${em}|${req.ip}`;
+  const nowMs = Date.now();
+  const rec = adminLoginFails.get(lockKey);
+  if (rec && rec.lockedUntil > nowMs) {
+    audit('AUTHENTICATION AGENT', 'admin login', 'fail', `Blocked admin login for ${em} from ${req.ip} — locked until ${new Date(rec.lockedUntil).toISOString()}`);
+    return res.redirect('/admin?err=' + encodeURIComponent('Invalid admin credentials.'));
+  }
   if (em !== ADMIN_EMAIL.toLowerCase() || !adminPasswordOk(pw)) {
+    const fails = (rec ? rec.fails : []).filter(ts => ts > nowMs - ADMIN_LOCK_WINDOW_MS);
+    fails.push(nowMs);
+    if (fails.length >= ADMIN_LOCK_MAX_FAILS) {
+      adminLoginFails.set(lockKey, { fails: [], lockedUntil: nowMs + ADMIN_LOCK_WINDOW_MS });
+      audit('AUTHENTICATION AGENT', 'admin login lockout', 'fail', `Admin login locked for ${em} from ${req.ip} after ${ADMIN_LOCK_MAX_FAILS} failures in 15 minutes`);
+    } else {
+      adminLoginFails.set(lockKey, { fails, lockedUntil: 0 });
+    }
     audit('AUTHENTICATION AGENT', 'admin login', 'fail', `Failed admin login for ${em}`);
     return res.redirect('/admin?err=' + encodeURIComponent('Invalid admin credentials.'));
   }
+  adminLoginFails.delete(lockKey); // clear the failure counter on success
   audit('AUTHENTICATION AGENT', 'admin login', 'pass', `Admin ${em} signed in`);
   createSession(req, res, null, true);
   res.redirect('/admin/dashboard');
@@ -10447,7 +10651,7 @@ app.get('/admin/companies/:id/research', requireAdmin, (req, res) => {
   res.send(page('Research — ' + c.name, body, req.user, req.query.msg, req.query.err));
 });
 
-app.post('/admin/companies/:id/research', requireAdmin, async (req, res) => {
+app.post('/admin/companies/:id/research', requireAdmin, ah(async (req, res) => {
   const c = db.prepare('SELECT * FROM companies WHERE id = ?').get(parseInt(req.params.id, 10));
   if (!c) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Company not found.'));
 
@@ -10524,7 +10728,7 @@ app.post('/admin/companies/:id/research', requireAdmin, async (req, res) => {
   res.redirect(`/admin/companies/${c.id}/research?` + (suggestion
     ? 'msg=' + encodeURIComponent('Research found a public summary — review and save.')
     : 'err=' + encodeURIComponent('No public data found for "' + c.name + '" (' + (failReason || 'not found') + '). You can still fill the fields manually.')));
-});
+}));
 
 // ----- Batch C (3): admin bank-KYC override (pins the BANK RESEARCH AGENT verdict) -----
 app.post('/admin/companies/:id/bank-kyc', requireAdmin, (req, res) => {
@@ -10659,8 +10863,11 @@ app.post('/admin/password', requireAdmin, (req, res) => {
   const upsert = db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value');
   upsert.run('admin_password_hash', hashPassword(next, salt));
   upsert.run('admin_password_salt', salt);
-  audit('AUTHENTICATION AGENT', 'admin password change', 'pass', 'Admin password updated (hashed override stored)');
-  res.redirect('/admin/dashboard?msg=' + encodeURIComponent('Admin password updated.'));
+  // Session lifecycle: sign out every OTHER admin session (keep the current one).
+  const curToken = readSignedCookie(req, 'dz_session');
+  const killed = curToken ? db.prepare('DELETE FROM sessions WHERE is_admin = 1 AND token != ?').run(curToken).changes : 0;
+  audit('AUTHENTICATION AGENT', 'admin password change', 'pass', `Admin password updated (hashed override stored) — ${killed} other admin session(s) signed out`);
+  res.redirect('/admin/dashboard?msg=' + encodeURIComponent('Admin password changed — other sessions signed out.'));
 });
 
 // ----- Platform settings: adjustable commission (0.1–20%), audit-logged old→new -----
@@ -11145,7 +11352,7 @@ function parseGoogleTranslate(json) {
   if (!Array.isArray(json) || !Array.isArray(json[0])) return '';
   return json[0].map(seg => (Array.isArray(seg) && seg[0]) ? String(seg[0]) : '').join('').trim();
 }
-app.post('/api/translate', requireCompany, async (req, res) => {
+app.post('/api/translate', requireCompany, ah(async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   const rawText = String((req.body && req.body.text) || '');
   if (rawText.length > 2000) return res.status(413).json({ ok: false, error: 'too_long' });
@@ -11190,7 +11397,7 @@ app.post('/api/translate', requireCompany, async (req, res) => {
       .run(cacheKey, target, out.slice(0, 4000), now());
   } catch (e) { /* caching is best-effort */ }
   return res.json({ ok: true, text: out, target });
-});
+}));
 
 // ----- (3) BANK RESEARCH AGENT — company bank details KYC -----
 /** Basic ISO-13616 IBAN mod-97 checksum. Returns true/false; null when the input isn't IBAN-shaped. */
@@ -12108,7 +12315,67 @@ app.use((req, res) => {
   res.status(404).send(page('Not found', '<div class="card"><h2>404 — page not found</h2><p class="muted"><a href="/">Back to home</a></p></div>', currentUser(req)));
 });
 
+// ----- Global error handler: log server-side, NEVER leak err.message/stack to the client -----
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  console.error('Unhandled route error:', err);
+  try { audit('SECURITY AGENT', 'unhandled error', 'fail', `${req.method} ${req.path}: ${String((err && err.message) || err).slice(0, 300)}`); } catch (e) { /* audit must never throw here */ }
+  if (res.headersSent) return next(err); // let Express close the broken response
+  try {
+    res.status(500).send(page('Something went wrong', '<div class="card"><h2>Something went wrong</h2><p class="muted">An unexpected error occurred. Please try again.</p></div>', currentUser(req)));
+  } catch (e) {
+    try { res.status(500).send('Something went wrong'); } catch (e2) { /* response is unsalvageable */ }
+  }
+});
+
+// ----- Crash protection: log, never leak; a rejection must not kill the process -----
+process.on('unhandledRejection', (reason) => {
+  console.error('unhandledRejection:', reason);
+  try { audit('SECURITY AGENT', 'unhandledRejection', 'fail', String((reason && reason.message) || reason).slice(0, 300)); } catch (e) { /* best-effort */ }
+});
+process.on('uncaughtException', (err) => {
+  console.error('uncaughtException:', err);
+  try { audit('SECURITY AGENT', 'uncaughtException', 'fail', String((err && err.message) || err).slice(0, 300)); } catch (e) { /* best-effort */ }
+});
+
+// ----- Hourly cleanup of expired sessions & verification codes -----
+// Both tables store expires_at as ISO-8601 text from now(), so a plain `<` comparison is valid.
+setInterval(() => {
+  try {
+    db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(now());
+    db.prepare('DELETE FROM verification_codes WHERE expires_at < ?').run(now());
+  } catch (e) { /* best-effort housekeeping */ }
+}, 3600_000).unref();
+
+// ----- Production boot guard: refuse to start with weak/missing secrets -----
+function bootGuard() {
+  // A settings-table admin password hash (set via /admin/password) also satisfies the admin-secret requirement.
+  let hasAdminOverride = false;
+  try { hasAdminOverride = !!db.prepare('SELECT value FROM settings WHERE key = ?').get('admin_password_hash'); } catch (e) { /* settings table unreadable */ }
+  const envPw = process.env.ADMIN_PASSWORD || '';
+  const adminOk = hasAdminOverride || (envPw !== '' && envPw !== 'admin' && envPw.length >= 12);
+  const sessionOk = !!process.env.SESSION_SECRET && process.env.SESSION_SECRET !== 'dev-insecure-secret-change-me';
+  const brevoOk = !!process.env.BREVO_API_KEY;
+  if (process.env.NODE_ENV === 'production') {
+    const missing = [];
+    if (!sessionOk) missing.push('SESSION_SECRET (set a strong random value, not the dev default)');
+    if (!adminOk) missing.push('ADMIN_PASSWORD (≥12 chars, not "admin") or an admin password hash saved via /admin/password');
+    if (!brevoOk) missing.push('BREVO_API_KEY (required so 2FA codes are emailed, never displayed)');
+    if (missing.length) {
+      console.error('FATAL: NODE_ENV=production but required secrets are missing or weak. Refusing to start.\n  - ' + missing.join('\n  - '));
+      process.exit(1);
+    }
+  } else {
+    const warn = [];
+    if (!sessionOk) warn.push('SESSION_SECRET is using the dev default');
+    if (!adminOk) warn.push('ADMIN_PASSWORD is unset/weak (dev fallback "admin")');
+    if (!brevoOk) warn.push('BREVO_API_KEY is unset (2FA codes cannot be emailed; set ALLOW_DEMO_2FA=1 for local demos)');
+    if (warn.length) console.warn('⚠️  DEV MODE — insecure defaults in use, do NOT deploy like this:\n  - ' + warn.join('\n  - '));
+  }
+}
+bootGuard();
+
 app.listen(PORT, () => {
   console.log(`Dealzoin listening on http://localhost:${PORT}`);
-  console.log(`Admin login: ${ADMIN_EMAIL} (env-configured)${BREVO_API_KEY ? '' : ' — DEMO MODE: verification codes shown on screen'}`);
+  console.log(`Admin login: ${ADMIN_EMAIL} (env-configured)${BREVO_API_KEY ? '' : (process.env.ALLOW_DEMO_2FA === '1' ? ' — DEMO MODE: verification codes shown on screen' : ' — WARNING: no BREVO_API_KEY, 2FA codes will not be delivered')}`);
 });
