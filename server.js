@@ -18,6 +18,12 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin';
 const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-insecure-secret-change-me';
 const BREVO_API_KEY = process.env.BREVO_API_KEY || '';
 const BREVO_SENDER_EMAIL = process.env.BREVO_SENDER_EMAIL || ADMIN_EMAIL;
+// Free email fallback: send codes through a Gmail account using a Google App Password.
+// Set GMAIL_USER + GMAIL_APP_PASSWORD on the host; Brevo takes priority when both exist.
+const GMAIL_USER = process.env.GMAIL_USER || '';
+const GMAIL_APP_PASSWORD = String(process.env.GMAIL_APP_PASSWORD || '').replace(/\s+/g, '');
+let nodemailer = null;
+if (GMAIL_USER && GMAIL_APP_PASSWORD) { try { nodemailer = require('nodemailer'); } catch (e) { console.warn('⚠️  GMAIL_USER is set but the nodemailer package is missing — Gmail delivery disabled.'); } }
 
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const CODE_TTL_MS = 10 * 60 * 1000;             // 10 minutes (login 2FA codes)
@@ -104,7 +110,9 @@ function rateLimitRoute(routeKey, limit, windowMs, redirectTo) {
 const ah = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 // ============================= DATABASE SETUP =============================
-const db = new Database(path.join(process.cwd(), 'dealzoin.db'));
+// DB_PATH lets hosting (e.g. Render persistent disk mounted at /var/data) keep the SQLite
+// file across redeploys. Locally / without a disk it falls back to ./dealzoin.db as before.
+const db = new Database(process.env.DB_PATH || path.join(process.cwd(), 'dealzoin.db'));
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
@@ -2065,6 +2073,25 @@ function runOnboardingAgent(name, email, opts) {
  */
 function sendVerificationCode(email, code) {
   if (!BREVO_API_KEY) {
+    if (nodemailer) {
+      // Gmail SMTP fallback (free). Codes come "from" the configured Gmail account.
+      const transporter = nodemailer.createTransport({ service: 'gmail', auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD } });
+      transporter.sendMail({
+        from: `"Dealzoin Security" <${GMAIL_USER}>`,
+        to: email,
+        subject: 'Your Dealzoin verification code',
+        html: `<html><body style="font-family:sans-serif"><h2>Dealzoin Security</h2>
+          <p>Your login verification code is:</p>
+          <p style="font-size:28px;font-weight:bold;letter-spacing:4px">${code}</p>
+          <p>This code expires in 10 minutes. If you did not request it, ignore this email.</p>
+          </body></html>`
+      }).then(() => {
+        audit('AUTHENTICATION AGENT', '2FA code delivery', 'pass', `Gmail email sent to ${email}`);
+      }).catch((err) => {
+        audit('AUTHENTICATION AGENT', '2FA code delivery', 'fail', `Gmail send error for ${email}: ${String(err && err.message || err).slice(0, 200)}`);
+      });
+      return;
+    }
     if (process.env.ALLOW_DEMO_2FA === '1') {
       console.log(`[DEMO MODE] Verification code for ${email}: ${code}`);
       audit('AUTHENTICATION AGENT', '2FA code delivery', 'flag', `DEMO MODE — code for ${email} shown on screen (ALLOW_DEMO_2FA=1, no BREVO_API_KEY set)`);
@@ -3264,6 +3291,105 @@ function totalUnread(companyId) {
 const THEME_TOGGLE_BTN = '<button class="nav-ic theme-toggle btn-theme js-theme" id="theme-toggle" type="button" title="Toggle light/dark theme" aria-label="Toggle light/dark theme"><span class="ic">🌙</span></button>';
 
 /** Render the full HTML page shell. */
+
+// ============================= PWA — installable phone app =============================
+/* Dealzoin as an installable Progressive Web App: web app manifest + home-screen icons +
+ * a conservative service worker. The SW only caches PUBLIC, unauthenticated shell assets —
+ * private deal/account pages are NEVER cached (shared-device privacy). Navigations are
+ * network-first with a themed offline fallback, so the app shell always opens. */
+
+const PWA_ICON_192_B64 = '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';
+const PWA_ICON_512_B64 = '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';
+const PWA_ICON_APPLE_B64 = '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';
+
+const PWA_ICON_BUFFERS = {
+  'icon-192.png': Buffer.from(PWA_ICON_192_B64, 'base64'),
+  'icon-512.png': Buffer.from(PWA_ICON_512_B64, 'base64'),
+  'apple-touch-icon.png': Buffer.from(PWA_ICON_APPLE_B64, 'base64'),
+};
+
+app.get('/icons/:name', (req, res) => {
+  const buf = PWA_ICON_BUFFERS[String(req.params.name || '')];
+  if (!buf) return res.status(404).end();
+  res.setHeader('Content-Type', 'image/png');
+  res.setHeader('Content-Length', buf.length);
+  res.setHeader('Cache-Control', 'public, max-age=604800'); // 7 days — static brand assets
+  res.send(buf);
+});
+
+app.get('/manifest.webmanifest', (req, res) => {
+  res.setHeader('Content-Type', 'application/manifest+json');
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.send(JSON.stringify({
+    name: 'Dealzoin — B2B Deal Network',
+    short_name: 'Dealzoin',
+    description: 'Closed B2B deal network for verified companies.',
+    id: '/',
+    start_url: '/timeline',
+    scope: '/',
+    display: 'standalone',
+    orientation: 'portrait',
+    background_color: '#0D1321',
+    theme_color: '#0D1321',
+    icons: [
+      { src: '/icons/icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
+      { src: '/icons/icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any maskable' },
+    ],
+  }));
+});
+
+const PWA_SW_JS = `/* Dealzoin service worker — v1. Privacy-first: only public shell assets are cached. */
+var CACHE = 'dz-pwa-v1';
+var SHELL = ['/offline', '/icons/icon-192.png', '/icons/icon-512.png'];
+self.addEventListener('install', function (e) {
+  e.waitUntil(caches.open(CACHE).then(function (c) { return c.addAll(SHELL); }).then(function () { return self.skipWaiting(); }));
+});
+self.addEventListener('activate', function (e) {
+  e.waitUntil(caches.keys().then(function (keys) {
+    return Promise.all(keys.filter(function (k) { return k !== CACHE; }).map(function (k) { return caches.delete(k); }));
+  }).then(function () { return self.clients.claim(); }));
+});
+self.addEventListener('fetch', function (e) {
+  var req = e.request;
+  if (req.method !== 'GET') return;
+  var url = new URL(req.url);
+  if (url.origin !== location.origin) return;
+  if (req.mode === 'navigate') {
+    // Pages are private and dynamic: always network-first, themed offline page as fallback.
+    e.respondWith(fetch(req).catch(function () { return caches.match('/offline'); }));
+    return;
+  }
+  if (url.pathname.indexOf('/icons/') === 0) {
+    e.respondWith(caches.match(req).then(function (hit) {
+      return hit || fetch(req).then(function (res) {
+        var copy = res.clone();
+        caches.open(CACHE).then(function (c) { c.put(req, copy); });
+        return res;
+      });
+    }));
+  }
+});
+`;
+
+app.get('/sw.js', (req, res) => {
+  res.setHeader('Content-Type', 'text/javascript; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache'); // browsers must re-check the SW itself
+  res.send(PWA_SW_JS);
+});
+
+// Themed offline fallback — standalone HTML, zero DB/session dependencies (the SW caches it).
+app.get('/offline', (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache');
+  res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Offline — Dealzoin</title>
+<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0D1321;color:#F2EFE6;font-family:Georgia,serif;text-align:center}
+.card{max-width:340px;padding:32px}.coin{width:72px;height:72px;margin:0 auto 18px;border:2px solid #F58A3A;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#F58A3A;font-size:28px;font-weight:bold}
+h1{font-size:22px;margin:0 0 10px}p{color:#8B93A7;font-size:14px;line-height:1.6}a{display:inline-block;margin-top:18px;padding:10px 22px;border:1px solid #F58A3A;border-radius:10px;color:#F58A3A;text-decoration:none;font-size:14px}</style></head>
+<body><div class="card"><div class="coin">Dz</div><h1>You're offline</h1>
+<p>Dealzoin needs an internet connection — your deals, chats and documents are safe and waiting for you.</p>
+<a href="/">Try again</a></div></body></html>`);
+});
+
 function page(title, body, user, msg, err, active, headExtra, opts) {
   const unread = (user && !user.isAdmin) ? totalUnread(user.id) : 0;
   const notifUnread = (user && !user.isAdmin) ? unreadNotifications(user.id) : 0;
@@ -3290,6 +3416,7 @@ function page(title, body, user, msg, err, active, headExtra, opts) {
   const navLinks = user && user.isAdmin
     ? `${langSelectorHtml(lang)}${THEME_TOGGLE_BTN}
        <a class="navlink" href="/admin">${tt('nav.dashboard')}</a>
+       <a class="navlink" href="/admin/security">🛡️ Security</a>
        <form method="POST" action="/admin/logout" style="display:inline"><button class="btn btn-sm btn-outline">${tt('nav.logout')}</button></form>`
     : user
     ? `<span class="nav-icons">
@@ -3328,6 +3455,14 @@ function page(title, body, user, msg, err, active, headExtra, opts) {
 <script>try{if(localStorage.getItem('dz-theme')==='light'){document.documentElement.dataset.theme='light';}}catch(e){}document.documentElement.classList.add('dz-js');</script>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)} — Dealzoin</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#0D1321">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Dealzoin">
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>${CSS}</style>
@@ -3767,6 +3902,7 @@ ${termsGate ? `<noscript><div class="card" style="position:fixed;left:16px;right
     zoForm.addEventListener('submit',function(e){e.preventDefault();var v=zoInput.value;zoInput.value='';zoSend(v);});
   }
 })();</script>
+<script>if('serviceWorker' in navigator){window.addEventListener('load',function(){navigator.serviceWorker.register('/sw.js').catch(function(){});});}</script>
 </body></html>`;
 }
 
@@ -10235,7 +10371,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
 
   const body = `
   <h2 class="sec-h" style="margin-top:0;margin-bottom:14px">🛡️ Admin dashboard</h2>
-  <div class="feed-actions" style="margin:0 0 14px"><a class="btn btn-sm btn-outline" href="/admin/documents">🗄️ Document vault</a></div>
+  <div class="feed-actions" style="margin:0 0 14px"><a class="btn btn-sm btn-outline" href="/admin/documents">🗄️ Document vault</a> <a class="btn btn-sm btn-outline" href="/admin/security">🛡️ Security Center</a></div>
   ${statsHtml}
   <div class="card" data-reveal><h3>Pending companies</h3>
     <table><tr><th>Company</th><th>Registered</th><th>Actions</th></tr>${pendingHtml}</table></div>
@@ -10589,6 +10725,73 @@ app.get('/admin/documents/:id/download', requireAdmin, (req, res) => {
   res.setHeader('Cache-Control', 'private, no-store');
   res.setHeader('Content-Disposition', `attachment; filename="${String(doc.filename || 'document.pdf').replace(/[^A-Za-z0-9._-]/g, '_')}"`);
   res.send(doc.data);
+});
+
+// ----- SECURITY CENTER — security-event overview built from the agent_audit log -----
+app.get('/admin/security', requireAdmin, (req, res) => {
+  const cut24 = new Date(Date.now() - 24 * 3600e3).toISOString();
+  const cut7d = new Date(Date.now() - 7 * 24 * 3600e3).toISOString();
+  // ONE grouped query: every metric x both windows via conditional sums. The action strings
+  // come straight from the audit() call sites:
+  //   'login password check' / 'admin login' / 'admin login lockout'  -> failed logins
+  //   '2FA verify' / '2FA code delivery'                              -> 2FA failures & lockouts
+  //   'rate limit'                                                    -> rate-limit denials
+  //   '* guard' / 'document access' / 'terms gate enforcement'        -> access-control denials
+  //   'CSRF check'                                                    -> CSRF / origin blocks
+  const m = db.prepare(`SELECT
+      SUM(CASE WHEN result = 'fail' AND action LIKE '%login%' AND created_at >= ? THEN 1 ELSE 0 END) AS login24,
+      SUM(CASE WHEN result = 'fail' AND action LIKE '%login%' AND created_at >= ? THEN 1 ELSE 0 END) AS login7d,
+      SUM(CASE WHEN result = 'fail' AND action LIKE '%2fa%' AND created_at >= ? THEN 1 ELSE 0 END) AS twofa24,
+      SUM(CASE WHEN result = 'fail' AND action LIKE '%2fa%' AND created_at >= ? THEN 1 ELSE 0 END) AS twofa7d,
+      SUM(CASE WHEN result = 'fail' AND action LIKE '%rate%' AND created_at >= ? THEN 1 ELSE 0 END) AS rate24,
+      SUM(CASE WHEN result = 'fail' AND action LIKE '%rate%' AND created_at >= ? THEN 1 ELSE 0 END) AS rate7d,
+      SUM(CASE WHEN result = 'fail' AND (action LIKE '%guard%' OR action LIKE '%access%' OR action LIKE '%gate%') AND created_at >= ? THEN 1 ELSE 0 END) AS access24,
+      SUM(CASE WHEN result = 'fail' AND (action LIKE '%guard%' OR action LIKE '%access%' OR action LIKE '%gate%') AND created_at >= ? THEN 1 ELSE 0 END) AS access7d,
+      SUM(CASE WHEN result = 'fail' AND action LIKE '%csrf%' AND created_at >= ? THEN 1 ELSE 0 END) AS csrf24,
+      SUM(CASE WHEN result = 'fail' AND action LIKE '%csrf%' AND created_at >= ? THEN 1 ELSE 0 END) AS csrf7d
+    FROM agent_audit`).get(cut24, cut7d, cut24, cut7d, cut24, cut7d, cut24, cut7d, cut24, cut7d);
+
+  // Anomaly callouts: a single email or IPv4 showing up in >= 10 fail rows within 24h.
+  const hitCount = new Map();
+  const identityRe = /([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})|(\b\d{1,3}(?:\.\d{1,3}){3}\b)/gi;
+  for (const r of db.prepare(`SELECT details FROM agent_audit WHERE result = 'fail' AND created_at >= ? ORDER BY id DESC LIMIT 5000`).all(cut24)) {
+    const found = String(r.details || '').match(identityRe) || [];
+    for (const f of new Set(found.map(x => x.toLowerCase()))) hitCount.set(f, (hitCount.get(f) || 0) + 1);
+  }
+  const anomalies = [...hitCount.entries()].filter(([, n]) => n >= 10).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  const anomalyHtml = anomalies.length ? anomalies.map(([who, n]) => `
+    <div class="card" data-reveal style="border-color:var(--danger)"><h3>⚠️ Repeated failures from ${esc(who)}</h3>
+      <p class="muted" style="margin:0"><b>${esc(who)}</b> appears in ${n} failed security events in the last 24 hours — consider a targeted review (suspend the account, or block the source at the edge if it looks malicious).</p></div>`).join('') : '';
+
+  const statDefs = [
+    ['Failed logins', m.login24, m.login7d],
+    ['2FA failures & lockouts', m.twofa24, m.twofa7d],
+    ['Rate-limit denials', m.rate24, m.rate7d],
+    ['Access-control denials', m.access24, m.access7d],
+    ['CSRF / origin blocks', m.csrf24, m.csrf7d]
+  ];
+  const statsHtml = `<div class="stats">${statDefs.map(([l, a, b], i) =>
+    `<div class="stat card--cut" data-reveal style="--i:${i}" data-num="${String(i + 1).padStart(2, '0')}"><div class="num${a ? '" style="color:var(--danger)' : ' mint'}">${a || 0}</div><div class="lbl">${l} (24h) · 7d: ${b || 0}</div></div>`).join('')}</div>`;
+
+  // Notable events: the 50 most recent failures & flags, newest first.
+  const events = db.prepare(`SELECT * FROM agent_audit WHERE result IN ('fail', 'flag') ORDER BY id DESC LIMIT 50`).all();
+  const eventRows = events.length ? events.map((a, i) => `
+    <tr data-reveal style="--i:${Math.min(i, 8)}">
+      <td class="muted" style="white-space:nowrap">${esc(a.created_at.slice(0, 19).replace('T', ' '))}</td>
+      <td>${esc(a.agent)}</td><td>${esc(a.action)}</td><td>${resultBadge(a.result)}</td><td class="muted">${esc(a.details)}</td>
+    </tr>`).join('') : '<tr><td colspan="5" class="muted">No failed or flagged security events yet.</td></tr>';
+
+  const body = `
+  <h2 class="sec-h" style="margin-top:0;margin-bottom:14px">🛡️ Security Center</h2>
+  <div class="feed-actions" style="margin:0 0 14px"><a class="btn btn-sm btn-outline" href="/admin/dashboard">← Back to dashboard</a></div>
+  ${statsHtml}
+  ${anomalyHtml}
+  <div class="card" data-reveal><h3>Notable events — latest 50 failures &amp; flags</h3>
+    <p class="muted" style="margin-bottom:12px">Newest first, straight from the agent audit log. Counts above cover the last 24 hours (with 7-day totals alongside).</p>
+    <table><tr><th>Time (UTC)</th><th>Agent</th><th>Action</th><th>Result</th><th>Details</th></tr>${eventRows}</table>
+  </div>`;
+  audit('SECURITY AGENT', 'security center viewed', 'pass', 'Admin opened the Security Center');
+  res.send(page('Security Center', body, req.user, req.query.msg, req.query.err));
 });
 
 // ----- Admin reputation scale (0 = unrated, 1–5 stars) -----
@@ -11032,13 +11235,14 @@ const zoAuditThrottle = new Map(); // session/IP key -> last audit ts (max 1 age
 
 /** Tiny live counters for account-aware answers — a handful of indexed COUNTs, computed lazily. */
 function zoQuickStats(user) {
-  const s = { openDeals: 0, pendingPayments: 0, contracts: 0, unreadChats: 0, unreadNotifs: 0 };
+  const s = { openDeals: 0, pendingPayments: 0, contracts: 0, unreadChats: 0, unreadNotifs: 0, activeNegotiations: 0 };
   if (!user || user.isAdmin) return s;
   try { s.openDeals = db.prepare(`SELECT COUNT(*) AS n FROM deals WHERE company_id = ? AND COALESCE(status, 'open') = 'open'`).get(user.id).n; } catch (e) { /* keep 0 */ }
   try { s.pendingPayments = db.prepare(`SELECT COUNT(*) AS n FROM deals WHERE company_id = ? AND payment_status = 'pending_payment'`).get(user.id).n; } catch (e) { /* keep 0 */ }
   try { s.contracts = db.prepare('SELECT COUNT(*) AS n FROM contracts WHERE signer_company_id = ? OR owner_company_id = ?').get(user.id, user.id).n; } catch (e) { /* keep 0 */ }
   try { s.unreadChats = totalUnread(user.id); } catch (e) { /* keep 0 */ }
   try { s.unreadNotifs = unreadNotifications(user.id); } catch (e) { /* keep 0 */ }
+  try { s.activeNegotiations = db.prepare(`SELECT COUNT(*) AS n FROM negotiations WHERE (buyer_id = ? OR seller_id = ?) AND state NOT IN ('DONE', 'REJECTED', 'EXPIRED')`).get(user.id, user.id).n; } catch (e) { /* keep 0 */ }
   return s;
 }
 
@@ -11174,8 +11378,18 @@ const ZO_KNOWLEDGE = [
       links: [], sug: ZO_STARTERS }) },
   { id: 'help', scope: 'public',
     kw: [['help', 4], ['what can you do', 5], ['options', 3], ['topics', 3], ['assist', 3], ['guide', 2]],
-    reply: () => ({ text: 'I can explain: registration & KYC, posting buy/sell deals, the LOI → PO → signing pipeline, counter offers, commission & the payment gate, shipment tracking & incoterms, chats, private contracts, notifications, calendar & video calls, sub-accounts, reputation, themes and uploads. Just ask in plain words!',
+    reply: () => ({ text: 'I can explain: registration & KYC, posting buy/sell deals, the LOI → PO → signing pipeline, counter offers, commission & the payment gate, shipment tracking & incoterms, chats, private contracts, notifications, calendar & video calls, sub-accounts, reputation, account security, themes and uploads. Just ask in plain words!',
       links: [], sug: ZO_STARTERS }) },
+
+  // ----- Security & privacy (Security Agent answers) -----
+  { id: 'account_security', scope: 'public',
+    kw: [['is my account secure', 8], ['account security', 7], ['how secure', 6], ['security', 4], ['secure', 4], ['safety', 4], ['safe', 3], ['hack', 4], ['hacked', 5], ['hacker', 4], ['protect my account', 6], ['account protection', 6], ['is it safe', 6], ['is dealzoin safe', 7]],
+    reply: () => ({ text: "Yes — your account is guarded by the platform's Security Agent stack: passwords are stored as salted scrypt hashes (never in plain text), every sign-in needs a 6-digit email verification code with a strict attempt limit and automatic lockout, sessions are server-side and revocable, every security-relevant event is written to the admin audit log, and each deal, document and payment route enforces per-company authorization so other companies can never reach your data.",
+      links: [], sug: ['How does the verification code work?', 'Who can see my documents?', 'How do I change my password?'] }) },
+  { id: '2fa_help', scope: 'public',
+    kw: [['2fa', 7], ['verification code', 7], ['code not arriving', 8], ['didnt receive code', 8], ['code not received', 8], ['no code', 4], ['code expired', 6], ['login code', 6], ['otp code', 5], ['otp', 4], ['authenticator', 4], ['two factor', 6], ['two-factor', 6]],
+    reply: () => ({ text: "Sign-in is two-step: password first, then a 6-digit verification code emailed by the platform's own sender (\"Dealzoin Security\"). The code is valid for 10 minutes and allows 5 attempts — after 5 wrong tries it is burned and you simply sign in again for a fresh one (each new sign-in replaces the old code). Not arriving? Wait a minute, check your spam/junk folder, then sign in again to trigger a new email.",
+      links: [{ label: 'Sign in', href: '/login' }], sug: ['I have a login problem', 'Is my account secure?'] }) },
   { id: 'account_needed', scope: 'public', // logged-out visitor asks an account-specific question
     kw: [['my deals', 6], ['my payments', 6], ['my payment', 6], ['my contracts', 6], ['my messages', 6], ['my notifications', 6], ['my account', 5], ['my commission', 6], ['do i owe', 5], ['my unread', 5]],
     reply: (c) => (c.user ? null : { text: "That's account-specific — please sign in and ask me again, and I'll pull up your live numbers.",
@@ -11208,6 +11422,24 @@ const ZO_KNOWLEDGE = [
     kw: [['my contracts', 7], ['my mailbox', 6], ['contracts waiting', 5], ['pending contracts', 5]],
     reply: (c) => ({ text: `You are involved in ${c.stats.contracts} contract${c.stats.contracts === 1 ? '' : 's'} (deal-room signatures and private contracts). The mailbox shows what needs your signature or approval.`,
       links: [{ label: 'Contracts mailbox', href: '/contracts' }], sug: ['How does signing work?'] }) },
+
+  // ----- Security & privacy (account-aware) -----
+  { id: 'password_change', scope: 'user',
+    kw: [['change password', 7], ['change my password', 8], ['reset password', 6], ['forgot password', 7], ['forgot my password', 8], ['new password', 5], ['update password', 6], ['password reset', 6], ['password', 3]],
+    reply: () => ({ text: `Companies cannot change their own password in the app yet — for security, password changes are handled by the platform administrator. Email ${ADMIN_EMAIL} from your registered address with your company name; the admin will reset it for you, and the change signs out every other active session on your account.`,
+      links: [], sug: ['How do I contact the admin?', 'Is my account secure?'] }) },
+  { id: 'document_privacy', scope: 'user',
+    kw: [['who can see my documents', 8], ['documents private', 6], ['private documents', 6], ['kyc privacy', 7], ['payment proof visible', 7], ['are my files private', 7], ['files private', 6], ['privacy', 5], ['who can see', 5], ['document visibility', 6], ['see my files', 5], ['documents', 2]],
+    reply: () => ({ text: "Your sensitive files stay locked down: KYC documents (MOA, bank statements, proofs) and commission payment proofs are visible only to your own company and the platform admin — never to other member companies. Public-facing media is different: your avatar, header image, posts and deal photos/videos are visible to the other approved companies on the network.",
+      links: [{ label: 'My profile', href: '/profile' }], sug: ['Is my account secure?', 'Which KYC documents do I need?'] }) },
+  { id: 'report_suspicious', scope: 'user',
+    kw: [['report', 4], ['suspicious', 5], ['scam', 5], ['scammer', 5], ['fraud', 5], ['fake company', 6], ['report company', 6], ['report a company', 7], ['abuse', 4], ['suspicious activity', 6], ['report user', 6]],
+    reply: () => ({ text: `If something looks off — a fake company, a suspicious deal, fraud signals — email the admin at ${ADMIN_EMAIL} right away with the company name and the deal number (DZ-…) if you have one. Admins review the full audit trail (logins, documents, payments and deal actions are all agent-logged) and can suspend or remove bad actors.`,
+      links: [], sug: ['Is my account secure?', 'How do I contact the admin?'] }) },
+  { id: 'active_deals_status', scope: 'user', stats: true,
+    kw: [['active deals', 7], ['deal status', 6], ['what needs attention', 7], ['needs attention', 6], ['my negotiations', 7], ['deal pipeline', 6], ['my active', 5], ['where are my deals', 6], ['deals status', 6]],
+    reply: (c) => ({ text: `Here is your live picture: ${c.stats.openDeals} open deal${c.stats.openDeals === 1 ? '' : 's'} on the floor and ${c.stats.activeNegotiations} active negotiation${c.stats.activeNegotiations === 1 ? '' : 's'} in the pipeline (LOI → signing). ${c.stats.pendingPayments ? `${c.stats.pendingPayments} deal${c.stats.pendingPayments === 1 ? ' is' : 's are'} waiting in the commission-payment gate — clear that first to unlock tracking.` : 'Nothing is stuck in the commission-payment gate.'}${c.stats.unreadNotifs ? ` You also have ${c.stats.unreadNotifs} unread notification${c.stats.unreadNotifs === 1 ? '' : 's'} worth a look.` : ''}`,
+      links: [{ label: 'Deals inbox', href: '/deals/inbox' }, { label: 'Dashboard', href: '/dashboard' }], sug: ['What are my payments?', 'What are my notifications?'] }) },
 
   // ----- Admin-only (never answered to companies/members/visitors) -----
   { id: 'admin_approvals', scope: 'admin',
@@ -11245,11 +11477,45 @@ function zoClean(s) {
   return String(s).toLowerCase().replace(/['’]/g, '').replace(/[^a-z0-9%\s-]+/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-/** Score every in-scope intent against the message; best-first list of [score, intent]. */
+/** Edit-distance ≤1 between two short tokens: iterative 2-row Levenshtein, length-capped
+ *  at 12 chars with an early exit — only consulted for keyword/token pairs ≥5 chars. */
+function zoEditDist1(a, b) {
+  a = a.slice(0, 12); b = b.slice(0, 12);
+  const la = a.length, lb = b.length;
+  if (a === b) return true;
+  if (Math.abs(la - lb) > 1) return false;
+  let prev = []; for (let j = 0; j <= lb; j++) prev[j] = j;
+  for (let i = 1; i <= la; i++) {
+    const cur = [i];
+    let rowMin = i;
+    for (let j = 1; j <= lb; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      if (cur[j] < rowMin) rowMin = cur[j];
+    }
+    if (rowMin > 1) return false; // every cell from here on stays > 1 — bail out early
+    prev = cur;
+  }
+  return prev[lb] <= 1;
+}
+
+/** Fuzzy token match (typo tolerance): the input token starts with the keyword
+ *  (keyword ≥4 chars, e.g. "negotiating" ~ "negotiate") or sits within edit-distance 1
+ *  (keyword ≥5 chars, e.g. "pasword" ~ "password"). */
+function zoFuzzyHit(kw, tokenArr) {
+  for (const tok of tokenArr) {
+    if (tok.length >= kw.length && tok.startsWith(kw)) return true;
+    if (kw.length >= 5 && tok.length >= 4 && Math.abs(tok.length - kw.length) <= 1 && zoEditDist1(tok, kw)) return true;
+  }
+  return false;
+}
+
+/** Score every in-scope intent against the message; best-first list of [score, intent].
+ *  Typo tolerance: an unmatched single-word keyword still counts at 70% weight on a fuzzy hit. */
 function zoMatch(message, user) {
   const cleaned = zoClean(message);
   const msg = ' ' + cleaned + ' ';
-  const tokens = new Set(cleaned.split(' ').filter(Boolean));
+  const tokenArr = cleaned.split(' ').filter(Boolean);
+  const tokens = new Set(tokenArr);
   const inScope = (it) => it.scope === 'public'
     || (it.scope === 'user' && user && !user.isAdmin)
     || (it.scope === 'admin' && user && user.isAdmin);
@@ -11262,8 +11528,9 @@ function zoMatch(message, user) {
       if (!kw) continue;
       if (kw.indexOf(' ') !== -1) { if (msg.indexOf(' ' + kw + ' ') !== -1) score += w; }
       else if (tokens.has(kw)) score += w;
+      else if (kw.length >= 4 && zoFuzzyHit(kw, tokenArr)) score += w * 0.7; // fuzzy hits weigh 70%
     }
-    if (score >= ZO_MATCH_THRESHOLD) scored.push([score, it]);
+    if (score > 0) scored.push([score, it]); // sub-threshold rows feed the "did you mean" fallback
   }
   scored.sort((a, b) => b[0] - a[0]);
   return scored;
@@ -11294,7 +11561,9 @@ app.post('/assistant/ask', (req, res) => {
     return answer({ reply: "I didn't catch that — type a question and I'll do my best.", links: [], suggestions: ZO_STARTERS }, 'empty');
   }
 
-  for (const [, intent] of zoMatch(message, user)) {
+  const matches = zoMatch(message, user);
+  for (const [score, intent] of matches) {
+    if (score < ZO_MATCH_THRESHOLD) break; // below-threshold rows are fallback suggestions only
     if (intent.stats && !ctx.stats) ctx.stats = zoQuickStats(user);
     const r = intent.reply(ctx);
     if (!r) continue; // intent deferred (e.g. account question asked while logged out)
@@ -11306,11 +11575,26 @@ app.post('/assistant/ask', (req, res) => {
   }
 
   // TODO: LLM BRAIN — if process.env.OPENAI_API_KEY, forward unmatched questions to an LLM before falling back
-  const sug = (user && user.isAdmin)
-    ? ['How do I approve payments?', 'How do I set the commission?', 'How do I check documents?']
-    : user ? ZO_STARTERS : ['What is Dealzoin?', 'How do I register?', 'What is the commission?'];
+  // Smarter fallback: offer the 3 closest intents as "Did you mean" chips (even below threshold).
+  // Chip label: the intent's strongest multi-word keyword, capitalized as a question.
+  const didYouMean = [];
+  for (const [, intent] of matches) {
+    if (didYouMean.length >= 3) break;
+    const best = intent.kw.filter(([kw]) => zoClean(kw).indexOf(' ') !== -1)
+      .sort((a, b) => b[1] - a[1])[0];
+    if (!best) continue;
+    const label = zoClean(best[0]);
+    const chip = label.charAt(0).toUpperCase() + label.slice(1) + '?';
+    if (!didYouMean.includes(chip)) didYouMean.push(chip);
+  }
+  const sug = didYouMean.length ? didYouMean
+    : (user && user.isAdmin)
+      ? ['How do I approve payments?', 'How do I set the commission?', 'How do I check documents?']
+      : user ? ZO_STARTERS : ['What is Dealzoin?', 'How do I register?', 'What is the commission?'];
   return answer({
-    reply: `Hmm, I'm not sure about that one — I'm best at Dealzoin platform questions. Try one of these, or email the admin at ${ADMIN_EMAIL} for anything else.`,
+    reply: didYouMean.length
+      ? `I'm not fully sure about that one — did you mean one of these? I can help with deals, signing, payments, security, documents and more — just ask in plain words.`
+      : `Hmm, I'm not sure about that one — I'm best at Dealzoin platform questions. Try one of these, or email the admin at ${ADMIN_EMAIL} for anything else.`,
     links: [],
     suggestions: sug
   }, 'fallback');
@@ -12368,12 +12652,12 @@ function bootGuard() {
       console.error('FATAL: NODE_ENV=production but required secrets are missing or weak. Refusing to start.\n  - ' + missing.join('\n  - '));
       process.exit(1);
     }
-    if (!brevoOk) console.warn('⚠️  BREVO_API_KEY not set — verification codes will be written to the SERVER LOGS (owner-only) instead of being emailed. Set BREVO_API_KEY as soon as possible.');
+    if (!brevoOk && !nodemailer) console.warn('⚠️  No email provider set — codes go to SERVER LOGS only. Set GMAIL_USER + GMAIL_APP_PASSWORD (free) or BREVO_API_KEY.');
   } else {
     const warn = [];
     if (!sessionOk) warn.push('SESSION_SECRET is using the dev default');
     if (!adminOk) warn.push('ADMIN_PASSWORD is unset/weak (dev fallback "admin")');
-    if (!brevoOk) warn.push('BREVO_API_KEY is unset (2FA codes cannot be emailed; set ALLOW_DEMO_2FA=1 for local demos)');
+    if (!brevoOk && !nodemailer) warn.push('No email provider (2FA codes cannot be emailed; set GMAIL_USER+GMAIL_APP_PASSWORD, BREVO_API_KEY, or ALLOW_DEMO_2FA=1 for local demos)');
     if (warn.length) console.warn('⚠️  DEV MODE — insecure defaults in use, do NOT deploy like this:\n  - ' + warn.join('\n  - '));
   }
 }
@@ -12381,5 +12665,6 @@ bootGuard();
 
 app.listen(PORT, () => {
   console.log(`Dealzoin listening on http://localhost:${PORT}`);
-  console.log(`Admin login: ${ADMIN_EMAIL} (env-configured)${BREVO_API_KEY ? '' : (process.env.ALLOW_DEMO_2FA === '1' ? ' — DEMO MODE: verification codes shown on screen' : ' — WARNING: no BREVO_API_KEY, 2FA codes will not be delivered')}`);
+  const emailMode = BREVO_API_KEY ? 'Brevo' : (nodemailer ? 'Gmail' : (process.env.ALLOW_DEMO_2FA === '1' ? 'DEMO MODE — codes shown on screen' : 'SERVER LOGS only — no email provider'));
+  console.log(`Admin login: ${ADMIN_EMAIL} (env-configured) — 2FA delivery: ${emailMode}`);
 });
