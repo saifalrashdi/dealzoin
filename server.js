@@ -3271,7 +3271,8 @@ const NAV_ICONS = {
   bell: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8.5a6 6 0 0 0-12 0c0 6.5-2.5 7.5-2.5 7.5h17S18 15 18 8.5z"/><path d="M10 20a2.2 2.2 0 0 0 4 0"/></svg>',
   contracts: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7.5 9 6 9-6"/></svg>',
   calendar: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 9.5h18M8 3v4M16 3v4"/><path d="M7.5 14h3M13.5 14h3M7.5 17.5h3"/></svg>',
-  globe: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17"/><path d="M12 3.5c2.4 2.3 3.7 5.2 3.7 8.5s-1.3 6.2-3.7 8.5c-2.4-2.3-3.7-5.2-3.7-8.5s1.3-6.2 3.7-8.5z"/></svg>'
+  globe: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17"/><path d="M12 3.5c2.4 2.3 3.7 5.2 3.7 8.5s-1.3 6.2-3.7 8.5c-2.4-2.3-3.7-5.2-3.7-8.5s1.3-6.2 3.7-8.5z"/></svg>',
+  box: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 3.5 7.5v9L12 21l8.5-4.5v-9L12 3z"/><path d="M3.5 7.5 12 12l8.5-4.5M12 12v9"/></svg>'
 };
 function navIcon(key, href, label, active, badge) {
   const badgeHtml = badge > 0 ? `<span class="nav-badge" aria-label="${badge} unread">${badge > 99 ? '99+' : badge}</span>` : '';
@@ -3426,6 +3427,7 @@ function page(title, body, user, msg, err, active, headExtra, opts) {
          ${navIcon('calendar', '/calendar', tt('nav.calendar'), active)}
          ${navIcon('globe', '/tracking', tt('nav.tracking'), active)}
          ${navIcon('tenders', '/tenders', tt('nav.tenders'), active)}
+         ${navIcon('box', '/products', 'Products', active)}
          ${navIcon('bell', '/notifications', tt('nav.notifications'), active, notifUnread)}
          ${navIcon('search', '/search', tt('nav.search'), active)}
          ${navIcon('profile', '/profile', tt('nav.profile'), active)}
@@ -5650,6 +5652,7 @@ app.get('/explore', requireCompany, (req, res) => {
       <div class="kicker">Deals explorer</div>
       <h1 style="font-size:1.75rem;margin-top:4px">🧭 Open deals, ranked for you</h1>
     </div>
+    <a class="btn btn-sm btn-outline" href="/products">📦 Products</a>
     <a class="btn btn-sm btn-outline" href="/companies">🏢 Companies</a>
   </div>
   <p class="muted" style="margin-bottom:14px">Ranked by your interests — categories you follow and engage with, network traction, issuer reputation and freshness. Deal values stay private.</p>
@@ -5669,6 +5672,17 @@ app.get('/company/:id', requireCompany, (req, res) => {
   const dealsHtml = deals.length
     ? deals.map((d, idx) => feedCard(dealFeedItem(d), req.user, names, idx)).join('')
     : '<div class="card"><p class="muted">No deals yet.</p></div>';
+
+  // Storefront: this company's active product listings (Alibaba-style catalog section).
+  const prods = db.prepare(`SELECT * FROM products WHERE company_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 12`).all(id);
+  const isOwnProfile = req.user && !req.user.isAdmin && req.user.id === id;
+  const productsSection = (prods.length || isOwnProfile) ? `
+  <h2 class="sec-h">📦 Products by ${esc(c.name)}</h2>
+  ${prods.length ? productGridHtml(prods, names, req.user && !req.user.isAdmin ? req.user.id : null) : ''}
+  <div style="margin-top:10px">
+    ${isOwnProfile ? `<a class="btn btn-sm" href="/products/new">➕ Post a product</a> ` : ''}
+    <a class="btn btn-sm btn-outline" href="/products?company=${id}">View full catalog</a>
+  </div>` : '';
 
   // Research Agent intelligence card — shown only when at least one intel field is set.
   const hasIntel = !!(c.market_value || c.field || c.employees || c.trade_license);
@@ -5696,9 +5710,283 @@ app.get('/company/:id', requireCompany, (req, res) => {
   </div>
   ${intelCard}
   ${c.about ? `<div class="card"><h3>About</h3><p class="profile-about">${esc(c.about)}</p></div>` : ''}
+  ${productsSection}
   <h2 class="sec-h">Deals by ${esc(c.name)}</h2>
   ${dealsHtml}`;
   res.send(page(c.name, body, req.user, req.query.msg, req.query.err));
+});
+
+// ============================= PRODUCT CATALOG (Alibaba-style storefronts) =============================
+/* Companies can list PRODUCTS independently of deals: title, category, indicative price,
+ * minimum order quantity (MOQ), description and up to 3 photos. Products are browsable by
+ * all member companies (a company profile doubles as its storefront). Deals remain the
+ * transactional pipeline; products are the standing catalog buyers can browse and open
+ * chats from — the same separation Alibaba uses between storefront and orders. */
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS products (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  company_id  INTEGER NOT NULL,
+  title       TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  category    TEXT DEFAULT '',
+  price_text  TEXT DEFAULT '',
+  moq         TEXT DEFAULT '',
+  status      TEXT NOT NULL DEFAULT 'active',     -- active | hidden
+  created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_products_company ON products(company_id, status);
+CREATE TABLE IF NOT EXISTS product_photos (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  product_id INTEGER NOT NULL,
+  media_id   INTEGER NOT NULL,
+  position   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_product_photos_product ON product_photos(product_id);
+`);
+
+const PRODUCT_TITLE_MAX = 120;
+const PRODUCT_DESC_MAX = 4000;
+const PRODUCT_FIELD_MAX = 80;
+const PRODUCT_MAX_PHOTOS = 3;
+
+/** Multer for product photos: images only, max 3, 5 MB each (same limits as deal images). */
+const productPhotosUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: IMAGE_MAX_BYTES, files: PRODUCT_MAX_PHOTOS },
+  fileFilter: (req, file, cb) => {
+    const ext = String(file.originalname || '').split('.').pop().toLowerCase();
+    const mime = String(file.mimetype || '').toLowerCase();
+    if (MEDIA_IMAGE_EXT[ext] && mime.startsWith('image/')) return cb(null, true);
+    cb(new Error('Product photos must be image files (PNG, JPG, WebP or GIF).'));
+  }
+});
+
+/** "photos" array upload with friendly redirects + magic-byte verification per file. */
+function productPhotosMw(req, res, next) {
+  productPhotosUpload.array('photos', PRODUCT_MAX_PHOTOS)(req, res, (err) => {
+    const back = (req.get('referer') || '/products/new').split('?')[0];
+    if (err) {
+      const msg = err.code === 'LIMIT_FILE_SIZE' ? 'Each photo is limited to 5 MB.'
+        : err.code === 'LIMIT_UNEXPECTED_FILE' ? `You can attach at most ${PRODUCT_MAX_PHOTOS} photos.`
+        : (err.message || 'Invalid photo upload.');
+      return res.redirect(back + '?err=' + encodeURIComponent(msg));
+    }
+    for (const f of (req.files || [])) {
+      if (!isImageBuffer(f.buffer)) {
+        return res.redirect(back + '?err=' + encodeURIComponent('Upload rejected: a file content does not look like a real image.'));
+      }
+    }
+    next();
+  });
+}
+
+function productPhotos(productId) {
+  return db.prepare('SELECT media_id FROM product_photos WHERE product_id = ? ORDER BY position, id').all(productId)
+    .map(r => r.media_id);
+}
+
+/** Grid card for catalog browsing. Photo, title, price hint, MOQ chip, company. */
+function productCardHtml(p, names, viewerId) {
+  const photos = productPhotos(p.id);
+  const img = photos.length
+    ? `<img src="/media/${photos[0]}" alt="${esc(p.title)}" loading="lazy" style="width:100%;height:160px;object-fit:cover;border-radius:12px;border:1px solid var(--border-soft)">`
+    : `<div style="width:100%;height:160px;border-radius:12px;border:1px dashed var(--border-soft);display:flex;align-items:center;justify-content:center;color:var(--ink-faint);font-size:28px">📦</div>`;
+  const mine = viewerId && p.company_id === viewerId;
+  return `<div class="card" style="padding:12px">
+    <a href="/product/${p.id}" style="text-decoration:none;color:inherit">${img}</a>
+    <h3 style="margin:10px 0 4px;font-size:15px"><a href="/product/${p.id}">${esc(p.title)}</a>${mine ? ' <span class="hint-chip">mine</span>' : ''}</h3>
+    ${p.price_text ? `<div style="color:var(--gold);font-weight:600;font-size:14px">${esc(p.price_text)}</div>` : ''}
+    ${p.moq ? `<div style="margin-top:4px"><span class="hint-chip">MOQ: ${esc(p.moq)}</span></div>` : ''}
+    <div class="muted" style="margin-top:6px;font-size:12px"><a href="/company/${p.company_id}">${esc(names.get(p.company_id) || 'Company')}</a>${p.category ? ` · ${esc(p.category)}` : ''}</div>
+  </div>`;
+}
+
+function productGridHtml(products, names, viewerId) {
+  if (!products.length) return '';
+  return `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px">`
+    + products.map(p => productCardHtml(p, names, viewerId)).join('') + `</div>`;
+}
+
+// ----- Browse the catalog: all member products, with search + category + company filters -----
+app.get('/products', requireCompanyOrAdmin, (req, res) => {
+  const q = String(req.query.q || '').trim().slice(0, 80);
+  const cat = String(req.query.category || '').trim().slice(0, 60);
+  const companyId = parseInt(req.query.company || '', 10) || null;
+  const names = companyNameMap();
+
+  const where = [`p.status = 'active'`];
+  const args = [];
+  if (companyId) { where.push('p.company_id = ?'); args.push(companyId); }
+  if (cat) { where.push('p.category = ?'); args.push(cat); }
+  if (q) { where.push('(p.title LIKE ? OR p.description LIKE ?)'); args.push(`%${q}%`, `%${q}%`); }
+  const products = db.prepare(`SELECT p.* FROM products p WHERE ${where.join(' AND ')} ORDER BY p.created_at DESC LIMIT 200`).all(...args);
+
+  const cats = db.prepare(`SELECT DISTINCT category FROM products WHERE status = 'active' AND category != '' ORDER BY category`).all().map(r => r.category);
+  const grid = products.length ? productGridHtml(products, names, req.user && !req.user.isAdmin ? req.user.id : null)
+    : `<div class="card" style="text-align:center">
+        <h3>No products found</h3>
+        <p class="muted" style="margin:8px 0 14px">${q || cat || companyId ? 'Try widening your search — or be the first to list in this space.' : 'Be the first company to list a product on the network.'}</p>
+        <a class="btn" href="/products/new">📦 Post a product</a>
+      </div>`;
+
+  const body = `
+  <div class="feed-head" style="margin-bottom:4px">
+    <div>
+      <div class="kicker">Product catalog</div>
+      <h1 style="font-size:1.75rem;margin-top:4px">📦 Products on the network</h1>
+    </div>
+    <a class="btn" href="/products/new">➕ Post a product</a>
+  </div>
+  <p class="muted" style="margin-bottom:14px">Standing catalog listings from verified companies — with minimum order quantities. To transact, open a chat or start a deal with the seller.</p>
+  <form method="GET" action="/products" class="card" style="padding:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:end">
+    <div style="flex:2;min-width:180px"><label>Search</label><input type="text" name="q" value="${esc(q)}" placeholder="e.g. steel pipes, dates, LED panels"></div>
+    <div style="flex:1;min-width:150px"><label>Category</label><select name="category"><option value="">All</option>${optionsHtml(cats, cat)}</select></div>
+    <button class="btn" type="submit">Filter</button>
+  </form>
+  ${grid}`;
+  res.send(page('Products', body, req.user, req.query.msg, req.query.err, 'box'));
+});
+
+// ----- Post a product -----
+app.get('/products/new', requireCompany, (req, res) => {
+  const body = `
+  <div class="feed-head" style="margin-bottom:10px">
+    <div>
+      <div class="kicker">Product catalog</div>
+      <h1 style="font-size:1.75rem;margin-top:4px">📦 Post a product</h1>
+    </div>
+    <a class="btn btn-sm btn-outline" href="/products">← Catalog</a>
+  </div>
+  <div class="card">
+    <form method="POST" action="/products/new" enctype="multipart/form-data">
+      <label>Product name (required)</label>
+      <input type="text" name="title" required maxlength="${PRODUCT_TITLE_MAX}" placeholder="e.g. Grade A Medjool dates — 10 kg cartons">
+      <div class="grid2">
+        <div><label>Category</label><select name="category"><option value="">— choose —</option>${optionsHtml(COMPANY_CATEGORIES, '')}</select>${otherInputHtml('category')}</div>
+        <div><label>Minimum order quantity (MOQ)</label><input type="text" name="moq" maxlength="${PRODUCT_FIELD_MAX}" placeholder="e.g. 500 units · 1 pallet · 20ft container"></div>
+      </div>
+      <label>Indicative price (optional)</label>
+      <input type="text" name="price_text" maxlength="${PRODUCT_FIELD_MAX}" placeholder="e.g. $12–15 / kg — negotiable">
+      <label>Description</label>
+      <textarea name="description" rows="5" maxlength="${PRODUCT_DESC_MAX}" placeholder="Specifications, packaging, certifications, lead time, export experience…"></textarea>
+      <label>Photos (up to ${PRODUCT_MAX_PHOTOS} — PNG, JPG, WebP or GIF, max 5 MB each)</label>
+      <input type="file" name="photos" accept="image/png,image/jpeg,image/webp,image/gif" multiple>
+      <div class="btn-row" style="margin-top:14px"><button class="btn" type="submit">Publish product</button></div>
+      <p class="muted" style="margin-top:8px;font-size:12px">Products are visible to all verified member companies. Deals and negotiations stay separate — a product listing is your storefront, not a contract.</p>
+    </form>
+  </div>`;
+  res.send(page('Post a product', body, req.user, req.query.msg, req.query.err, 'box'));
+});
+
+app.post('/products/new', requireCompany, rateLimitRoute('product-new', 20, 60 * 60 * 1000, '/products/new'), productPhotosMw, (req, res) => {
+  const title = String(req.body.title || '').trim().slice(0, PRODUCT_TITLE_MAX);
+  const category = resolveOther(req.body.category, req.body.category_other, COMPANY_CATEGORIES);
+  const moq = String(req.body.moq || '').trim().slice(0, PRODUCT_FIELD_MAX);
+  const priceText = String(req.body.price_text || '').trim().slice(0, PRODUCT_FIELD_MAX);
+  const description = String(req.body.description || '').trim().slice(0, PRODUCT_DESC_MAX);
+  if (!title) return res.redirect('/products/new?err=' + encodeURIComponent('Give your product a name.'));
+
+  const info = db.prepare('INSERT INTO products (company_id, title, description, category, price_text, moq, status, created_at) VALUES (?,?,?,?,?,?,?,?)')
+    .run(req.user.id, title, description, category, priceText, moq, 'active', now());
+  const pid = info.lastInsertRowid;
+  (req.files || []).slice(0, PRODUCT_MAX_PHOTOS).forEach((f, i) => {
+    const mid = saveMedia(req.user.id, f);
+    db.prepare('INSERT INTO product_photos (product_id, media_id, position) VALUES (?,?,?)').run(pid, mid, i);
+  });
+  audit('CATALOG AGENT', 'product posted', 'pass', `${req.user.name} listed product #${pid} "${title.slice(0, 80)}" (${(req.files || []).length} photo(s), MOQ: ${moq || '—'})`);
+  res.redirect(`/product/${pid}?msg=` + encodeURIComponent('Product published to the catalog.'));
+});
+
+// ----- Product detail -----
+app.get('/product/:id', requireCompanyOrAdmin, (req, res) => {
+  const p = db.prepare('SELECT * FROM products WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!p || p.status !== 'active' && !(req.user.isAdmin || (req.user.id === p.company_id))) {
+    return res.redirect('/products?err=' + encodeURIComponent('Product not found.'));
+  }
+  const seller = db.prepare(`SELECT * FROM companies WHERE id = ? AND status = 'approved'`).get(p.company_id);
+  const names = companyNameMap();
+  const photos = productPhotos(p.id);
+  const gallery = photos.length
+    ? `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;margin-bottom:14px">` +
+      photos.map(mid => `<img src="/media/${mid}" alt="${esc(p.title)} photo" style="width:100%;max-height:300px;object-fit:cover;border-radius:12px;border:1px solid var(--border-soft)">`).join('') + `</div>`
+    : '';
+  const mine = req.user && !req.user.isAdmin && req.user.id === p.company_id;
+  const canManage = mine || (req.user && req.user.isAdmin);
+
+  const manageHtml = canManage ? `
+    <div class="card" style="border-color:var(--border-gold)">
+      <div class="kicker">Manage listing</div>
+      <div class="btn-row" style="margin-top:8px">
+        <form method="POST" action="/product/${p.id}/status" style="display:inline"><button class="btn btn-sm btn-outline" type="submit">${p.status === 'active' ? '🙈 Hide from catalog' : '👁️ Re-publish'}</button></form>
+        <form method="POST" action="/product/${p.id}/delete" style="display:inline" onsubmit="return confirm('Delete this product permanently?')"><button class="btn btn-sm btn-outline" type="submit">🗑️ Delete</button></form>
+      </div>
+    </div>` : '';
+
+  const chatForm = (!mine && seller) ? `
+    <form method="POST" action="/chats/private" style="display:inline">
+      <input type="hidden" name="company_id" value="${p.company_id}">
+      <button class="btn" type="submit">💬 Chat with ${esc(seller.name)}</button>
+    </form>` : '';
+
+  const body = `
+  <div class="feed-head" style="margin-bottom:10px">
+    <div>
+      <div class="kicker">Product listing${p.status === 'hidden' ? ' · hidden' : ''}</div>
+      <h1 style="font-size:1.6rem;margin-top:4px">📦 ${esc(p.title)}</h1>
+    </div>
+    <a class="btn btn-sm btn-outline" href="/products">← Catalog</a>
+  </div>
+  <div class="card">
+    ${gallery}
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+      ${p.price_text ? `<span style="color:var(--gold);font-weight:700;font-size:18px">${esc(p.price_text)}</span>` : ''}
+      ${p.moq ? `<span class="hint-chip" style="font-size:13px">Minimum order: ${esc(p.moq)}</span>` : ''}
+      ${p.category ? `<span class="hint-chip" style="font-size:13px">${esc(p.category)}</span>` : ''}
+    </div>
+    ${p.description ? `<p style="white-space:pre-wrap;line-height:1.6">${esc(p.description)}</p>` : '<p class="muted">No description provided.</p>'}
+    <p class="muted" style="margin-top:10px;font-size:12px">Listed ${esc(p.created_at.slice(0, 10))}</p>
+  </div>
+  ${seller ? `<div class="card">
+    <div class="kicker">Sold by</div>
+    <div class="feed-head"><h3 style="margin:6px 0">${avatarHtml(seller.name, seller.avatar_media_id)}${esc(seller.name)}</h3>${followButton(req.user, seller.id)}</div>
+    <p style="margin:4px 0">${starsHtml(seller.reputation)}</p>
+    <div class="btn-row" style="margin-top:10px">
+      ${chatForm}
+      <a class="btn btn-outline" href="/company/${seller.id}">🏢 View storefront</a>
+      <a class="btn btn-outline" href="/products?company=${seller.id}">📦 All their products</a>
+    </div>
+  </div>` : ''}
+  ${manageHtml}`;
+  res.send(page(p.title, body, req.user, req.query.msg, req.query.err, 'box'));
+});
+
+// ----- Manage: hide/show + delete (owner company or admin) -----
+app.post('/product/:id/status', requireCompanyOrAdmin, (req, res) => {
+  const p = db.prepare('SELECT * FROM products WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!p) return res.redirect('/products?err=' + encodeURIComponent('Product not found.'));
+  if (!req.user.isAdmin && p.company_id !== req.user.id) {
+    audit('CATALOG AGENT', 'product status guard', 'fail', `${req.user.name} tried to change product #${p.id} owned by company #${p.company_id}`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Not your product</h2><p class="muted">Only the listing company can change a product.</p></div>', req.user));
+  }
+  const next = p.status === 'active' ? 'hidden' : 'active';
+  db.prepare('UPDATE products SET status = ? WHERE id = ?').run(next, p.id);
+  audit('CATALOG AGENT', 'product status', 'pass', `Product #${p.id} "${p.title.slice(0, 60)}" ${next} by ${req.user.name}`);
+  res.redirect(`/product/${p.id}?msg=` + encodeURIComponent(next === 'hidden' ? 'Product hidden from the catalog.' : 'Product is live again.'));
+});
+
+app.post('/product/:id/delete', requireCompanyOrAdmin, (req, res) => {
+  const p = db.prepare('SELECT * FROM products WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!p) return res.redirect('/products?err=' + encodeURIComponent('Product not found.'));
+  if (!req.user.isAdmin && p.company_id !== req.user.id) {
+    audit('CATALOG AGENT', 'product delete guard', 'fail', `${req.user.name} tried to delete product #${p.id} owned by company #${p.company_id}`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Not your product</h2><p class="muted">Only the listing company can delete a product.</p></div>', req.user));
+  }
+  for (const mid of productPhotos(p.id)) { try { db.prepare('DELETE FROM media WHERE id = ?').run(mid); } catch (e) { /* best-effort */ } }
+  db.prepare('DELETE FROM product_photos WHERE product_id = ?').run(p.id);
+  db.prepare('DELETE FROM products WHERE id = ?').run(p.id);
+  audit('CATALOG AGENT', 'product deleted', 'pass', `Product #${p.id} "${p.title.slice(0, 60)}" deleted by ${req.user.name}`);
+  res.redirect('/products?msg=' + encodeURIComponent('Product deleted.'));
 });
 
 // ============================= CONTRACT ROUTES =============================
@@ -11276,6 +11564,14 @@ const ZO_KNOWLEDGE = [
     kw: [['post a deal', 6], ['create a deal', 6], ['new deal', 4], ['post deal', 5], ['sell', 2], ['buy', 2], ['listing', 2], ['publish', 3], ['how do i post', 5], ['buy vs sell', 5]],
     reply: () => ({ text: 'Open the create page (the + in the nav). Choose the deal type: SELL if you offer goods (a product-proof PDF is required) or BUY if you are looking to purchase. Fill in title, description, value & currency, category, origin/destination and the incoterm, attach a photo or video if you like, and publish — your deal gets its official number instantly.',
       links: [{ label: 'Create a deal', href: '/deals/new' }], sug: ['What are deal numbers?', 'What are incoterms?'] }) },
+  { id: 'products_catalog', scope: 'public',
+    kw: [['product', 3], ['products', 4], ['catalog', 5], ['catalogue', 5], ['moq', 6], ['minimum order', 6], ['storefront', 5], ['my products', 5], ['post product', 5], ['post a product', 6], ['list product', 5], ['list my products', 6], ['sell products', 4], ['alibaba', 3]],
+    reply: () => ({ text: 'The Product Catalog lets companies list products independently of deals — like a storefront. Add a product with photos, a minimum order quantity (MOQ) and an indicative price; buyers browse the catalog, open your profile storefront, and can start a chat or a deal from any listing. Deals remain the transactional pipeline (LOI → signing); products are your standing shelf.',
+      links: [{ label: 'Browse products', href: '/products' }, { label: 'Post a product', href: '/products/new' }], sug: ['How do I post a deal?', 'What is MOQ?'] }) },
+  { id: 'moq_explain', scope: 'public',
+    kw: [['what is moq', 7], ['moq mean', 6], ['minimum order quantity', 7], ['what does moq', 7]],
+    reply: () => ({ text: 'MOQ stands for Minimum Order Quantity — the smallest amount a seller will accept for an order (e.g. "500 units" or "1 × 20ft container"). It is standard in B2B trade: sellers set it so production and shipping stay economical. On Dealzoin you set the MOQ on each product listing, and it shows as a chip buyers see before they contact you.',
+      links: [{ label: 'Post a product', href: '/products/new' }], sug: ['How do I post a product?', 'How do I post a deal?'] }) },
   { id: 'deal_numbers', scope: 'public',
     kw: [['deal number', 6], ['deal numbers', 6], ['numbering', 3], ['reference number', 3], ['dz', 2]],
     reply: () => ({ text: 'Every deal receives an official number the moment it is published: DZ-<year>-<sequence>, e.g. DZ-2025-0042. Use it in contracts, chats and support requests — it uniquely identifies the deal across the platform.',
