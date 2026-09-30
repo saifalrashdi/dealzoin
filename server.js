@@ -78,6 +78,28 @@ app.use((req, res, next) => {
   next();
 });
 
+// ----- License expiry gate: a company whose trade license has expired is locked out of the
+// whole platform until it renews. Only the renewal page (+ logout/public assets) stays reachable.
+// Empty/unknown expiry NEVER blocks. Admins and persons are exempt. -----
+const LICENSE_GATE_OPEN = new Set(['/license-expired', '/license-renew', '/logout', '/lang', '/login', '/verify-login',
+  '/manifest.webmanifest', '/sw.js', '/offline', '/favicon.ico', '/review-request']);
+const licenseGateAuditThrottle = new Map(); // company id -> last audit ts (max 1 audit row per minute)
+app.use((req, res, next) => {
+  const user = currentUser(req);
+  if (!user || user.isAdmin || user.isPerson) return next();
+  const exp = String(user.licenseExpiry || '');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(exp)) return next();      // no expiry on record — allow
+  if (exp >= now().slice(0, 10)) return next();             // license still valid
+  if (LICENSE_GATE_OPEN.has(req.path)
+      || req.path.startsWith('/icons/') || req.path.startsWith('/legal/') || req.path.startsWith('/signup')) return next();
+  const lastAudit = licenseGateAuditThrottle.get(user.id) || 0;
+  if (Date.now() - lastAudit > 60000) {
+    licenseGateAuditThrottle.set(user.id, Date.now());
+    audit('ONBOARDING AGENT', 'license gate', 'fail', `Blocked ${req.method} ${req.path} for "${user.name}" — license expired ${exp}`);
+  }
+  return res.redirect('/license-expired');
+});
+
 // ----- In-memory sliding-window rate limiting (single Render instance; no new deps) -----
 const rateBuckets = new Map(); // key -> array of hit timestamps (ms)
 /** Record a hit for key; return true when the key is OVER the limit for the window. */
@@ -115,6 +137,11 @@ const ah = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(n
 const db = new Database(process.env.DB_PATH || path.join(process.cwd(), 'dealzoin.db'));
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
+// Performance: NORMAL sync is the recommended pairing with WAL (still crash-safe, just not
+// power-loss-safe on the last commit); temp tables/sorts stay in memory; ~20MB page cache.
+db.pragma('synchronous = NORMAL');
+db.pragma('temp_store = MEMORY');
+db.pragma('cache_size = -20000');
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS companies (
@@ -271,6 +298,24 @@ CREATE TABLE IF NOT EXISTS notifications (
 );
 `);
 
+// Hot-path indexes (verified against live query patterns; IF NOT EXISTS = idempotent).
+// conversation_members: unread-badge join + /chats roster filter by company_id.
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_conv_members_company ON conversation_members(company_id)'); } catch (e) { /* index may already exist */ }
+// notifications: unread badge + /notifications list.
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_notifications_company ON notifications(company_id, is_read)'); } catch (e) { /* index may already exist */ }
+// likes/comments: per-card social counts + explorer ranking (likes' UNIQUE index only covers company-first lookups).
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_likes_target ON likes(target_type, target_id)'); } catch (e) { /* index may already exist */ }
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_comments_target ON comments(target_type, target_id, created_at)'); } catch (e) { /* index may already exist */ }
+// follows: follower-first lookups are already covered by UNIQUE(follower_id, followed_id); add the reverse side.
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_follows_followed ON follows(followed_id)'); } catch (e) { /* index may already exist */ }
+// sessions: hourly expiry sweep + per-request expiry checks.
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)'); } catch (e) { /* index may already exist */ }
+// agent_audit: Security Center filters/aggregates by result + created_at window.
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_agent_audit_created ON agent_audit(created_at)'); } catch (e) { /* index may already exist */ }
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_agent_audit_result_created ON agent_audit(result, created_at)'); } catch (e) { /* index may already exist */ }
+// verification_codes: every 2FA/signing verify looks up by token.
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_verification_codes_token ON verification_codes(token)'); } catch (e) { /* index may already exist */ }
+
 // Migration: messages.sender_company_id must allow NULL (management posts in dispute chats).
 try {
   const msgCols = db.prepare('PRAGMA table_info(messages)').all();
@@ -291,6 +336,9 @@ try {
     COMMIT;`);
   }
 } catch (e) { /* non-fatal */ }
+// messages: per-conversation history + last-message lookups (/chat/:id, /chats, totalUnread).
+// Created after the rebuild migration above so a legacy rebuild can't drop it.
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, created_at)'); } catch (e) { /* index may already exist */ }
 
 // Graceful upgrades for databases created before media support existed.
 try { db.exec('ALTER TABLE deals ADD COLUMN media_id INTEGER'); } catch (e) { /* column already exists */ }
@@ -316,6 +364,8 @@ try { db.exec("ALTER TABLE verification_codes ADD COLUMN payload TEXT DEFAULT ''
 try { db.exec('ALTER TABLE verification_codes ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0'); } catch (e) { /* column already exists */ }
 // v5 upgrades (Trust & KYC): compliance-grade registration fields on companies.
 try { db.exec("ALTER TABLE companies ADD COLUMN category TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+// Shipping tenders: Logistics companies declare how they ship (sea/air/land/multimodal) at registration.
+try { db.exec("ALTER TABLE companies ADD COLUMN shipping_type TEXT NOT NULL DEFAULT ''"); } catch (e) { /* column already exists */ }
 try { db.exec("ALTER TABLE companies ADD COLUMN activity TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
 try { db.exec("ALTER TABLE companies ADD COLUMN trade_license TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
 try { db.exec('ALTER TABLE companies ADD COLUMN signature_name TEXT'); } catch (e) { /* column already exists */ }
@@ -330,6 +380,9 @@ try { db.exec("ALTER TABLE deals ADD COLUMN incoterm TEXT DEFAULT 'CIF'"); } cat
 try { db.exec("ALTER TABLE deals ADD COLUMN product_proof TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
 try { db.exec('ALTER TABLE deals ADD COLUMN product_proof_doc_id INTEGER'); } catch (e) { /* column already exists */ }
 try { db.exec("ALTER TABLE deals ADD COLUMN status TEXT DEFAULT 'open'"); } catch (e) { /* column already exists */ }
+// deals: explorer's open-deals scan + per-company open-deal counters (after the status column exists).
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_deals_status ON deals(status)'); } catch (e) { /* index may already exist */ }
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_deals_company_status ON deals(company_id, status)'); } catch (e) { /* index may already exist */ }
 try { db.exec("ALTER TABLE deals ADD COLUMN status_note TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
 try { db.exec("ALTER TABLE deals ADD COLUMN tracking_number TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
 try { db.exec("ALTER TABLE deals ADD COLUMN tracking_url TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
@@ -452,6 +505,8 @@ CREATE TABLE IF NOT EXISTS event_participants (
 `);
 // Stage C graceful column upgrades (old databases keep booting).
 try { db.exec('ALTER TABLE sessions ADD COLUMN member_id INTEGER'); } catch (e) { /* column already exists */ }
+// Person accounts (individual buyers): a session belongs to either a company (+optional member) OR a person.
+try { db.exec('ALTER TABLE sessions ADD COLUMN person_id INTEGER'); } catch (e) { /* column already exists */ }
 try { db.exec('ALTER TABLE posts ADD COLUMN author_name TEXT'); } catch (e) { /* column already exists */ }
 try { db.exec('ALTER TABLE deals ADD COLUMN author_name TEXT'); } catch (e) { /* column already exists */ }
 try { db.exec('ALTER TABLE messages ADD COLUMN author_name TEXT'); } catch (e) { /* column already exists */ }
@@ -549,6 +604,9 @@ try { db.exec("ALTER TABLE companies ADD COLUMN bank_holder TEXT DEFAULT ''"); }
 try { db.exec("ALTER TABLE companies ADD COLUMN bank_kyc_status TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
 try { db.exec("ALTER TABLE companies ADD COLUMN bank_kyc_notes TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
 try { db.exec("ALTER TABLE companies ADD COLUMN bank_kyc_at TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+// License expiry detector: ISO date (YYYY-MM-DD) mined from the company's trade-license PDF at
+// signup (or set by admin / renewed by the company). Empty = unknown — never blocks access.
+try { db.exec("ALTER TABLE companies ADD COLUMN license_expiry TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
 // (6) Promotional posts published by the ADVERTISING AGENT get a subtle marker.
 try { db.exec('ALTER TABLE posts ADD COLUMN is_promo INTEGER DEFAULT 0'); } catch (e) { /* column already exists */ }
 
@@ -891,12 +949,12 @@ function paymentProofHtml(r, user) {
   if (!r) return '';
   let out = '';
   if (r.proof_media_id) {
-    out += (user.isAdmin || user.id === r.company_id)
+    out += (user.isAdmin || (!user.isPerson && user.id === r.company_id))
       ? `<br>📄 Proof: <a href="/payments/${r.id}/proof"><b>${esc(r.proof_filename || 'receipt.pdf')}</b></a>`
       : `<br>📄 <span class="muted">Payment proof on file (${esc(r.proof_filename || 'receipt.pdf')})</span>`;
   }
   // Upload / re-upload replaces — only the paying party, and only while the row awaits admin review.
-  if (!user.isAdmin && user.id === r.company_id && r.status === 'pending') {
+  if (!user.isAdmin && !user.isPerson && user.id === r.company_id && r.status === 'pending') {
     out += `<form method="POST" action="/payments/${r.id}/proof" enctype="multipart/form-data" style="margin-top:6px">
       <label class="file-btn file-btn-sm"><span class="file-btn-text" data-default="📎 ${r.proof_media_id ? 'Replace payment proof (PDF)' : 'Upload payment proof (PDF)'}">📎 ${r.proof_media_id ? 'Replace payment proof (PDF)' : 'Upload payment proof (PDF)'}</span>
         <input type="file" class="file-input" name="proof" accept="application/pdf,.pdf" required></label>
@@ -1163,7 +1221,7 @@ function receivingAgentCardHtml(deal, user, isOwner, isBuyer) {
     </form>` : '';
 
   // Receiving-side update form — the nominating party (or admin) logs port/customs updates.
-  const canLog = agent && (user.isAdmin || (agent.nominated_by && user.id === agent.nominated_by));
+  const canLog = agent && (user.isAdmin || (!user.isPerson && agent.nominated_by && user.id === agent.nominated_by));
   const updateForm = canLog ? `
     <hr class="sep">
     <h4 style="margin-bottom:8px">📮 Log a receiving-side update</h4>
@@ -1186,7 +1244,7 @@ function receivingAgentCardHtml(deal, user, isOwner, isBuyer) {
 /** Gold commission-payment card for a finalized private contract (parties + admin; 50 / 50 split). */
 function pcPaymentCardHtml(pc, user) {
   if (!pc || pc.status !== 'approved' || !(Number(pc.value) > 0)) return '';
-  if (!user || !(user.isAdmin || user.id === pc.sender_company_id || user.id === pc.recipient_company_id)) return '';
+  if (!user || user.isPerson || !(user.isAdmin || user.id === pc.sender_company_id || user.id === pc.recipient_company_id)) return '';
   const pcb = pcPaymentBreakdown(pc);
   const names = companyNameMap();
   const rows = db.prepare('SELECT * FROM commission_payments WHERE private_contract_id = ? ORDER BY id DESC LIMIT 50').all(pc.id);
@@ -1512,32 +1570,271 @@ function authenticityBadge(status, notes) {
   return '<span class="badge badge-pass">✓ verified</span>';
 }
 
+// ----- KYC field extraction from company-profile / trade-license PDFs -----
+// Users are largely UAE/GCC companies: trade licenses and commercial registration PDFs,
+// often bilingual Arabic/English with scanned-layout spacing. Extraction therefore runs
+// on normalized text with label synonyms in both languages.
+
+/** Escape a literal string for use inside a RegExp. */
+function escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
 /**
- * Heuristic guesses from a company-profile PDF text (step-1 auto-fill).
- * Never throws — always returns a (possibly empty) guess object.
+ * Normalize raw PDF text for KYC extraction: Arabic-Indic digits → ASCII (٠-٩ → 0-9),
+ * Arabic punctuation → ASCII equivalents, bidi control marks stripped, horizontal
+ * whitespace collapsed, and "Label : value" pairs split across line breaks re-joined.
+ */
+function normalizeKycText(text) {
+  let t = String(text || '');
+  t = t.replace(/[٠-٩۰-۹]/g, (ch) => {
+    const c = ch.charCodeAt(0);
+    return String(c <= 0x0669 ? c - 0x0660 : c - 0x06F0);
+  });
+  t = t.replace(/،/g, ',').replace(/؛/g, ';').replace(/؟/g, '?');
+  t = t.replace(/[\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, ''); // bidi/format control marks
+  t = t.replace(/[\u00A0\u2007\u202F]/g, ' ');
+  const lines = t.split(/\r?\n/).map(l => l.replace(/[ \t]{2,}/g, ' ').trim()).filter(Boolean);
+  const merged = [];
+  for (const line of lines) {
+    const prev = merged[merged.length - 1];
+    if (prev !== undefined && /[:：]\s*$/.test(prev)) merged[merged.length - 1] = prev + ' ' + line;
+    else if (prev !== undefined && /^[:：]/.test(line)) merged[merged.length - 1] = prev + ' ' + line.replace(/^[:：]\s*/, '');
+    else merged.push(line);
+  }
+  return merged.join('\n');
+}
+
+/** Label synonyms per KYC field (English + Arabic, matched case-insensitively). */
+const KYC_FIELD_LABELS = {
+  name: ['Trade Name', 'Company Name', 'Business Name', 'Legal Name', 'اسم الشركة', 'الاسم التجاري'],
+  license_number: ['Trade License Number', 'Commercial License Number', 'License Number', 'Licence Number', 'License No', 'Licence No', 'Trade License', 'Commercial License', 'رقم الرخصة التجارية', 'رقم الرخصة', 'الرخصة التجارية'],
+  commercial_register: ['Commercial Registration', 'Commercial Register', 'Registration No', 'Reg. No', 'CR No', 'رقم السجل التجاري', 'السجل التجاري'],
+  trn: ['Tax Registration Number', 'VAT Registration Number', 'TRN', 'الرقم الضريبي'],
+  legal_form: ['Legal Type', 'Legal Form', 'Company Type', 'Legal Status', 'الشكل القانوني', 'الصفة القانونية'],
+  issue_date: ['Date of Issue', 'Issue Date', 'Issued On', 'تاريخ الإصدار'],
+  expiry_date: ['Date of Expiry', 'Expiry Date', 'Expiration Date', 'Valid Until', 'تاريخ الانتهاء'],
+  address: ['Registered Address', 'Address', 'P.O. Box', 'PO Box', 'صندوق البريد', 'العنوان'],
+  activity: ['Business Activities', 'Economic Activities', 'Licensed Activities', 'Activities', 'Activity', 'الأنشطة التجارية', 'الأنشطة', 'النشاط'],
+};
+
+/** Per-field compiled label regexes (ASCII labels get alphanumeric boundaries); plus a
+ *  combined "next label" regex used to cut a value where the next labeled field begins. */
+const KYC_LABEL_RE = {};
+const KYC_NEXT_LABEL_RE = (() => {
+  const all = [];
+  for (const [key, labels] of Object.entries(KYC_FIELD_LABELS)) {
+    const parts = labels.slice().sort((a, b) => b.length - a.length)
+      .map(l => (/^[\x00-\x7F]+$/.test(l) ? `(?<![a-z0-9])${escRe(l)}(?![a-z0-9])` : escRe(l)));
+    KYC_LABEL_RE[key] = new RegExp(parts.join('|'), 'i');
+    all.push(...parts);
+  }
+  return new RegExp(`(?:${all.join('|')})[\\s]*[:：\\-–—]`, 'i');
+})();
+
+/** Known UAE legal forms, most specific first. */
+const KYC_LEGAL_FORMS = [
+  [/\bF\.?Z\.?\s?-?\s?L\.?L\.?C\.?\b|free zone limited liability/i, 'FZ-LLC'],
+  [/\bF\.?Z\.?\s?-?\s?C\.?O\.?\b/i, 'FZCO'],
+  [/\bF\.?Z\.?E\.?\b|free zone establishment/i, 'FZE'],
+  [/\bP\.?J\.?S\.?C\.?\b|public joint stock/i, 'PJSC'],
+  [/private joint stock|\bPr\.?J\.?S\.?C\.?\b/i, 'PrJSC'],
+  [/\bL\.?L\.?C\.?\b|limited liability|مسؤولية محدودة/, 'LLC'],
+  [/sole establishment|sole proprietor|مؤسسة فردية/, 'Sole Establishment'],
+  [/مساهمة عامة/, 'PJSC'],
+  [/مساهمة خاصة/, 'PrJSC'],
+  [/\bbranch\b/i, 'Branch'],
+  [/\bpartnership\b/i, 'Partnership'],
+  [/\bestablishment\b/i, 'Establishment'],
+];
+
+/** Map free text to a known legal form; null when unrecognized. */
+function mapKycLegalForm(s) {
+  const t = String(s || '');
+  for (const [re, name] of KYC_LEGAL_FORMS) if (re.test(t)) return name;
+  return null;
+}
+
+const UAE_EMIRATES = ['Abu Dhabi', 'Dubai', 'Sharjah', 'Ajman', 'Ras Al Khaimah', 'Umm Al Quwain', 'Fujairah'];
+
+const KYC_MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, sept: 9, oct: 10, nov: 11, dec: 12 };
+
+/** Parse DD/MM/YYYY, DD-MMM-YYYY, YYYY-MM-DD (and .-separated) into ISO yyyy-mm-dd; null when not a date. */
+function parseKycDate(s) {
+  const str = String(s || '');
+  let m = str.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
+  if (m && +m[2] >= 1 && +m[2] <= 12 && +m[3] >= 1 && +m[3] <= 31) return `${m[1]}-${m[2]}-${m[3]}`;
+  m = str.match(/\b(\d{1,2})(?:st|nd|rd|th)?[\s\-\/]+([A-Za-z]{3,9})[\s\-\/,]+(\d{2,4})\b/);
+  if (m) {
+    const mo = KYC_MONTHS[m[2].toLowerCase().slice(0, 4)] || KYC_MONTHS[m[2].toLowerCase().slice(0, 3)];
+    const d = +m[1], y = m[3].length === 2 ? 2000 + +m[3] : +m[3];
+    if (mo && d >= 1 && d <= 31 && y >= 1950 && y <= 2100) return `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+  }
+  m = str.match(/\b(\d{1,2})[\s\/\-.](\d{1,2})[\s\/\-.](\d{2,4})\b/);
+  if (m) {
+    const d = +m[1], mo = +m[2], y = m[3].length === 2 ? 2000 + +m[3] : +m[3];
+    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31 && y >= 1950 && y <= 2100) return `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+  }
+  return null;
+}
+
+/**
+ * Find the value following a labeled field: text after the label up to end-of-line,
+ * or up to the next known label when that label is itself followed by a separator.
+ * Every label occurrence is tried — an early occurrence used as a bare section header
+ * (e.g. a "Commercial License" title line) yields no value and the search moves on.
+ */
+function kycFindValue(t, labelRe, maxLen) {
+  const re = new RegExp(labelRe.source, labelRe.flags.includes('i') ? 'gi' : 'g');
+  let m;
+  while ((m = re.exec(t))) {
+    let v = t.slice(m.index + m[0].length);
+    const nl = v.indexOf('\n');
+    if (nl !== -1) v = v.slice(0, nl);
+    v = v.replace(/^[\s:：\-–—.,;]+/, '');
+    v = v.replace(/^(?:no|number)\b\.?/i, '').replace(/^[\s:：\-–—.,;]+/, ''); // "Trade License No : …" matched at "Trade License"
+    const next = v.match(KYC_NEXT_LABEL_RE);
+    if (next) v = v.slice(0, next.index);
+    v = v.replace(/[\s:：\-–—,;]+$/, '').trim();
+    if (v && v.length >= 2) return v.slice(0, maxLen || 160);
+  }
+  return null;
+}
+
+/**
+ * KYC-aware extractor for company-profile / trade-license PDF text (step-1 auto-fill).
+ * Never throws — always returns a (possibly empty) guess object:
+ *   { name, website, email, activity, employees, phone,
+ *     fields: { <key>: { value, confidence: 'high'|'medium'|'low' } },
+ *     license: { number, expiry, expired, trn, legal_form },
+ *     warnings: [string] }
+ * Confidence: high = labeled match with valid shape, medium = labeled but unusual shape
+ * (or strong labeled-ish pattern), low = unlabeled heuristic.
  */
 function guessesFromProfileText(text) {
-  const g = { name: '', website: '', email: '', activity: '', employees: '' };
+  const g = { name: '', website: '', email: '', activity: '', employees: '', phone: '',
+              fields: {}, license: { number: null, expiry: null, expired: false, trn: null, legal_form: null }, warnings: [] };
   try {
-    const t = String(text || '');
-    const lines = t.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-    // Company name: first prominent line (short-ish, mostly letters, not a URL/email/boilerplate).
-    for (const line of lines.slice(0, 15)) {
-      if (line.length < 3 || line.length > 80) continue;
-      if (/https?:|www\.|@|\d{3,}|page\s+\d|confidential/i.test(line)) continue;
-      if (!/[a-zA-Z]/.test(line)) continue;
-      g.name = line;
+    const t = normalizeKycText(text);
+    const setField = (key, value, confidence) => {
+      const v = String(value || '').trim();
+      if (v && !g.fields[key]) g.fields[key] = { value: v.slice(0, 300), confidence };
+    };
+
+    // --- Company / trade name ---
+    const nameV = kycFindValue(t, KYC_LABEL_RE.name, 120);
+    if (nameV) {
+      setField('name', nameV, 'high');
+    } else {
+      // Fallback: first prominent line (short-ish, mostly letters, not a URL/email/boilerplate).
+      for (const line of t.split('\n').slice(0, 15)) {
+        if (line.length < 3 || line.length > 80) continue;
+        if (/https?:|www\.|@|\d{3,}|page\s+\d|confidential|licen[cs]e|رخصة/i.test(line)) continue;
+        if (!/[a-zA-Zء-غف-ي]/.test(line)) continue;
+        setField('name', line, 'low');
+        break;
+      }
+    }
+    if (g.fields.name) g.name = g.fields.name.value;
+
+    // --- License number (labeled, else bare pattern like LIC-123456 / CN-1234567) ---
+    const licV = kycFindValue(t, KYC_LABEL_RE.license_number, 60);
+    if (licV && !/^(n\/a|none|-|no)$/i.test(licV)) {
+      const digits = (licV.match(/\d/g) || []).length;
+      const shapeOk = digits >= 4 && /^(?=.*\d)[A-Za-z0-9][A-Za-z0-9\s\-\/\\.]{2,38}$/.test(licV);
+      setField('license_number', licV, shapeOk ? 'high' : 'medium');
+    }
+    if (!g.fields.license_number) {
+      const bare = t.match(/\b(?:LIC|CN|TL|DED)[-\/\s]?\d{4,}\b/i);
+      if (bare) setField('license_number', bare[0].replace(/\s+/g, ''), 'low');
+    }
+    if (g.fields.license_number) g.license.number = g.fields.license_number.value;
+    else g.warnings.push('No license number found — is this a trade license PDF?');
+
+    // --- Commercial register (CR) ---
+    const crV = kycFindValue(t, KYC_LABEL_RE.commercial_register, 60);
+    if (crV) setField('commercial_register', crV, /\d{3,}/.test(crV) ? 'high' : 'medium');
+
+    // --- TRN (UAE VAT registration — 15 digits; malformed values are flagged) ---
+    const trnV = kycFindValue(t, KYC_LABEL_RE.trn, 40);
+    if (trnV) {
+      const digits = trnV.replace(/\D/g, '');
+      if (digits.length === 15) setField('trn', digits, 'high');
+      else { setField('trn', trnV, 'medium'); g.warnings.push('TRN malformed — 15 digits expected'); }
+    } else {
+      const bare = t.match(/\b\d{15}\b/);
+      if (bare) setField('trn', bare[0], 'low');
+    }
+    if (g.fields.trn) g.license.trn = g.fields.trn.value;
+
+    // --- Legal form (mapped to known UAE forms when recognized) ---
+    const lfV = kycFindValue(t, KYC_LABEL_RE.legal_form, 80);
+    if (lfV) {
+      const mapped = mapKycLegalForm(lfV);
+      setField('legal_form', mapped || lfV, mapped ? 'high' : 'medium');
+    } else {
+      const mapped = mapKycLegalForm(t);
+      if (mapped) setField('legal_form', mapped, 'low');
+    }
+    if (g.fields.legal_form) g.license.legal_form = g.fields.legal_form.value;
+
+    // --- Issue / expiry dates (an expired license is flagged) ---
+    const issV = kycFindValue(t, KYC_LABEL_RE.issue_date, 40);
+    if (issV) { const iso = parseKycDate(issV); setField('issue_date', iso || issV, iso ? 'high' : 'medium'); }
+    const expV = kycFindValue(t, KYC_LABEL_RE.expiry_date, 40);
+    if (expV) {
+      const iso = parseKycDate(expV);
+      setField('expiry_date', iso || expV, iso ? 'high' : 'medium');
+      if (iso) {
+        g.license.expiry = iso;
+        if (iso < new Date().toISOString().slice(0, 10)) {
+          g.license.expired = true;
+          g.warnings.push(`License appears EXPIRED (expiry ${iso})`);
+        }
+      }
+    }
+
+    // --- Address pieces + Emirate detection ---
+    const addrV = kycFindValue(t, KYC_LABEL_RE.address, 160);
+    if (addrV && !/^\S+@\S+$/.test(addrV)) setField('address', addrV, 'medium');
+    for (const emirate of UAE_EMIRATES) {
+      if (new RegExp(`\\b${escRe(emirate)}\\b`, 'i').test(t)) { setField('emirate', emirate, 'medium'); break; }
+    }
+
+    // --- Contact details (regex anywhere in the text) ---
+    const wm = t.match(/https?:\/\/[^\s<>"')\]]+/i) || t.match(/\bwww\.[^\s<>"')\]]+/i);
+    if (wm) {
+      g.website = wm[0].replace(/[.,;:]+$/, '');
+      if (!/^https?:\/\//i.test(g.website)) g.website = 'https://' + g.website;
+      setField('website', g.website, 'high');
+    }
+    const em = t.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/);
+    if (em) { g.email = em[0].toLowerCase(); setField('email', g.email, 'high'); }
+    const phoneCandidates = t.match(/(?<!\d)\+?\d[\d\s().\-]{6,17}\d(?!\d)/g) || [];
+    for (const cand of phoneCandidates) {
+      const digits = cand.replace(/\D/g, '');
+      if (digits.length < 7 || digits.length > 15) continue;
+      if (g.fields.trn && digits === g.fields.trn.value.replace(/\D/g, '')) continue;
+      if (parseKycDate(cand)) continue; // looks like a date, not a phone number
+      g.phone = cand.trim().replace(/\s+/g, ' ');
+      setField('phone', g.phone, /^\+/.test(cand.trim()) ? 'medium' : 'low');
       break;
     }
-    const wm = t.match(/https?:\/\/[^\s<>"')\]]+/i);
-    if (wm) g.website = wm[0].replace(/[.,;:]+$/, '');
-    const em = t.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/);
-    if (em) g.email = em[0].toLowerCase();
-    for (const line of lines) {
-      if (/industry|field|sector|specializ/i.test(line) && line.length >= 8 && line.length <= 300) { g.activity = line; break; }
+
+    // --- Business activities (labeled capture up to 200 chars, else sector-line heuristic) ---
+    const actV = kycFindValue(t, KYC_LABEL_RE.activity, 200);
+    if (actV) {
+      setField('activity', actV, 'high');
+    } else {
+      for (const line of t.split('\n')) {
+        if (/industry|field|sector|specializ/i.test(line) && line.length >= 8 && line.length <= 300) { setField('activity', line, 'low'); break; }
+      }
     }
+    if (g.fields.activity) g.activity = g.fields.activity.value.slice(0, 300);
+
+    // --- Employee count hint (kept from the original heuristic) ---
     const empl = t.match(/([~≈]?[\d][\d,. ]{0,12})\s*(?:\+\s*)?employees/i) || t.match(/employees[:\s]+([~≈]?[\d][\d,.]{0,12})/i);
     if (empl) g.employees = ('~' + empl[1].trim().replace(/\s+/g, '').replace(/^~+/, '')).replace(/^~(?=~)/, '');
+
+    if (!Object.keys(g.fields).length) g.warnings.push('Could not identify any KYC fields — the PDF may be a scan or an unusual layout; please fill the form manually.');
   } catch (e) { /* guesses are best-effort */ }
   return g;
 }
@@ -2938,6 +3235,13 @@ const CSS = `
   .dz-pulse-gold::before { color: var(--gold); }
   .dz-pulse-mint::before { color: var(--mint); }
   @keyframes dz-ping { 0% { transform: scale(.5); opacity: .8; } 100% { transform: scale(1.7); opacity: 0; } }
+  /* Numbered deal pin chips on the /tracking activity map: the deal's short number in a rounded
+     chip (mint = my company is a party, gold = other companies). */
+  .dz-pin { display: inline-block; min-width: 20px; padding: 1px 6px; border-radius: 999px; text-align: center;
+    font: 700 11px/16px var(--font-body); border: 1.5px solid rgba(255,255,255,.55); box-shadow: 0 1px 6px rgba(0,0,0,.35); }
+  .dz-pin-gold { background: var(--gold); color: var(--on-gold); }
+  .dz-pin-mint { background: var(--mint); color: #06231B; }
+  .dz-pin-wrap { background: none; border: none; }
   /* In-transit strip on /tracking. */
   .track-strip { display: flex; gap: 12px; overflow-x: auto; padding: 4px 2px 12px; }
   .track-card { min-width: 250px; flex: 0 0 auto; padding: 12px 14px; }
@@ -3291,6 +3595,24 @@ function totalUnread(companyId) {
 /** Moon/sun theme toggle button (client-side only, persists to localStorage). */
 const THEME_TOGGLE_BTN = '<button class="nav-ic theme-toggle btn-theme js-theme" id="theme-toggle" type="button" title="Toggle light/dark theme" aria-label="Toggle light/dark theme"><span class="ic">🌙</span></button>';
 
+/** Per-request memo for the nav badge counters: page() plus any route body that also asks
+ *  for the same counts within one request share a single computation. Keyed on the user
+ *  object, which currentUser() hands out once per request (see _reqUserMemo). Live SSE
+ *  streams never poll these counters in a loop, so per-request staleness is not a concern. */
+const _pageCounterMemo = new WeakMap();
+function pageCounters(user) {
+  let c = _pageCounterMemo.get(user);
+  if (!c) {
+    c = {
+      unread: totalUnread(user.id),
+      notifs: unreadNotifications(user.id),
+      contracts: unreadPrivateContracts(user.id)
+    };
+    _pageCounterMemo.set(user, c);
+  }
+  return c;
+}
+
 /** Render the full HTML page shell. */
 
 // ============================= PWA — installable phone app =============================
@@ -3392,23 +3714,25 @@ h1{font-size:22px;margin:0 0 10px}p{color:#8B93A7;font-size:14px;line-height:1.6
 });
 
 function page(title, body, user, msg, err, active, headExtra, opts) {
-  const unread = (user && !user.isAdmin) ? totalUnread(user.id) : 0;
-  const notifUnread = (user && !user.isAdmin) ? unreadNotifications(user.id) : 0;
-  const contractsUnread = (user && !user.isAdmin) ? unreadPrivateContracts(user.id) : 0;
-  // Per-company palette (admin sessions always see the default Titan look).
-  const palette = companyPalette(user);
+  // Badge counters query company-scoped tables — persons have no company id, so skip them.
+  const counters = (user && !user.isAdmin && !user.isPerson) ? pageCounters(user) : null;
+  const unread = counters ? counters.unread : 0;
+  const notifUnread = counters ? counters.notifs : 0;
+  const contractsUnread = counters ? counters.contracts : 0;
+  // Per-company palette (admin and person sessions always see the default Titan look).
+  const palette = (user && user.isPerson) ? 'titan' : companyPalette(user);
   // Logo-derived custom theme: a full CSS variable override block generated from the logo colors.
   const customTheme = palette === 'custom' ? companyCustomTheme(user) : null;
   // Batch C (7): interface language — company preference wins; anonymous pages may pass opts.lang
   // (resolved from the dz_lang cookie by the route). Arabic flips the whole page to RTL.
-  const lang = (user && !user.isAdmin && SUPPORTED_LANGS.includes(user.lang)) ? user.lang
+  const lang = (user && !user.isAdmin && !user.isPerson && SUPPORTED_LANGS.includes(user.lang)) ? user.lang
     : (opts && SUPPORTED_LANGS.includes(opts.lang)) ? opts.lang : 'en';
   const isRtl = lang === 'ar';
   const tt = (k) => t(lang, k);
   // Terms re-agreement gate: a logged-in company on an outdated terms version gets the
   // blocking modal on every page until it explicitly agrees (POST /terms/agree).
   let termsGate = '';
-  if (user && !user.isAdmin) {
+  if (user && !user.isAdmin && !user.isPerson) {
     try {
       const tv = db.prepare('SELECT agreed_terms_version FROM companies WHERE id = ?').get(user.id);
       if (!tv || (tv.agreed_terms_version || 0) < TERMS_VERSION) termsGate = termsGateHtml('gate');
@@ -3417,8 +3741,16 @@ function page(title, body, user, msg, err, active, headExtra, opts) {
   const navLinks = user && user.isAdmin
     ? `${langSelectorHtml(lang)}${THEME_TOGGLE_BTN}
        <a class="navlink" href="/admin">${tt('nav.dashboard')}</a>
+       <a class="navlink" href="/admin/persons">👤 Persons</a>
        <a class="navlink" href="/admin/security">🛡️ Security</a>
        <form method="POST" action="/admin/logout" style="display:inline"><button class="btn btn-sm btn-outline">${tt('nav.logout')}</button></form>`
+    : user && user.isPerson
+    ? `<span class="nav-icons">
+         ${navIcon('box', '/products', 'Products', active)}
+         ${navIcon('contracts', '/my/orders', 'My Orders', active)}
+       </span>
+       ${THEME_TOGGLE_BTN}
+       <form method="POST" action="/logout" style="display:inline"><button class="btn btn-sm btn-outline">${tt('nav.logout')}</button></form>`
     : user
     ? `<span class="nav-icons">
          ${navIcon('home', '/timeline', tt('nav.home'), active)}
@@ -3483,7 +3815,7 @@ ${ticker}
   ${err ? `<div class="flash-err">⚠ ${esc(err)}</div>` : ''}
   ${body}
 </main>
-<div class="footer">Dealzoin — the B2B deal network. Companies only. 🪙</div>
+<div class="footer">${user ? '<a href="/review-request" style="color:inherit">🆘 Issue? Request admin review</a> · ' : ''}Dealzoin — the B2B deal network. Companies only. 🪙</div>
 <button class="back-to-top" id="back-to-top" type="button" aria-label="Back to top" title="Back to top">&uarr;</button>
 ${termsGate}
 ${termsGate ? `<noscript><div class="card" style="position:fixed;left:16px;right:16px;bottom:16px;z-index:150;border-color:var(--border-gold)">
@@ -4554,11 +4886,11 @@ function fileButtonHtml(labelText) {
 function isSecureReq(req) {
   return req && (req.secure || req.headers['x-forwarded-proto'] === 'https');
 }
-function createSession(req, res, companyId, isAdmin, memberId) {
+function createSession(req, res, companyId, isAdmin, memberId, personId) {
   const token = randomToken();
   const expires = new Date(Date.now() + SESSION_TTL_MS).toISOString();
-  db.prepare('INSERT INTO sessions (token, company_id, is_admin, member_id, created_at, expires_at) VALUES (?,?,?,?,?,?)')
-    .run(token, companyId, isAdmin ? 1 : 0, memberId || null, now(), expires);
+  db.prepare('INSERT INTO sessions (token, company_id, is_admin, member_id, person_id, created_at, expires_at) VALUES (?,?,?,?,?,?,?)')
+    .run(token, companyId, isAdmin ? 1 : 0, memberId || null, personId || null, now(), expires);
   res.setHeader('Set-Cookie',
     `dz_session=${signedCookieValue(token)}; HttpOnly; Path=/; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}; SameSite=Lax${isSecureReq(req) ? '; Secure' : ''}`);
 }
@@ -4567,28 +4899,57 @@ function destroySession(req, res) {
   if (token) db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
   res.setHeader('Set-Cookie', 'dz_session=; HttpOnly; Path=/; Max-Age=0');
 }
-/** Resolve the current session -> { id, name, isAdmin } or null. */
+/** Resolve the current session -> { id, name, isAdmin } or null.
+ *  Memoized per request (WeakMap keyed on req): guards + route bodies often resolve the
+ *  session several times per request, and the result cannot change mid-request (logout and
+ *  session-revoking routes never re-resolve afterwards). Sharing one object per request also
+ *  lets pageCounters() below key its memo on the user object. */
+const _reqUserMemo = new WeakMap();
 function currentUser(req) {
+  if (_reqUserMemo.has(req)) return _reqUserMemo.get(req);
   const token = readSignedCookie(req, 'dz_session');
-  if (!token) return null;
-  const sess = db.prepare('SELECT * FROM sessions WHERE token = ?').get(token);
-  if (!sess || sess.expires_at < now()) return null;
-  if (sess.is_admin) return { id: 0, name: 'Admin', isAdmin: true };
-  const c = db.prepare('SELECT id, name, status, lang FROM companies WHERE id = ?').get(sess.company_id);
-  if (!c || c.status !== 'approved') return null;
-  // Sub-account session: resolve the member (must still be active) and attach attribution info.
-  if (sess.member_id) {
-    const m = db.prepare(`SELECT id, name, role, status FROM company_members WHERE id = ? AND company_id = ?`).get(sess.member_id, c.id);
-    if (!m || m.status !== 'active') return null;
-    return { id: c.id, name: c.name, isAdmin: false, memberId: m.id, memberName: m.name, memberRole: m.role, lang: c.lang || 'en' };
+  let user = null;
+  /* INVARIANT: persons and companies share the same id space (both tables auto-increment
+   * from 1). For persons, user.id MUST stay the person id (product_orders.buyer_person_id and
+   * all requirePerson routes rely on it), so it CANNOT be namespaced. Therefore: ALWAYS check
+   * user.isPerson before comparing user.id to a company-keyed column (company_id,
+   * owner_company_id, signer_company_id, buyer_id, seller_id, sender_company_id,
+   * recipient_company_id, follower_id, followed_id, from_company_id, split_proposed_by,
+   * conversation_members.company_id, event_participants.company_id, nominated_by, …).
+   * A person id must NEVER be allowed to match a company id. */
+  if (token) {
+    const sess = db.prepare('SELECT * FROM sessions WHERE token = ?').get(token);
+    if (sess && sess.expires_at >= now()) {
+      if (sess.is_admin) {
+        user = { id: 0, name: 'Admin', isAdmin: true };
+      } else if (sess.person_id) {
+        // Person (individual buyer) session — no company features, catalog browsing only.
+        const p = db.prepare('SELECT id, name, email, status FROM persons WHERE id = ?').get(sess.person_id);
+        if (p && p.status === 'active') user = { isPerson: true, id: p.id, personId: p.id, name: p.name, email: p.email, isAdmin: false };
+      } else {
+        const c = db.prepare('SELECT id, name, status, lang, license_expiry FROM companies WHERE id = ?').get(sess.company_id);
+        if (c && c.status === 'approved') {
+          // Sub-account session: resolve the member (must still be active) and attach attribution info.
+          if (sess.member_id) {
+            const m = db.prepare(`SELECT id, name, role, status FROM company_members WHERE id = ? AND company_id = ?`).get(sess.member_id, c.id);
+            if (m && m.status === 'active') user = { id: c.id, name: c.name, isAdmin: false, memberId: m.id, memberName: m.name, memberRole: m.role, lang: c.lang || 'en', licenseExpiry: c.license_expiry || '' };
+          } else {
+            user = { id: c.id, name: c.name, isAdmin: false, lang: c.lang || 'en', licenseExpiry: c.license_expiry || '' };
+          }
+        }
+      }
+    }
   }
-  return { id: c.id, name: c.name, isAdmin: false, lang: c.lang || 'en' };
+  _reqUserMemo.set(req, user);
+  return user;
 }
 /** Paths a company may POST to even when their T&C agreement is stale (else they could never re-agree or log out). */
-const TERMS_STALE_POST_WHITELIST = new Set(['/terms/agree', '/logout', '/lang']);
+const TERMS_STALE_POST_WHITELIST = new Set(['/terms/agree', '/logout', '/lang', '/license-renew']);
 /** Guard: approved company session required. Stale T&C version blocks ALL mutating actions server-side (the popup is enforced, not cosmetic). */
 function requireCompany(req, res, next) {
   const user = currentUser(req);
+  // Persons are signed in but have no company features — send them back to the catalog, not to login.
+  if (user && user.isPerson) return res.redirect('/products?err=' + encodeURIComponent('That area is for registered companies.'));
   if (!user || user.isAdmin) return res.redirect('/login?err=' + encodeURIComponent('Please sign in with an approved company account.'));
   if (req.method === 'POST' && !TERMS_STALE_POST_WHITELIST.has(req.path)) {
     try {
@@ -4632,9 +4993,10 @@ app.get('/', (req, res) => {
       <p class="a-enter" data-stage="hero" style="--i:2">Dealzoin is the closed network where vetted companies post opportunities, negotiate in private deal rooms, and sign — every step on the record.</p>
       <div class="a-enter" data-stage="hero" style="--i:3">
       ${user
-        ? `<a class="btn js-magnet" href="${user.isAdmin ? '/admin' : '/timeline'}">Enter the Deal Floor &rarr;</a>`
+        ? `<a class="btn js-magnet" href="${user.isAdmin ? '/admin' : (user.isPerson ? '/products' : '/timeline')}">Enter the Deal Floor &rarr;</a>`
         : `<a class="btn js-magnet" href="/signup">Enter the Deal Floor &rarr;</a>
-           &nbsp; <a class="btn btn-outline" href="#why">See how it works</a>`}
+           &nbsp; <a class="btn btn-outline" href="#why">See how it works</a>
+           &nbsp; <a class="btn btn-outline" href="/signup/person">👤 Register as a person — browse &amp; order products</a>`}
       </div>
     </div>
   </div>
@@ -4715,6 +5077,8 @@ function termsGateHtml(mode) {
 </div>`;
 }
 const COMPANY_CATEGORIES = ['Trading', 'Manufacturing', 'Logistics', 'Technology', 'Agriculture', 'Energy', 'Construction', 'Healthcare', 'Finance', 'Other'];
+// Shipping tenders: the freight modes a Logistics company can declare at registration.
+const SHIPPING_TYPES = ['Sea freight', 'Air freight', 'Land freight', 'Multimodal'];
 
 /** Full registration Terms & Conditions page (public). */
 app.get('/legal/terms', (req, res) => {
@@ -4789,8 +5153,13 @@ app.get('/signup', (req, res) => {
       <label>Description</label><textarea name="description" rows="4" maxlength="2000"></textarea>
       <label>Field of activity (required)</label><input type="text" name="activity" id="f-activity" required maxlength="300" placeholder="e.g. Wholesale electronics trading">
       <div class="grid2">
-        <div><label>Category (required)</label><select name="category" required><option value="">— choose —</option>${optionsHtml(COMPANY_CATEGORIES, '')}</select>${otherInputHtml('category')}</div>
-        <div><label>Trade license number (required)</label><input type="text" name="trade_license" required minlength="4" maxlength="80" placeholder="e.g. TL-9988"></div>
+        <div><label>Category (required)</label><select name="category" id="f-category" required><option value="">— choose —</option>${optionsHtml(COMPANY_CATEGORIES, '')}</select>${otherInputHtml('category')}</div>
+        <div><label>Trade license number (required)</label><input type="text" name="trade_license" id="f-license" required minlength="4" maxlength="80" placeholder="e.g. TL-9988"></div>
+      </div>
+      <div id="shipping-type-row" style="display:none">
+        <label>Shipping type (required for Logistics companies)</label>
+        <select name="shipping_type"><option value="">— choose —</option>${optionsHtml(SHIPPING_TYPES, '')}</select>
+        <p class="muted" style="margin-top:4px">How your company moves cargo — you can bid to ship closed deals in this mode.</p>
       </div>
 
       <hr class="sep">
@@ -4815,6 +5184,11 @@ app.get('/signup', (req, res) => {
   </div>
   ${termsGateHtml('signup')}
   <script>(function(){
+    // Shipping type is only relevant (and required) for Logistics companies.
+    var cat=document.getElementById('f-category'),row=document.getElementById('shipping-type-row');
+    if(cat&&row){var t=function(){row.style.display=cat.value==='Logistics'?'':'none';};cat.addEventListener('change',t);t();}
+  })();</script>
+  <script>(function(){
     var inp=document.getElementById('profile-pdf');
     if(!inp)return;
     inp.addEventListener('change',function(){
@@ -4827,7 +5201,18 @@ app.get('/signup', (req, res) => {
         if(g&&g.ok){
           var set=function(id,v){var el=document.getElementById(id);if(el&&v&&!el.value)el.value=v;};
           set('f-name',g.name);set('f-website',g.website);set('f-email',g.email);set('f-activity',g.activity);
-          if(note)note.innerHTML='<div class="flash-ok" style="margin-top:8px">✓ Auto-filled from your company profile — please review.</div>';
+          if(g.license&&g.license.number)set('f-license',g.license.number);
+          if(note){
+            note.innerHTML='';
+            var okDiv=document.createElement('div');okDiv.className='flash-ok';okDiv.style.marginTop='8px';
+            okDiv.textContent='✓ Auto-filled from your company profile — please review.';
+            note.appendChild(okDiv);
+            if(g.warnings&&g.warnings.length){
+              var wl=document.createElement('ul');wl.className='muted';wl.style.margin='6px 0 0 18px';
+              g.warnings.forEach(function(w){var li=document.createElement('li');li.textContent='⚠ '+w;wl.appendChild(li);});
+              note.appendChild(wl);
+            }
+          }
         }else{
           if(note)note.innerHTML='<div class="flash-err" style="margin-top:8px">⚠ '+(g&&g.error?g.error:'Could not read that PDF — please fill the form manually.')+'</div>';
         }
@@ -4846,7 +5231,15 @@ app.post('/signup/parse-profile', rateLimitRoute('signup-parse-profile', 10, 60 
     if (!req.file) return res.json({ ok: false, error: 'No PDF received.' });
     if (!isPdfBuffer(req.file.buffer)) return res.json({ ok: false, error: 'That file is not a real PDF.' });
     const parsed = await extractPdfText(req.file.buffer);
-    if (!parsed) return res.json({ ok: false, error: 'Could not parse that PDF — it may be corrupt or password-protected.' });
+    if (!parsed) {
+      const encrypted = req.file.buffer.includes(Buffer.from('/Encrypt', 'latin1'));
+      return res.json({ ok: false, error: encrypted
+        ? 'That PDF is password-protected — please export an unprotected copy, or fill the form manually.'
+        : 'Could not parse that PDF — it may be corrupt or malformed. Please fill the form manually.' });
+    }
+    if (!parsed.text || parsed.text.trim().length < 20) {
+      return res.json({ ok: false, error: "Couldn't read any text from that PDF — it may be a scan or image-only. Please fill the form manually." });
+    }
     const g = guessesFromProfileText(parsed.text);
     res.json({ ok: true, ...g });
   });
@@ -4873,6 +5266,12 @@ async function signupCompleteHandler(req, res) {
   if (!site) return fail('A valid company website is required (https://…).');
   if (!activity) return fail('Field of activity is required.');
   if (!category) return fail('Please choose a company category.');
+  // Shipping tenders: Logistics companies must declare how they ship; everyone else stores ''.
+  let shippingType = '';
+  if (category === 'Logistics') {
+    shippingType = String(b.shipping_type || '').trim();
+    if (!SHIPPING_TYPES.includes(shippingType)) return fail('Shipping companies (Logistics category) must choose a shipping type: Sea, Air, Land or Multimodal freight.');
+  }
   if (tradeLicense.length < 4) return fail('A valid trade license number (min 4 characters) is required.');
   const missingPledge = signupPledges().find(([key]) => b[key] !== 'yes');
   if (missingPledge) return fail('All five pledges must be accepted to register.');
@@ -4900,16 +5299,17 @@ async function signupCompleteHandler(req, res) {
   const salt = newSalt();
   const signatureIp = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim().slice(0, 80);
   const info = db.prepare(`INSERT INTO companies (name, email, password_hash, salt, website, description, status, flagged, flag_reasons, created_at,
-              category, activity, trade_license, signature_name, signature_at, signature_ip, agreed_terms_version, agreed_at)
-              VALUES (?,?,?,?,?,?, 'pending', ?, ?, ?, ?,?,?,?,?,?,?,?)`)
+              category, activity, trade_license, signature_name, signature_at, signature_ip, agreed_terms_version, agreed_at, shipping_type)
+              VALUES (?,?,?,?,?,?, 'pending', ?, ?, ?, ?,?,?,?,?,?,?,?,?)`)
     .run(nm, em, hashPassword(b.password, salt), salt,
          site, String(b.description || '').trim().slice(0, 2000),
          check.flags.length ? 1 : 0, check.flags.join('; '), now(),
          category, activity, tradeLicense, signatureName, now(), signatureIp,
-         TERMS_VERSION, now()); // registration pledges accepted => current terms version recorded
+         TERMS_VERSION, now(), // registration pledges accepted => current terms version recorded
+         shippingType);
   const companyId = info.lastInsertRowid;
   audit('ONBOARDING AGENT', 'signup decision', check.flags.length ? 'flag' : 'pass',
-        `Company "${nm}" registered as pending (category: ${category}, trade license: ${tradeLicense})${check.flags.length ? ' with warnings: ' + check.flags.join('; ') : ''}`);
+        `Company "${nm}" registered as pending (category: ${category}${shippingType ? ', shipping: ' + shippingType : ''}, trade license: ${tradeLicense})${check.flags.length ? ' with warnings: ' + check.flags.join('; ') : ''}`);
 
   // Store every uploaded KYC document; the DOCUMENT AUTHENTICITY AGENT checks each one.
   const company = db.prepare('SELECT * FROM companies WHERE id = ?').get(companyId);
@@ -4923,6 +5323,23 @@ async function signupCompleteHandler(req, res) {
       audit('DOCUMENT AGENT', `document check (${docType})`, 'fail', `"${f.originalname || 'file'}" for "${nm}": agent error: ${e.message}`);
     }
   }
+
+  // License expiry detector: mine the uploaded profile/trade-license PDF for its expiry date so the
+  // license gate can lock the account the day the license lapses (best-effort — never blocks signup).
+  try {
+    const pf = files.profile_pdf && files.profile_pdf[0];
+    if (pf) {
+      const parsed = await extractPdfText(pf.buffer);
+      if (parsed && parsed.text && parsed.text.trim().length >= 20) {
+        const g = guessesFromProfileText(parsed.text);
+        if (g.license && g.license.expiry) {
+          db.prepare('UPDATE companies SET license_expiry = ? WHERE id = ?').run(g.license.expiry, companyId);
+          audit('ONBOARDING AGENT', 'license expiry detected', g.license.expired ? 'flag' : 'pass',
+            `"${nm}" license expiry read from profile PDF: ${g.license.expiry}${g.license.expired ? ' — ALREADY EXPIRED at registration' : ''}`);
+        }
+      }
+    }
+  } catch (e) { /* expiry detection is best-effort */ }
 
   res.redirect('/login?msg=' + encodeURIComponent('Registration received! Your company and documents are pending admin approval.'));
 }
@@ -4943,6 +5360,7 @@ app.get('/login', (req, res) => {
     </form>
     <p class="muted" style="margin-top:12px">${esc(t(lang, 'auth.noaccount'))} <a href="/signup">${esc(t(lang, 'auth.register'))}</a></p>
     <p class="muted">Team member? Sign in with your own member email &amp; password.</p>
+    <p class="muted">New individual buyer? <a href="/signup/person">Register as a person</a></p>
     <p class="shield-note">🛡️ Protected by Dealzoin security agents</p>
   </div>`;
   res.send(page('Sign in', body, null, req.query.msg, req.query.err, undefined, undefined, { lang }));
@@ -4958,8 +5376,18 @@ app.post('/login', rateLimitRoute('login', 10, 10 * 60 * 1000, '/login'), (req, 
     const member = db.prepare(`SELECT * FROM company_members WHERE email = ? AND status = 'active'`).get(em);
     const parent = member ? db.prepare('SELECT * FROM companies WHERE id = ?').get(member.company_id) : null;
     if (!member || !parent || !verifyPassword(pw, member.salt, member.password_hash)) {
-      audit('AUTHENTICATION AGENT', 'login password check', 'fail', `Failed login for ${em}`);
-      return res.redirect('/login?err=' + encodeURIComponent('Invalid email or password.'));
+      // Person (individual buyer) login: no company/member matched this email.
+      const person = db.prepare('SELECT * FROM persons WHERE email = ?').get(em);
+      if (!person || !verifyPassword(pw, person.salt, person.password_hash)) {
+        audit('AUTHENTICATION AGENT', 'login password check', 'fail', `Failed login for ${em}`);
+        return res.redirect('/login?err=' + encodeURIComponent('Invalid email or password.'));
+      }
+      if (person.status !== 'active') {
+        audit('AUTHENTICATION AGENT', 'login status check', 'fail', `Login blocked for ${em} — person account is ${person.status}`);
+        return res.redirect('/login?err=' + encodeURIComponent('This account is suspended. Contact support.'));
+      }
+      audit('AUTHENTICATION AGENT', 'login password check', 'pass', `Password OK for person ${em} (${person.name})`);
+      return issuePersonLoginCode(req, res, person, 'login');
     }
     if (parent.status !== 'approved') {
       return res.redirect('/login?err=' + encodeURIComponent('This company account is not currently approved. Contact support.'));
@@ -5044,10 +5472,18 @@ app.post('/verify-login', rateLimitRoute('verify-login', 10, 10 * 60 * 1000, '/v
     audit('AUTHENTICATION AGENT', '2FA verify', 'fail', 'Code expired or missing');
     return res.redirect('/login?err=' + encodeURIComponent('Code expired. Please sign in again.'));
   }
-  const company = db.prepare('SELECT * FROM companies WHERE id = ?').get(row.company_id);
-  if (!company || company.status !== 'approved') {
+  // Person codes carry payload {person_id} with company_id = 0 (see issuePersonLoginCode).
+  let payloadObj = {};
+  try { payloadObj = JSON.parse(row.payload || '{}') || {}; } catch (e) { payloadObj = {}; }
+  const personRow = payloadObj.person_id ? db.prepare('SELECT * FROM persons WHERE id = ?').get(payloadObj.person_id) : null;
+  if (payloadObj.person_id && (!personRow || personRow.status !== 'active')) {
     return res.redirect('/login?err=' + encodeURIComponent('Account not available.'));
   }
+  const company = personRow ? null : db.prepare('SELECT * FROM companies WHERE id = ?').get(row.company_id);
+  if (!personRow && (!company || company.status !== 'approved')) {
+    return res.redirect('/login?err=' + encodeURIComponent('Account not available.'));
+  }
+  const loginEmail = personRow ? personRow.email : company.email;
   // constant-time code comparison
   const a = Buffer.from(code.padEnd(6, ' '));
   const b = Buffer.from(row.code.padEnd(6, ' '));
@@ -5058,18 +5494,25 @@ app.post('/verify-login', rateLimitRoute('verify-login', 10, 10 * 60 * 1000, '/v
     if (attempts >= 5) {
       db.prepare('DELETE FROM verification_codes WHERE id = ?').run(row.id);
       res.setHeader('Set-Cookie', 'dz_verify=; HttpOnly; Path=/; Max-Age=0');
-      audit('AUTHENTICATION AGENT', '2FA verify', 'fail', `2FA locked after 5 attempts for ${company.email}`);
+      audit('AUTHENTICATION AGENT', '2FA verify', 'fail', `2FA locked after 5 attempts for ${loginEmail}`);
       return res.redirect('/login?err=' + encodeURIComponent('Too many incorrect codes — please sign in again.'));
     }
     db.prepare('UPDATE verification_codes SET attempts = attempts + 1 WHERE id = ?').run(row.id);
-    audit('AUTHENTICATION AGENT', '2FA verify', 'fail', `Wrong code for ${company.email} (attempt ${attempts}/5)`);
+    audit('AUTHENTICATION AGENT', '2FA verify', 'fail', `Wrong code for ${loginEmail} (attempt ${attempts}/5)`);
     return res.redirect('/verify-login?err=' + encodeURIComponent('Incorrect code. Try again.'));
   }
 
   db.prepare('DELETE FROM verification_codes WHERE id = ?').run(row.id);
+  // Person session: no company context — catalog browsing + ordering only.
+  if (personRow) {
+    audit('AUTHENTICATION AGENT', '2FA verify', 'pass', `2FA passed for person ${personRow.email} (${personRow.name}) — session created`);
+    res.setHeader('Set-Cookie', 'dz_verify=; HttpOnly; Path=/; Max-Age=0');
+    createSession(req, res, null, false, null, personRow.id);
+    return res.redirect('/products?msg=' + encodeURIComponent('Welcome, ' + personRow.name + '!'));
+  }
   // Sub-account session when the login was initiated by a team member.
   let memberId = null, memberRow = null;
-  try { memberId = (JSON.parse(row.payload || '{}') || {}).member_id || null; } catch (e) { memberId = null; }
+  try { memberId = payloadObj.member_id || null; } catch (e) { memberId = null; }
   if (memberId) {
     memberRow = db.prepare(`SELECT * FROM company_members WHERE id = ? AND company_id = ? AND status = 'active'`).get(memberId, company.id);
     if (!memberRow) return res.redirect('/login?err=' + encodeURIComponent('This team member account is no longer active.'));
@@ -5086,6 +5529,159 @@ app.post('/logout', (req, res) => {
   res.redirect('/?msg=' + encodeURIComponent('Signed out.'));
 });
 
+// ----- License renewal: the ONLY page an expired-license company can reach (see license gate) -----
+app.get('/license-expired', (req, res) => {
+  const user = currentUser(req);
+  if (!user || user.isAdmin || user.isPerson) return res.redirect('/');
+  const exp = String(user.licenseExpiry || '');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(exp) || exp >= now().slice(0, 10)) return res.redirect('/dashboard');
+  const body = `
+  <div class="card" style="max-width:560px;margin:24px auto" data-reveal>
+    <h2 style="margin-top:0">🚫 Trade license expired</h2>
+    <p><b>Renew your license to continue using Dealzoin.</b></p>
+    <p class="muted">Our records show the trade license for <b>${esc(user.name)}</b> expired on <b>${esc(exp)}</b>.
+    For everyone's safety, companies with an expired license cannot browse, post, bid, or trade on the platform.</p>
+    <form method="POST" action="/license-renew" enctype="multipart/form-data">
+      <label>Upload your renewed trade license (PDF) *</label>
+      <label class="file-btn"><span class="file-btn-text" data-default="📎 Choose renewed license PDF">📎 Choose renewed license PDF</span>
+        <input type="file" class="file-input" name="license" accept="application/pdf,.pdf" required></label>
+      <button class="btn" type="submit">Submit renewal 📤</button>
+      <p class="muted" style="margin-top:8px">The Document Agent reads the new expiry date automatically — if the renewed license is valid, your access is restored immediately.</p>
+    </form>
+    <p class="muted" style="margin-top:14px">Uploaded the wrong license or the date can't be read?
+      <a href="/review-request?category=license"><b>🆘 Submit a comment for admin review</b></a> — the admin can override the date manually.</p>
+    <form method="POST" action="/logout"><button class="btn btn-sm btn-outline" type="submit">Sign out</button></form>
+  </div>`;
+  res.send(page('License expired', body, user, req.query.msg, req.query.err));
+});
+
+// Renewal upload: parse the new license PDF, read its expiry date, restore access if valid.
+app.post('/license-renew', requireCompany, rateLimitRoute('license-renew', 10, 60 * 60 * 1000, '/license-expired'), (req, res) => {
+  pdfUpload.single('license')(req, res, async (err) => {
+    const fail = (m) => res.redirect('/license-expired?err=' + encodeURIComponent(m));
+    try {
+      if (err) return fail(err.code === 'LIMIT_FILE_SIZE' ? 'PDF too large (max 15 MB).' : PDF_RULES_MSG);
+      if (!req.file) return fail('Please choose your renewed trade license PDF.');
+      if (!isPdfBuffer(req.file.buffer)) return fail('That file is not a real PDF.');
+      const parsed = await extractPdfText(req.file.buffer);
+      if (!parsed || !parsed.text || parsed.text.trim().length < 20) {
+        return fail('Could not read any text from that PDF — it may be a scan or image-only. Please upload a text-based license PDF, or contact the admin.');
+      }
+      const g = guessesFromProfileText(parsed.text);
+      const today = now().slice(0, 10);
+      const exp = g.license && g.license.expiry;
+      if (!exp) {
+        audit('ONBOARDING AGENT', 'license renewal', 'fail', `"${req.user.name}" uploaded a renewal PDF but no expiry date could be read`);
+        return fail('No expiry date could be read from that PDF. Please upload your renewed trade license, or contact the admin to update your record.');
+      }
+      if (exp < today) {
+        audit('ONBOARDING AGENT', 'license renewal', 'fail', `"${req.user.name}" uploaded a license that is still expired (expiry ${exp})`);
+        return fail(`The uploaded license is also expired (expiry ${esc(exp)}). Please upload your renewed, currently valid trade license.`);
+      }
+      db.prepare('UPDATE companies SET license_expiry = ? WHERE id = ?').run(exp, req.user.id);
+      audit('ONBOARDING AGENT', 'license renewal', 'pass', `"${req.user.name}" renewed license — new expiry ${exp}; access restored`);
+      res.redirect('/dashboard?msg=' + encodeURIComponent(`License renewed — valid until ${exp}. Welcome back! ✅`));
+    } catch (e) {
+      try { audit('ONBOARDING AGENT', 'license renewal', 'fail', `Renewal error for "${req.user.name}": ${e.message}`); } catch (e2) {}
+      fail('Something went wrong while reading that PDF. Please try again or contact the admin.');
+    }
+  });
+});
+
+// ============================ ADMIN REVIEW REQUESTS ============================
+// Any signed-in user (company or person) can escalate an issue — KYC, license expiry,
+// account status, payments, tenders — with a comment straight to the site admin.
+// The admin reviews each request and can override/skip ANY AI-agent decision.
+db.exec(`
+CREATE TABLE IF NOT EXISTS review_requests (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  company_id  INTEGER,                          -- NULL when the author is a person
+  person_id   INTEGER,                          -- NULL when the author is a company
+  author_name TEXT DEFAULT '',
+  category    TEXT NOT NULL DEFAULT 'other',
+  comment     TEXT NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'pending',  -- pending | in_review | resolved | dismissed
+  admin_note  TEXT DEFAULT '',
+  resolved_at TEXT DEFAULT '',
+  created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_requests_status ON review_requests(status, created_at);
+`);
+
+const REVIEW_CATEGORIES = [
+  ['kyc', '🪪 KYC / document issue'],
+  ['license', '📜 License expiry issue'],
+  ['account', '🏢 Account status / suspension'],
+  ['payment', '💰 Payment / order issue'],
+  ['tender', '📋 Tender / deal issue'],
+  ['other', '❓ Other']
+];
+const REVIEW_CATEGORY_KEYS = REVIEW_CATEGORIES.map(([k]) => k);
+const REVIEW_STATUS_LABELS = { pending: '⏳ Waiting for admin', in_review: '👀 Admin is reviewing', resolved: '✅ Resolved', dismissed: '✖️ Dismissed' };
+
+function reviewStatusBadge(s) {
+  return s === 'resolved' ? '<span class="badge badge-approved">RESOLVED ✅</span>'
+    : s === 'in_review' ? '<span class="badge badge-pending">IN REVIEW 👀</span>'
+    : s === 'dismissed' ? '<span class="badge badge-rejected">DISMISSED</span>'
+    : '<span class="badge badge-pending">PENDING ⏳</span>';
+}
+
+// User side: submit a review request + track own requests.
+app.get('/review-request', requireViewer, (req, res) => {
+  const user = req.user;
+  const mine = user.isPerson
+    ? db.prepare('SELECT * FROM review_requests WHERE person_id = ? ORDER BY id DESC LIMIT 30').all(user.id)
+    : db.prepare('SELECT * FROM review_requests WHERE company_id = ? ORDER BY id DESC LIMIT 30').all(user.id);
+  const preselect = REVIEW_CATEGORY_KEYS.includes(req.query.category) ? req.query.category : '';
+  const rows = mine.length ? mine.map((r) => `
+    <div style="padding:8px 0;border-top:1px dashed var(--border-soft)">
+      <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center">
+        <span><b>#${r.id}</b> · ${esc((REVIEW_CATEGORIES.find(([k]) => k === r.category) || [,'❓ Other'])[1])}</span>
+        ${reviewStatusBadge(r.status)}
+      </div>
+      <p style="margin:4px 0;white-space:pre-wrap">${esc(r.comment)}</p>
+      <span class="muted">${esc(REVIEW_STATUS_LABELS[r.status] || r.status)} · sent ${esc(r.created_at.slice(0, 16).replace('T', ' '))} UTC</span>
+      ${r.admin_note ? `<p class="ok" style="margin:4px 0 0">🛡️ <b>Admin:</b> ${esc(r.admin_note)}</p>` : ''}
+    </div>`).join('') : '<p class="muted">No requests yet.</p>';
+  const body = `
+  <div class="card" style="max-width:640px;margin:0 auto" data-reveal>
+    <h2 style="margin-top:0">🆘 Request admin review</h2>
+    <p class="muted">Something wrong — a KYC rejection, a license-expiry lock, an account or payment issue?
+    Describe it below. Your comment goes <b>straight to the website administrator</b>, who can review and override any automated (AI agent) decision.</p>
+    <form method="POST" action="/review-request">
+      <label>Issue type *</label>
+      <select name="category" required>
+        <option value="">— choose —</option>
+        ${REVIEW_CATEGORIES.map(([k, label]) => `<option value="${k}"${k === preselect ? ' selected' : ''}>${esc(label)}</option>`).join('')}
+      </select>
+      <label>Your comment for the admin *</label>
+      <textarea name="comment" rows="4" required maxlength="2000" placeholder="Explain the issue — e.g. my license was renewed but the system still shows it expired…"></textarea>
+      <button class="btn" type="submit">Send to admin 📨</button>
+    </form>
+  </div>
+  <div class="card" style="max-width:640px;margin:14px auto" data-reveal>
+    <h3>📬 My requests</h3>
+    ${rows}
+  </div>`;
+  res.send(page('Request admin review', body, user, req.query.msg, req.query.err));
+});
+
+app.post('/review-request', requireViewer, rateLimitRoute('review-request', 10, 60 * 60 * 1000, '/review-request'), (req, res) => {
+  const user = req.user;
+  const b = req.body || {};
+  const category = REVIEW_CATEGORY_KEYS.includes(b.category) ? b.category : '';
+  if (!category) return res.redirect('/review-request?err=' + encodeURIComponent('Please choose an issue type.'));
+  const comment = String(b.comment || '').trim().slice(0, 2000);
+  if (comment.length < 5) return res.redirect('/review-request?err=' + encodeURIComponent('Please describe the issue (at least a few words).'));
+  const info = db.prepare(`INSERT INTO review_requests (company_id, person_id, author_name, category, comment, status, created_at)
+                           VALUES (?,?,?,?,?, 'pending', ?)`)
+    .run(user.isPerson ? null : user.id, user.isPerson ? user.id : null,
+         `${user.name}${user.isPerson ? ' (person)' : ''}`, category, comment, now());
+  audit('SECURITY AGENT', 'review request', 'flag',
+    `New admin-review request #${info.lastInsertRowid} (${category}) from ${user.name}${user.isPerson ? ' [person]' : ''}: "${comment.slice(0, 120)}"`);
+  res.redirect('/review-request?msg=' + encodeURIComponent('Sent! The admin will review your request — you can track the answer below.'));
+});
+
 /** Batch A: record re-agreement to the current Terms & Conditions version (from the
  *  blocking gate modal shown to companies on an outdated terms version). */
 app.post('/terms/agree', requireCompany, (req, res) => {
@@ -5095,19 +5691,68 @@ app.post('/terms/agree', requireCompany, (req, res) => {
 });
 
 // ============================= FEED CARD RENDERING =============================
+// companyNameMap is called by ~30 route handlers (sometimes several times per request) and
+// callers only ever read the map, so a short-TTL shared cache is safe: a rename may take up
+// to 5s to appear on other companies' pages, which is acceptable for display names.
+let _nameMapCache = null, _nameMapAt = 0;
+const NAME_MAP_TTL_MS = 5000;
 function companyNameMap() {
+  const t = Date.now();
+  if (_nameMapCache && t - _nameMapAt < NAME_MAP_TTL_MS) return _nameMapCache;
   const map = new Map();
   for (const c of db.prepare('SELECT id, name FROM companies').all()) map.set(c.id, c.name);
+  _nameMapCache = map;
+  _nameMapAt = t;
   return map;
 }
-/** Likes + comments for a card target, plus whether the viewer liked it. */
-function cardSocial(targetType, targetId, viewerId) {
+/** Likes + comments for a card target, plus whether the viewer liked it.
+ *  `cache` is an optional Map ('type:id' -> social object) from prefetchCardSocial(). */
+function cardSocial(targetType, targetId, viewerId, cache) {
+  if (cache) {
+    const hit = cache.get(targetType + ':' + targetId);
+    if (hit) return hit;
+  }
   const likeCount = db.prepare('SELECT COUNT(*) AS n FROM likes WHERE target_type = ? AND target_id = ?').get(targetType, targetId).n;
   const liked = viewerId
     ? !!db.prepare('SELECT 1 FROM likes WHERE company_id = ? AND target_type = ? AND target_id = ?').get(viewerId, targetType, targetId)
     : false;
   const comments = db.prepare('SELECT * FROM comments WHERE target_type = ? AND target_id = ? ORDER BY created_at ASC LIMIT 50').all(targetType, targetId);
   return { likeCount, liked, comments };
+}
+/** Batch-prefetch cardSocial() data for a whole feed: 4-6 queries total instead of 3 per card.
+ *  Produces exactly what cardSocial() would return per card (likeCount, viewer-liked flag,
+ *  first 50 comments oldest-first). */
+function prefetchCardSocial(items, viewerId) {
+  const cache = new Map();
+  const dealIds = new Set(), postIds = new Set();
+  for (const item of items) {
+    const t = item.kind === 'post' ? 'post' : 'deal';
+    const id = item.kind === 'repost' ? item.repost_of : item.ref_id;
+    if (Number.isInteger(id)) (t === 'deal' ? dealIds : postIds).add(id);
+  }
+  const loadType = (t, ids) => {
+    if (!ids.size) return;
+    const list = [...ids];
+    const ph = list.map(() => '?').join(',');
+    const likeCounts = new Map();
+    for (const r of db.prepare(`SELECT target_id, COUNT(*) AS n FROM likes WHERE target_type = ? AND target_id IN (${ph}) GROUP BY target_id`).all(t, ...list)) likeCounts.set(r.target_id, r.n);
+    const likedSet = new Set();
+    if (viewerId) {
+      for (const r of db.prepare(`SELECT target_id FROM likes WHERE company_id = ? AND target_type = ? AND target_id IN (${ph})`).all(viewerId, t, ...list)) likedSet.add(r.target_id);
+    }
+    const commentMap = new Map();
+    for (const r of db.prepare(`SELECT * FROM comments WHERE target_type = ? AND target_id IN (${ph}) ORDER BY created_at ASC`).all(t, ...list)) {
+      let arr = commentMap.get(r.target_id);
+      if (!arr) commentMap.set(r.target_id, arr = []);
+      if (arr.length < 50) arr.push(r);
+    }
+    for (const id of list) {
+      cache.set(t + ':' + id, { likeCount: likeCounts.get(id) || 0, liked: likedSet.has(id), comments: commentMap.get(id) || [] });
+    }
+  };
+  loadType('deal', dealIds);
+  loadType('post', postIds);
+  return cache;
 }
 function commentListHtml(comments, names) {
   if (!comments.length) return '';
@@ -5133,16 +5778,17 @@ function cargoChipHtml(user, item) {
   const qty = Number(item.cargo_qty);
   if (!isFinite(qty) || qty <= 0 || !user) return '';
   const unit = DEAL_CARGO_UNITS.includes(item.cargo_unit) ? item.cargo_unit : 'units';
-  const authorized = user.isAdmin || user.id === item.company_id
-    || (!user.isAdmin && !!_cargoNegStmt.get(item.ref_id, user.id, user.id));
+  const authorized = user.isAdmin || (!user.isPerson && user.id === item.company_id)
+    || (!user.isAdmin && !user.isPerson && !!_cargoNegStmt.get(item.ref_id, user.id, user.id));
   if (!authorized) return '';
   return ` <span class="chip chip-cargo" title="Cargo capacity — visible to deal parties only">📦 ${esc(fmtAmount(qty))} ${esc(unit)}</span>`;
 }
-/** Render one feed card. kind: 'deal' | 'post' | 'repost'. idx = loop index (entrance stagger). */
-function feedCard(item, user, names, idx) {
+/** Render one feed card. kind: 'deal' | 'post' | 'repost'. idx = loop index (entrance stagger).
+ *  socCache: optional prefetchCardSocial() map to avoid per-card COUNT queries on feed pages. */
+function feedCard(item, user, names, idx, socCache) {
   const stagger = Math.min(Number.isInteger(idx) ? idx : 0, 8);
   const ownerName = names.get(item.company_id) || 'Unknown';
-  const isOwn = user && !user.isAdmin && user.id === item.company_id;
+  const isOwn = user && !user.isAdmin && !user.isPerson && user.id === item.company_id;
   const lang = (user && user.lang) || 'en';
   // Member attribution: "— by {member name}" when a sub-account authored the item.
   const byLine = item.author_name ? ` <span class="muted">— by ${esc(item.author_name)}</span>` : '';
@@ -5150,7 +5796,7 @@ function feedCard(item, user, names, idx) {
   // For reposts the social target is the ORIGINAL deal; otherwise the item itself.
   const targetType = item.kind === 'post' ? 'post' : 'deal';
   const targetId = item.kind === 'repost' ? item.repost_of : item.ref_id;
-  const soc = cardSocial(targetType, targetId, user && !user.isAdmin ? user.id : null);
+  const soc = cardSocial(targetType, targetId, user && !user.isAdmin ? user.id : null, socCache);
 
   // System announcement posts (deal-closed congratulations): gold announcement card, shown to everyone.
   if (item.kind === 'post' && item.is_system) {
@@ -5267,6 +5913,7 @@ app.get('/timeline', requireCompany, (req, res) => {
   const followFilter = 'WHERE (company_id IN (SELECT followed_id FROM follows WHERE follower_id = ?) OR company_id = ?)';
   const followCount = db.prepare('SELECT COUNT(*) AS n FROM follows WHERE follower_id = ?').get(req.user.id).n;
   const feed = feedQuery(followFilter, req.user.id, req.user.id);
+  const socCache = prefetchCardSocial(feed, req.user.id); // batch the per-card social queries
 
   let feedHtml;
   if (!followCount) {
@@ -5294,10 +5941,10 @@ app.get('/timeline', requireCompany, (req, res) => {
       <a class="btn btn-outline" href="/search" style="margin-left:8px">Search</a>
     </div>
     ${discoverHtml}
-    ${feed.length ? feed.map((i, idx) => feedCard(i, req.user, names, idx)).join('') : ''}`;
+    ${feed.length ? feed.map((i, idx) => feedCard(i, req.user, names, idx, socCache)).join('') : ''}`;
   } else {
     feedHtml = feed.length
-      ? feed.map((i, idx) => feedCard(i, req.user, names, idx)).join('')
+      ? feed.map((i, idx) => feedCard(i, req.user, names, idx, socCache)).join('')
       : '<div class="card"><p class="muted">Nothing yet from the companies you follow. <a href="/companies">Browse the companies directory</a> · <a href="/explore">Explore open deals →</a></p></div>';
   }
 
@@ -5567,7 +6214,7 @@ app.get('/companies', requireCompany, (req, res) => {
         <h3>${avatarHtml(c.name, c.avatar_media_id)}<a href="/company/${c.id}">${esc(c.name)}</a></h3>
         ${followButton(req.user, c.id)}
       </div>
-      <p class="muted" style="margin-top:4px">${c.category ? `<span class="chip chip-category">${esc(c.category)}</span> ` : ''}${starsHtml(c.reputation, true)} · ${fc.followers} followers</p>
+      <p class="muted" style="margin-top:4px">${c.category ? `<span class="chip chip-category">${esc(c.category)}</span> ` : ''}${c.shipping_type ? `<span class="chip" title="Shipping type">🚢 ${esc(c.shipping_type)}</span> ` : ''}${starsHtml(c.reputation, true)} · ${fc.followers} followers</p>
       ${c.activity ? `<p style="margin-top:6px">⚙️ ${esc(c.activity)}</p>` : ''}
       ${c.bio || c.description ? `<p class="muted" style="margin-top:6px">${esc((c.bio || c.description || '').slice(0, 160))}</p>` : ''}
     </div>`;
@@ -5615,11 +6262,22 @@ app.get('/explore', requireCompany, (req, res) => {
   const followedIds = new Set(db.prepare('SELECT followed_id FROM follows WHERE follower_id = ?').all(myId).map(r => r.followed_id));
 
   const openDeals = db.prepare(`SELECT * FROM deals WHERE status = 'open' ORDER BY created_at DESC LIMIT 200`).all();
+  // Batch the scorer's per-deal signals (was 2 COUNTs + 1 reputation lookup per deal — up to 600 queries).
+  const openIds = openDeals.map(d => d.id);
+  const likeCounts = new Map(), commentCounts = new Map(), repByCompany = new Map();
+  if (openIds.length) {
+    const ph = openIds.map(() => '?').join(',');
+    for (const r of db.prepare(`SELECT target_id, COUNT(*) AS n FROM likes WHERE target_type = 'deal' AND target_id IN (${ph}) GROUP BY target_id`).all(...openIds)) likeCounts.set(r.target_id, r.n);
+    for (const r of db.prepare(`SELECT target_id, COUNT(*) AS n FROM comments WHERE target_type = 'deal' AND target_id IN (${ph}) GROUP BY target_id`).all(...openIds)) commentCounts.set(r.target_id, r.n);
+    const companyIds = [...new Set(openDeals.map(d => d.company_id))];
+    const cph = companyIds.map(() => '?').join(',');
+    for (const r of db.prepare(`SELECT id, reputation FROM companies WHERE id IN (${cph})`).all(...companyIds)) repByCompany.set(r.id, r.reputation || 0);
+  }
   const nowMs = Date.now();
   const scored = openDeals.map(d => {
-    const likes = db.prepare(`SELECT COUNT(*) AS n FROM likes WHERE target_type = 'deal' AND target_id = ?`).get(d.id).n;
-    const comments = db.prepare(`SELECT COUNT(*) AS n FROM comments WHERE target_type = 'deal' AND target_id = ?`).get(d.id).n;
-    const rep = companyReputation(d.company_id);
+    const likes = likeCounts.get(d.id) || 0;
+    const comments = commentCounts.get(d.id) || 0;
+    const rep = repByCompany.get(d.company_id) || 0;
     const ageDays = Math.max(0, (nowMs - Date.parse(d.created_at || '')) / 86400000);
     let score = 0;
     const hints = [];
@@ -5635,10 +6293,12 @@ app.get('/explore', requireCompany, (req, res) => {
     return { deal: d, score, hints: hints.slice(0, 3) };
   }).sort((a, b) => b.score - a.score).slice(0, 50);
 
+  const exploreItems = scored.map(s => dealFeedItem(s.deal));
+  const socCache = prefetchCardSocial(exploreItems, req.user.id); // batch the per-card social queries
   const list = scored.length ? scored.map((s, idx) => {
     const hintsHtml = s.hints.length
       ? `<div class="hint-chips">${s.hints.map(h => `<span class="hint-chip">💡 ${esc(h)}</span>`).join('')}</div>` : '';
-    return hintsHtml + feedCard(dealFeedItem(s.deal), req.user, names, idx);
+    return hintsHtml + feedCard(exploreItems[idx], req.user, names, idx, socCache);
   }).join('') : `<div class="card" style="text-align:center">
       <h3>No open deals right now</h3>
       <p class="muted" style="margin:8px 0 14px">Be the first to put an offer on the wire — or browse the register to find counterparties.</p>
@@ -5694,7 +6354,7 @@ app.get('/company/:id', requireCompany, (req, res) => {
     ${c.field ? `<div class="intel-row"><span class="k">Field</span><span style="text-align:right">${esc(c.field)}</span></div>` : ''}
     ${c.employees ? `<div class="intel-row"><span class="k">Employees</span><span>${esc(c.employees)}</span></div>` : ''}
     ${c.trade_license ? `<div class="intel-row"><span class="k">Trade license</span><span>🪪 ${esc(c.trade_license)}</span></div>` : ''}
-    ${c.research_source ? `<div class="muted intel-src">Source: <a href="${esc(c.research_source)}" rel="noopener noreferrer nofollow">${esc(c.research_source)}</a></div>` : ''}
+    ${c.research_source ? `<div class="muted intel-src">Sources: ${sourceLinksHtml(c.research_source)}</div>` : ''}
     <div class="muted intel-src">Data provided by platform admin &amp; public sources.</div>
   </div>` : '';
 
@@ -5705,6 +6365,7 @@ app.get('/company/:id', requireCompany, (req, res) => {
     <p style="margin-top:6px">${starsHtml(c.reputation)}</p>
     ${c.bio ? `<p class="profile-bio">${esc(c.bio)}</p>` : ''}
     <p class="muted">${fc.followers} followers · ${fc.following} following · member since ${esc(c.created_at.slice(0, 10))}</p>
+    ${c.category ? `<p style="margin-top:8px"><span class="chip chip-category">${esc(c.category)}</span>${c.shipping_type ? ` <span class="chip" title="Shipping type">🚢 ${esc(c.shipping_type)}</span>` : ''}</p>` : ''}
     ${c.website ? `<p style="margin-top:8px">🌐 <a href="${esc(c.website)}" rel="noopener noreferrer nofollow">${esc(c.website)}</a></p>` : ''}
     <p style="margin-top:10px;white-space:pre-wrap">${esc(c.description || '')}</p>
   </div>
@@ -5714,6 +6375,156 @@ app.get('/company/:id', requireCompany, (req, res) => {
   <h2 class="sec-h">Deals by ${esc(c.name)}</h2>
   ${dealsHtml}`;
   res.send(page(c.name, body, req.user, req.query.msg, req.query.err));
+});
+
+// ============================= PERSON ACCOUNTS (individual buyers) =============================
+/* Persons are lightweight individual-buyer accounts alongside the compliance-grade company
+ * accounts: name + email + password, no KYC. They sign in through the SAME 2FA email-code
+ * flow as companies (verification_codes purpose 'login', payload JSON {person_id: N} with
+ * company_id = 0), can browse products listed for audience 'everyone', and nothing else —
+ * requireCompany bounces them back to the catalog. */
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS persons (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  name          TEXT NOT NULL,
+  email         TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  salt          TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'active',     -- active | suspended
+  created_at    TEXT NOT NULL
+);
+`);
+
+/** Guard: any signed-in viewer — approved company, admin, or active person. */
+function requireViewer(req, res, next) {
+  const user = currentUser(req);
+  if (!user) return res.redirect('/login?err=' + encodeURIComponent('Please sign in.'));
+  req.user = user;
+  next();
+}
+/** Guard: person session required (individual buyer areas). */
+function requirePerson(req, res, next) {
+  const user = currentUser(req);
+  if (!user || !user.isPerson) return res.redirect('/login?err=' + encodeURIComponent('Please sign in with a person account.'));
+  req.user = user;
+  next();
+}
+
+/** Issue the shared login 2FA code for a person (company_id = 0 + payload {person_id}) and redirect to /verify-login. */
+function issuePersonLoginCode(req, res, person, auditContext) {
+  const code = String(crypto.randomInt(100000, 1000000)); // 6-digit
+  const token = randomToken();
+  const payload = JSON.stringify({ person_id: person.id });
+  db.prepare(`DELETE FROM verification_codes WHERE purpose = 'login' AND payload = ?`).run(payload);
+  db.prepare('INSERT INTO verification_codes (token, company_id, code, purpose, payload, expires_at, created_at) VALUES (?,?,?,?,?,?,?)')
+    .run(token, 0, code, 'login', payload, new Date(Date.now() + CODE_TTL_MS).toISOString(), now());
+  sendVerificationCode(person.email, code);
+  audit('AUTHENTICATION AGENT', '2FA code issued', 'pass', `Login code issued for person ${person.email} (${auditContext}; 10-min expiry)`);
+  res.setHeader('Set-Cookie', `dz_verify=${signedCookieValue(token)}; HttpOnly; Path=/; Max-Age=600; SameSite=Lax${isSecureReq(req) ? '; Secure' : ''}`);
+  res.redirect('/verify-login');
+}
+
+// ----- Person registration: minimal form, no company/KYC fields -----
+app.get('/signup/person', (req, res) => {
+  const body = `
+  <div class="card" style="max-width:460px;margin:0 auto">
+    <div class="kicker">Individual buyer account</div>
+    <h2 style="margin:6px 0 8px">👤 Register as a person</h2>
+    <p class="muted" style="margin-bottom:14px">Browse &amp; order products listed for individual buyers — no company or KYC documents needed. Companies should use the <a href="/signup">company registration</a> instead.</p>
+    <form method="POST" action="/signup/person">
+      <label>Full name</label><input type="text" name="name" required maxlength="120">
+      <label>Email</label><input type="email" name="email" required maxlength="160">
+      <label>Password (min 8 characters)</label><input type="password" name="password" required minlength="8" maxlength="200">
+      <button class="btn" type="submit">Create person account</button>
+    </form>
+    <p class="muted" style="margin-top:12px">Already registered? <a href="/login">Sign in</a></p>
+    <p class="shield-note">🛡️ Protected by the Authentication Agent (email 2FA on every sign-in)</p>
+  </div>`;
+  res.send(page('Register as a person', body, currentUser(req), req.query.msg, req.query.err));
+});
+
+app.post('/signup/person', rateLimitRoute('signup-person', 5, 60 * 60 * 1000, '/signup/person'), (req, res) => {
+  const name = String(req.body.name || '').trim().slice(0, 120);
+  const email = String(req.body.email || '').trim().toLowerCase().slice(0, 160);
+  const password = String(req.body.password || '');
+  const back = '/signup/person?err=';
+  if (!name || !email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.redirect(back + encodeURIComponent('Please fill in your name and a valid email.'));
+  }
+  if (password.length < 8) {
+    return res.redirect(back + encodeURIComponent('Password must be at least 8 characters.'));
+  }
+  // One identity per email across the whole platform: persons AND companies (and team members).
+  const dupe = db.prepare('SELECT id FROM persons WHERE email = ?').get(email)
+    || db.prepare('SELECT id FROM companies WHERE email = ?').get(email)
+    || db.prepare('SELECT id FROM company_members WHERE email = ?').get(email);
+  if (dupe) {
+    audit('AUTHENTICATION AGENT', 'person signup', 'fail', `Duplicate email rejected at person signup: ${email}`);
+    return res.redirect(back + encodeURIComponent('An account with this email already exists. Try signing in.'));
+  }
+  const salt = newSalt();
+  const info = db.prepare('INSERT INTO persons (name, email, password_hash, salt, status, created_at) VALUES (?,?,?,?,?,?)')
+    .run(name, email, hashPassword(password, salt), salt, 'active', now());
+  const person = { id: info.lastInsertRowid, name, email };
+  audit('AUTHENTICATION AGENT', 'person signup', 'pass', `Person account #${person.id} created for ${email} (${name})`);
+  issuePersonLoginCode(req, res, person, 'signup');
+});
+
+// ----- Person order history: every order this individual buyer has placed -----
+app.get('/my/orders', requirePerson, (req, res) => {
+  const names = companyNameMap();
+  const orders = db.prepare('SELECT * FROM product_orders WHERE buyer_person_id = ? ORDER BY id DESC LIMIT 200').all(req.user.id);
+  const body = `
+  <div class="feed-head" style="margin-bottom:10px">
+    <div>
+      <div class="kicker">Individual buyer</div>
+      <h1 style="font-size:1.75rem;margin-top:4px">📦 My Orders (${orders.length})</h1>
+    </div>
+    <a class="btn btn-sm btn-outline" href="/products">← Browse products</a>
+  </div>
+  <p class="muted" style="margin-bottom:12px">"Requested" orders are purchase inquiries — the seller contacts you to arrange payment. Orders "awaiting payment" can be settled online via PayPal with the Pay now button.</p>
+  ${ordersTableHtml(orders, names, { showSeller: true, payNow: req.user })}`;
+  res.send(page('My Orders', body, req.user, req.query.msg, req.query.err, 'contracts'));
+});
+
+// ----- Admin: person account oversight -----
+app.get('/admin/persons', requireAdmin, (req, res) => {
+  const persons = db.prepare('SELECT * FROM persons ORDER BY created_at DESC LIMIT 500').all();
+  const rows = persons.map(p => `<tr>
+    <td><b>${esc(p.name)}</b></td>
+    <td>${esc(p.email)}</td>
+    <td class="muted">${esc(p.created_at.slice(0, 10))}</td>
+    <td><span class="badge ${p.status === 'active' ? 'badge-approved' : 'badge-rejected'}">${esc(p.status)}</span></td>
+    <td><form method="POST" action="/admin/persons/${p.id}/status" style="display:inline">
+      <input type="hidden" name="status" value="${p.status === 'active' ? 'suspended' : 'active'}">
+      <button class="btn btn-sm ${p.status === 'active' ? 'btn-outline' : 'btn-green'}" type="submit">${p.status === 'active' ? 'Suspend' : 'Activate'}</button>
+    </form></td>
+  </tr>`).join('') || '<tr><td colspan="5" class="muted">No person accounts yet.</td></tr>';
+  const body = `
+  <div class="feed-head" style="margin-bottom:10px">
+    <div>
+      <div class="kicker">Admin · individual buyers</div>
+      <h1 style="font-size:1.75rem;margin-top:4px">👤 Persons (${persons.length})</h1>
+    </div>
+    <a class="btn btn-sm btn-outline" href="/admin/dashboard">← Dashboard</a>
+  </div>
+  <div class="card">
+    <table><thead><tr><th>Name</th><th>Email</th><th>Joined</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table>
+  </div>`;
+  res.send(page('Persons', body, req.user, req.query.msg, req.query.err));
+});
+
+app.post('/admin/persons/:id/status', requireAdmin, (req, res) => {
+  const p = db.prepare('SELECT * FROM persons WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!p) return res.redirect('/admin/persons?err=' + encodeURIComponent('Person not found.'));
+  const next = String(req.body.status || '') === 'suspended' ? 'suspended' : 'active';
+  if (next !== p.status) {
+    db.prepare('UPDATE persons SET status = ? WHERE id = ?').run(next, p.id);
+    if (next === 'suspended') db.prepare('DELETE FROM sessions WHERE person_id = ?').run(p.id); // revoke live sessions
+    audit('AUTHENTICATION AGENT', 'person status change', 'pass', `Admin set person #${p.id} (${p.email}) status: ${p.status} → ${next}`);
+  }
+  res.redirect('/admin/persons?msg=' + encodeURIComponent(`Person ${p.email} is now ${next}.`));
 });
 
 // ============================= PRODUCT CATALOG (Alibaba-style storefronts) =============================
@@ -5744,6 +6555,12 @@ CREATE TABLE IF NOT EXISTS product_photos (
 );
 CREATE INDEX IF NOT EXISTS idx_product_photos_product ON product_photos(product_id);
 `);
+// Audience: 'companies' (default, full network features) | 'everyone' (persons may view & order via PayPal).
+try { db.exec("ALTER TABLE products ADD COLUMN audience TEXT NOT NULL DEFAULT 'companies'"); } catch (e) { /* column already exists */ }
+// Structured pricing for ordering: price_amount is NULLABLE — NULL means "quote only" (the order is
+// recorded as a purchase inquiry without online payment). price_text stays as the free-text display hint.
+try { db.exec('ALTER TABLE products ADD COLUMN price_amount REAL'); } catch (e) { /* column already exists */ }
+try { db.exec("ALTER TABLE products ADD COLUMN price_currency TEXT NOT NULL DEFAULT 'USD'"); } catch (e) { /* column already exists */ }
 
 const PRODUCT_TITLE_MAX = 120;
 const PRODUCT_DESC_MAX = 4000;
@@ -5798,6 +6615,7 @@ function productCardHtml(p, names, viewerId) {
     <h3 style="margin:10px 0 4px;font-size:15px"><a href="/product/${p.id}">${esc(p.title)}</a>${mine ? ' <span class="hint-chip">mine</span>' : ''}</h3>
     ${p.price_text ? `<div style="color:var(--gold);font-weight:600;font-size:14px">${esc(p.price_text)}</div>` : ''}
     ${p.moq ? `<div style="margin-top:4px"><span class="hint-chip">MOQ: ${esc(p.moq)}</span></div>` : ''}
+    ${p.audience === 'everyone' ? `<div style="margin-top:4px"><span class="hint-chip">👤 Persons welcome</span></div>` : ''}
     <div class="muted" style="margin-top:6px;font-size:12px"><a href="/company/${p.company_id}">${esc(names.get(p.company_id) || 'Company')}</a>${p.category ? ` · ${esc(p.category)}` : ''}</div>
   </div>`;
 }
@@ -5809,25 +6627,28 @@ function productGridHtml(products, names, viewerId) {
 }
 
 // ----- Browse the catalog: all member products, with search + category + company filters -----
-app.get('/products', requireCompanyOrAdmin, (req, res) => {
+// Companies/admin see everything; persons (individual buyers) only see audience='everyone' listings.
+app.get('/products', requireViewer, (req, res) => {
   const q = String(req.query.q || '').trim().slice(0, 80);
   const cat = String(req.query.category || '').trim().slice(0, 60);
   const companyId = parseInt(req.query.company || '', 10) || null;
   const names = companyNameMap();
+  const isPersonViewer = !!(req.user && req.user.isPerson);
 
   const where = [`p.status = 'active'`];
   const args = [];
+  if (isPersonViewer) where.push(`p.audience = 'everyone'`);
   if (companyId) { where.push('p.company_id = ?'); args.push(companyId); }
   if (cat) { where.push('p.category = ?'); args.push(cat); }
   if (q) { where.push('(p.title LIKE ? OR p.description LIKE ?)'); args.push(`%${q}%`, `%${q}%`); }
   const products = db.prepare(`SELECT p.* FROM products p WHERE ${where.join(' AND ')} ORDER BY p.created_at DESC LIMIT 200`).all(...args);
 
-  const cats = db.prepare(`SELECT DISTINCT category FROM products WHERE status = 'active' AND category != '' ORDER BY category`).all().map(r => r.category);
-  const grid = products.length ? productGridHtml(products, names, req.user && !req.user.isAdmin ? req.user.id : null)
+  const cats = db.prepare(`SELECT DISTINCT category FROM products WHERE status = 'active' AND category != ''${isPersonViewer ? ` AND audience = 'everyone'` : ''} ORDER BY category`).all().map(r => r.category);
+  const grid = products.length ? productGridHtml(products, names, req.user && !req.user.isAdmin && !req.user.isPerson ? req.user.id : null)
     : `<div class="card" style="text-align:center">
         <h3>No products found</h3>
         <p class="muted" style="margin:8px 0 14px">${q || cat || companyId ? 'Try widening your search — or be the first to list in this space.' : 'Be the first company to list a product on the network.'}</p>
-        <a class="btn" href="/products/new">📦 Post a product</a>
+        ${isPersonViewer ? '' : `<a class="btn" href="/products/new">📦 Post a product</a>`}
       </div>`;
 
   const body = `
@@ -5836,7 +6657,7 @@ app.get('/products', requireCompanyOrAdmin, (req, res) => {
       <div class="kicker">Product catalog</div>
       <h1 style="font-size:1.75rem;margin-top:4px">📦 Products on the network</h1>
     </div>
-    <a class="btn" href="/products/new">➕ Post a product</a>
+    ${isPersonViewer ? '' : `<a class="btn" href="/products/new">➕ Post a product</a>`}
   </div>
   <p class="muted" style="margin-bottom:14px">Standing catalog listings from verified companies — with minimum order quantities. To transact, open a chat or start a deal with the seller.</p>
   <form method="GET" action="/products" class="card" style="padding:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:end">
@@ -5864,10 +6685,20 @@ app.get('/products/new', requireCompany, (req, res) => {
       <input type="text" name="title" required maxlength="${PRODUCT_TITLE_MAX}" placeholder="e.g. Grade A Medjool dates — 10 kg cartons">
       <div class="grid2">
         <div><label>Category</label><select name="category"><option value="">— choose —</option>${optionsHtml(COMPANY_CATEGORIES, '')}</select>${otherInputHtml('category')}</div>
-        <div><label>Minimum order quantity (MOQ)</label><input type="text" name="moq" maxlength="${PRODUCT_FIELD_MAX}" placeholder="e.g. 500 units · 1 pallet · 20ft container"></div>
+        <div><label>Minimum order quantity (MOQ)</label><input type="text" name="moq" maxlength="${PRODUCT_FIELD_MAX}" placeholder="e.g. 500 units · 1 pallet · 100 kg"></div>
       </div>
+      <label>Who can see &amp; order this? (required)</label>
+      <select name="audience" required>
+        <option value="companies">Companies only (default — full network features)</option>
+        <option value="everyone">Companies + individual buyers (persons can order via PayPal)</option>
+      </select>
       <label>Indicative price (optional)</label>
       <input type="text" name="price_text" maxlength="${PRODUCT_FIELD_MAX}" placeholder="e.g. $12–15 / kg — negotiable">
+      <div class="grid2">
+        <div><label>Unit price (number — optional)</label><input type="number" name="price_amount" min="0" step="0.01" placeholder="e.g. 12.50"></div>
+        <div><label>Price currency</label><select name="price_currency">${optionsHtml(DEAL_CURRENCIES, 'USD')}</select></div>
+      </div>
+      <p class="muted" style="margin-top:-4px;font-size:12px">Set a numeric unit price to let buyers pay online via PayPal when ordering; leave it empty and orders arrive as purchase inquiries you settle manually.</p>
       <label>Description</label>
       <textarea name="description" rows="5" maxlength="${PRODUCT_DESC_MAX}" placeholder="Specifications, packaging, certifications, lead time, export experience…"></textarea>
       <label>Photos (up to ${PRODUCT_MAX_PHOTOS} — PNG, JPG, WebP or GIF, max 5 MB each)</label>
@@ -5885,10 +6716,16 @@ app.post('/products/new', requireCompany, rateLimitRoute('product-new', 20, 60 *
   const moq = String(req.body.moq || '').trim().slice(0, PRODUCT_FIELD_MAX);
   const priceText = String(req.body.price_text || '').trim().slice(0, PRODUCT_FIELD_MAX);
   const description = String(req.body.description || '').trim().slice(0, PRODUCT_DESC_MAX);
+  const audience = String(req.body.audience || '') === 'everyone' ? 'everyone' : 'companies';
+  // Optional structured price: a non-negative number enables online (PayPal) ordering; empty stays quote-only.
+  const priceAmountRaw = String(req.body.price_amount || '').trim();
+  const priceAmountNum = parseFloat(priceAmountRaw);
+  const priceAmount = priceAmountRaw !== '' && isFinite(priceAmountNum) && priceAmountNum >= 0 && priceAmountNum <= 100000000 ? Math.round(priceAmountNum * 100) / 100 : null;
+  const priceCurrency = DEAL_CURRENCIES.includes(req.body.price_currency) ? req.body.price_currency : 'USD';
   if (!title) return res.redirect('/products/new?err=' + encodeURIComponent('Give your product a name.'));
 
-  const info = db.prepare('INSERT INTO products (company_id, title, description, category, price_text, moq, status, created_at) VALUES (?,?,?,?,?,?,?,?)')
-    .run(req.user.id, title, description, category, priceText, moq, 'active', now());
+  const info = db.prepare('INSERT INTO products (company_id, title, description, category, price_text, moq, audience, price_amount, price_currency, status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+    .run(req.user.id, title, description, category, priceText, moq, audience, priceAmount, priceCurrency, 'active', now());
   const pid = info.lastInsertRowid;
   (req.files || []).slice(0, PRODUCT_MAX_PHOTOS).forEach((f, i) => {
     const mid = saveMedia(req.user.id, f);
@@ -5899,10 +6736,14 @@ app.post('/products/new', requireCompany, rateLimitRoute('product-new', 20, 60 *
 });
 
 // ----- Product detail -----
-app.get('/product/:id', requireCompanyOrAdmin, (req, res) => {
+app.get('/product/:id', requireViewer, (req, res) => {
   const p = db.prepare('SELECT * FROM products WHERE id = ?').get(parseInt(req.params.id, 10));
-  if (!p || p.status !== 'active' && !(req.user.isAdmin || (req.user.id === p.company_id))) {
+  if (!p || p.status !== 'active' && !(req.user.isAdmin || (!req.user.isPerson && req.user.id === p.company_id))) {
     return res.redirect('/products?err=' + encodeURIComponent('Product not found.'));
+  }
+  // Persons only see listings the seller opened to individual buyers.
+  if (req.user.isPerson && p.audience !== 'everyone') {
+    return res.redirect('/products?err=' + encodeURIComponent('This listing is for registered companies only.'));
   }
   const seller = db.prepare(`SELECT * FROM companies WHERE id = ? AND status = 'approved'`).get(p.company_id);
   const names = companyNameMap();
@@ -5911,7 +6752,8 @@ app.get('/product/:id', requireCompanyOrAdmin, (req, res) => {
     ? `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;margin-bottom:14px">` +
       photos.map(mid => `<img src="/media/${mid}" alt="${esc(p.title)} photo" style="width:100%;max-height:300px;object-fit:cover;border-radius:12px;border:1px solid var(--border-soft)">`).join('') + `</div>`
     : '';
-  const mine = req.user && !req.user.isAdmin && req.user.id === p.company_id;
+  const isPersonViewer = !!(req.user && req.user.isPerson);
+  const mine = req.user && !req.user.isAdmin && !req.user.isPerson && req.user.id === p.company_id;
   const canManage = mine || (req.user && req.user.isAdmin);
 
   const manageHtml = canManage ? `
@@ -5923,11 +6765,29 @@ app.get('/product/:id', requireCompanyOrAdmin, (req, res) => {
       </div>
     </div>` : '';
 
-  const chatForm = (!mine && seller) ? `
+  const chatForm = (!mine && !isPersonViewer && seller) ? `
     <form method="POST" action="/chats/private" style="display:inline">
       <input type="hidden" name="company_id" value="${p.company_id}">
       <button class="btn" type="submit">💬 Chat with ${esc(seller.name)}</button>
     </form>` : '';
+
+  // ----- Order card: persons & companies (never the seller or the admin) can order 'everyone' listings -----
+  const moqNum = parseMoqNumber(p.moq);
+  const canOrder = !!(req.user && !req.user.isAdmin && !mine && seller && p.status === 'active' && p.audience === 'everyone');
+  const orderCardHtml = canOrder ? `
+  <div class="card" style="border-color:var(--border-gold)">
+    <div class="kicker">🛒 Order this product</div>
+    <form method="POST" action="/product/${p.id}/order" style="margin-top:8px;display:flex;gap:10px;flex-wrap:wrap;align-items:end">
+      <div style="max-width:170px"><label>Quantity${moqNum ? ` (MOQ: ${moqNum})` : ''}</label>
+        <input type="number" name="qty" value="${moqNum || 1}" min="${moqNum || 1}" step="1" required></div>
+      <button class="btn" type="submit">${p.price_amount != null && paypalConfigured() ? '🛒 Order & pay with PayPal' : '📨 Send order request'}</button>
+    </form>
+    <p class="muted" style="margin-top:8px;font-size:12px">
+      ${p.price_amount != null
+        ? `Unit price <b style="color:var(--gold)">${fmtAmount(p.price_amount)} ${esc(p.price_currency || 'USD')}</b> — your total is unit price × quantity, calculated at checkout.${paypalConfigured() ? '' : ' Online payment is temporarily unavailable, so your order goes to the seller as a request.'}`
+        : 'No fixed online price — your order is sent to the seller as a purchase inquiry and payment is arranged directly.'}
+    </p>
+  </div>` : '';
 
   const body = `
   <div class="feed-head" style="margin-bottom:10px">
@@ -5941,15 +6801,18 @@ app.get('/product/:id', requireCompanyOrAdmin, (req, res) => {
     ${gallery}
     <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
       ${p.price_text ? `<span style="color:var(--gold);font-weight:700;font-size:18px">${esc(p.price_text)}</span>` : ''}
+      ${p.price_amount != null ? `<span class="hint-chip" style="font-size:13px">💲 ${fmtAmount(p.price_amount)} ${esc(p.price_currency || 'USD')} / unit</span>` : ''}
       ${p.moq ? `<span class="hint-chip" style="font-size:13px">Minimum order: ${esc(p.moq)}</span>` : ''}
       ${p.category ? `<span class="hint-chip" style="font-size:13px">${esc(p.category)}</span>` : ''}
+      ${p.audience === 'everyone' ? `<span class="hint-chip" style="font-size:13px">👤 Persons welcome</span>` : ''}
     </div>
     ${p.description ? `<p style="white-space:pre-wrap;line-height:1.6">${esc(p.description)}</p>` : '<p class="muted">No description provided.</p>'}
     <p class="muted" style="margin-top:10px;font-size:12px">Listed ${esc(p.created_at.slice(0, 10))}</p>
   </div>
+  ${orderCardHtml}
   ${seller ? `<div class="card">
     <div class="kicker">Sold by</div>
-    <div class="feed-head"><h3 style="margin:6px 0">${avatarHtml(seller.name, seller.avatar_media_id)}${esc(seller.name)}</h3>${followButton(req.user, seller.id)}</div>
+    <div class="feed-head"><h3 style="margin:6px 0">${avatarHtml(seller.name, seller.avatar_media_id)}${esc(seller.name)}</h3>${isPersonViewer ? '' : followButton(req.user, seller.id)}</div>
     <p style="margin:4px 0">${starsHtml(seller.reputation)}</p>
     <div class="btn-row" style="margin-top:10px">
       ${chatForm}
@@ -5989,6 +6852,308 @@ app.post('/product/:id/delete', requireCompanyOrAdmin, (req, res) => {
   res.redirect('/products?msg=' + encodeURIComponent('Product deleted.'));
 });
 
+// ============================= PAYPAL ORDERS (product checkout) =============================
+/* Server-side PayPal REST integration (redirect flow — no JS SDK, no CSP changes, credentials
+ * never leave the server). Persons and companies can ORDER products flagged audience='everyone'.
+ * When the listing has a numeric price_amount AND PayPal is configured, the buyer is redirected
+ * to PayPal to pay; otherwise the order is stored as a 'requested' purchase inquiry and the
+ * seller arranges payment manually.
+ * Order state machine:
+ *   requested         — inquiry only (no numeric price, or PayPal unavailable/failed). Terminal here.
+ *   awaiting_payment  — PayPal order created; only way to 'paid' is a successful capture.
+ *   paid              — /paypal/return captured the payment (awaiting_payment → paid ONLY).
+ *   cancelled         — buyer aborted on the PayPal side (/paypal/cancel). */
+const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || '';
+const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET || '';
+const PAYPAL_ENV = String(process.env.PAYPAL_ENV || 'sandbox').toLowerCase() === 'live' ? 'live' : 'sandbox';
+const PAYPAL_API_BASE = PAYPAL_ENV === 'live' ? 'https://api-m.paypal.com' : 'https://api-m.sandbox.paypal.com';
+/** True only when BOTH credentials are set — every PayPal call is skipped (quote-only flow) otherwise. */
+function paypalConfigured() { return !!(PAYPAL_CLIENT_ID && PAYPAL_CLIENT_SECRET); }
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS product_orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  product_id INTEGER NOT NULL,
+  buyer_person_id INTEGER,          -- set when buyer is a person
+  buyer_company_id INTEGER,         -- set when buyer is a company
+  seller_company_id INTEGER NOT NULL,
+  qty INTEGER NOT NULL DEFAULT 1,
+  unit_price TEXT NOT NULL,         -- snapshot of price_text at order time
+  total_amount REAL,                -- NULL when price not numeric
+  currency TEXT DEFAULT 'USD',
+  paypal_order_id TEXT DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'requested',  -- requested | awaiting_payment | paid | cancelled
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_product_orders_product ON product_orders(product_id);
+CREATE INDEX IF NOT EXISTS idx_product_orders_buyer_person ON product_orders(buyer_person_id);
+CREATE INDEX IF NOT EXISTS idx_product_orders_buyer_company ON product_orders(buyer_company_id);
+`);
+
+/** Authenticated PayPal API call with an 8s timeout. THROWS on any failure — routes always wrap in try/catch. */
+async function paypalApi(pathname, { token = null, body = undefined, basicAuth = false } = {}) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => { try { ctrl.abort(); } catch (e) { /* settled */ } }, 8000);
+  try {
+    const headers = { 'Accept': 'application/json' };
+    if (basicAuth) headers['Authorization'] = 'Basic ' + Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64');
+    else if (token) headers['Authorization'] = `Bearer ${token}`;
+    let payload;
+    if (typeof body === 'string') { headers['Content-Type'] = 'application/x-www-form-urlencoded'; payload = body; }
+    else if (body !== undefined) { headers['Content-Type'] = 'application/json'; payload = JSON.stringify(body); }
+    const resp = await fetch(PAYPAL_API_BASE + pathname, { method: 'POST', headers, body: payload, signal: ctrl.signal });
+    const data = await resp.json().catch(() => null);
+    if (!resp.ok) throw new Error(`PayPal API HTTP ${resp.status} on ${pathname}`);
+    return data;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+/** OAuth client-credentials token. Throws on failure. */
+async function paypalToken() {
+  const data = await paypalApi('/v1/oauth2/token', { basicAuth: true, body: 'grant_type=client_credentials' });
+  if (!data || !data.access_token) throw new Error('PayPal auth returned no access token');
+  return data.access_token;
+}
+/** Create a CAPTURE order; returns { id, approveLink } (approval URL the buyer is redirected to). */
+async function paypalCreateOrder(amount, currency, returnUrl, cancelUrl) {
+  const token = await paypalToken();
+  const data = await paypalApi('/v2/checkout/orders', { token, body: {
+    intent: 'CAPTURE',
+    purchase_units: [{ amount: { currency_code: String(currency || 'USD'), value: Number(amount).toFixed(2) } }],
+    application_context: { return_url: returnUrl, cancel_url: cancelUrl, user_action: 'PAY_NOW' }
+  }});
+  const links = data && Array.isArray(data.links) ? data.links : [];
+  const approve = links.find(l => l && (l.rel === 'approve' || l.rel === 'payer-action') && l.href);
+  if (!data || !data.id || !approve) throw new Error('PayPal order created without an approval link');
+  return { id: String(data.id), approveLink: String(approve.href) };
+}
+/** Capture an approved order; returns { status, payerEmail }. */
+async function paypalCapture(orderId) {
+  const token = await paypalToken();
+  const data = await paypalApi(`/v2/checkout/orders/${encodeURIComponent(orderId)}/capture`, { token, body: {} });
+  const status = String((data && data.status) || '');
+  const payerEmail = data && data.payer && data.payer.email_address ? String(data.payer.email_address) : '';
+  return { status, payerEmail };
+}
+
+/** Leading integer of a free-text MOQ ("10 units" → 10); null when not parseable. */
+function parseMoqNumber(moq) {
+  const m = String(moq || '').match(/^\s*(\d{1,9})/);
+  return m ? parseInt(m[1], 10) : null;
+}
+/** Badge for order statuses, mapped onto the existing badge styles. */
+function orderStatusBadge(status) {
+  const cls = { requested: 'pending', awaiting_payment: 'sealed', paid: 'approved', cancelled: 'rejected' }[status] || 'pending';
+  return `<span class="badge badge-${cls}">${esc(String(status || '').replace(/_/g, ' '))}</span>`;
+}
+/** Where a buyer's order list lives, by session type. */
+function buyerOrdersPath(user) { return user && user.isPerson ? '/my/orders' : '/orders'; }
+/** True when this session user is the buyer of the order row. */
+function isOrderBuyer(user, o) {
+  if (!user || user.isAdmin || !o) return false;
+  if (user.isPerson) return o.buyer_person_id === user.id;
+  return o.buyer_company_id === user.id;
+}
+/** Display name of an order's buyer (person or company). */
+function orderBuyerName(o, names) {
+  if (o.buyer_person_id) {
+    const p = db.prepare('SELECT name FROM persons WHERE id = ?').get(o.buyer_person_id);
+    return `${p ? p.name : 'Person #' + o.buyer_person_id} (individual buyer)`;
+  }
+  return names.get(o.buyer_company_id) || `Company #${o.buyer_company_id}`;
+}
+/** Order total cell: computed amount when numeric, else the free-text price snapshot. */
+function orderTotalHtml(o) {
+  return o.total_amount != null
+    ? `<b style="color:var(--gold)">${fmtAmount(o.total_amount)} ${esc(o.currency || 'USD')}</b>`
+    : `<span class="muted">${esc(o.unit_price || 'price on request')}</span>`;
+}
+/** Shared orders table. opts: showBuyer (seller view), showSeller (buyer view), payNow (buyer session user). */
+function ordersTableHtml(orders, names, opts) {
+  opts = opts || {};
+  if (!orders.length) return '<p class="muted">No orders yet.</p>';
+  const rows = orders.map(o => {
+    const prod = db.prepare('SELECT id, title FROM products WHERE id = ?').get(o.product_id);
+    const payNow = opts.payNow && o.status === 'awaiting_payment' && isOrderBuyer(opts.payNow, o) && paypalConfigured()
+      ? `<form method="POST" action="/order/${o.id}/pay" style="display:inline"><button class="btn btn-sm btn-green" type="submit">💳 Pay now</button></form>`
+      : '';
+    return `<tr>
+      <td><a href="/product/${o.product_id}">${esc(prod ? prod.title : '(product removed)')}</a></td>
+      ${opts.showBuyer ? `<td>${esc(orderBuyerName(o, names))}</td>` : ''}
+      ${opts.showSeller ? `<td><a href="/company/${o.seller_company_id}">${esc(names.get(o.seller_company_id) || 'Company')}</a></td>` : ''}
+      <td>${o.qty}</td>
+      <td>${orderTotalHtml(o)}</td>
+      <td>${orderStatusBadge(o.status)}</td>
+      <td class="muted" style="white-space:nowrap">${esc(o.created_at.slice(0, 16).replace('T', ' '))}</td>
+      <td>${payNow}</td>
+    </tr>`;
+  }).join('');
+  return `<div class="card" style="overflow-x:auto"><table><thead><tr>
+    <th>Product</th>${opts.showBuyer ? '<th>Buyer</th>' : ''}${opts.showSeller ? '<th>Seller</th>' : ''}<th>Qty</th><th>Total</th><th>Status</th><th>Placed (UTC)</th><th></th>
+  </tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+// ----- Place an order (person or company; never the seller/admin) -----
+app.post('/product/:id/order', requireViewer, rateLimitRoute('product-order', 20, 60 * 60 * 1000, '/products'), ah(async (req, res) => {
+  const pid = parseInt(req.params.id, 10);
+  const failBack = (msg) => res.redirect(`/product/${pid || ''}?err=` + encodeURIComponent(msg));
+  try {
+    const p = db.prepare('SELECT * FROM products WHERE id = ?').get(pid);
+    if (!p || p.status !== 'active') return res.redirect('/products?err=' + encodeURIComponent('Product not found.'));
+    if (p.audience !== 'everyone') {
+      audit('ORDER AGENT', 'order audience guard', 'fail', `${req.user.name} tried to order companies-only product #${p.id}`);
+      return failBack('This listing is for registered companies only — open a chat or deal with the seller instead.');
+    }
+    if (req.user.isAdmin) return failBack('Admin sessions cannot place orders.');
+    if (!req.user.isPerson && req.user.id === p.company_id) return failBack('You cannot order your own product.');
+    const seller = db.prepare(`SELECT id FROM companies WHERE id = ? AND status = 'approved'`).get(p.company_id);
+    if (!seller) return failBack('The seller is not available right now.');
+
+    const moqNum = parseMoqNumber(p.moq);
+    const qty = parseInt(String(req.body.qty || ''), 10);
+    if (!Number.isInteger(qty) || qty < 1) return failBack('Enter a valid quantity (at least 1).');
+    if (qty > 1000000) return failBack('That quantity is too large for an online order — open a chat with the seller instead.');
+    if (moqNum && qty < moqNum) return failBack(`This product has a minimum order quantity of ${moqNum} — increase your quantity.`);
+
+    // Amounts are NEVER taken from the client: the total is computed here from the stored price × qty.
+    const currency = p.price_currency || 'USD';
+    const total = p.price_amount != null ? Math.round(p.price_amount * qty * 100) / 100 : null;
+    const info = db.prepare(`INSERT INTO product_orders
+      (product_id, buyer_person_id, buyer_company_id, seller_company_id, qty, unit_price, total_amount, currency, paypal_order_id, status, created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(p.id, req.user.isPerson ? req.user.id : null, req.user.isPerson ? null : req.user.id, p.company_id,
+        qty, p.price_text || '', total, currency, '', 'requested', now());
+    const orderId = info.lastInsertRowid;
+    const home = buyerOrdersPath(req.user);
+    const buyerLabel = req.user.isPerson ? `${req.user.name} (individual buyer)` : req.user.name;
+
+    // Online payment only when the listing has a numeric price AND PayPal credentials are configured.
+    if (total != null && paypalConfigured()) {
+      try {
+        const base = `${req.protocol}://${req.get('host')}`;
+        const pp = await paypalCreateOrder(total, currency, `${base}/paypal/return`, `${base}/paypal/cancel`);
+        db.prepare(`UPDATE product_orders SET paypal_order_id = ?, status = 'awaiting_payment' WHERE id = ? AND status = 'requested'`).run(pp.id, orderId);
+        audit('PAYMENT AGENT', 'order created', 'pass', `Order #${orderId} (product #${p.id} ×${qty}) by ${buyerLabel} — PayPal order ${pp.id}, total ${total} ${currency}`);
+        return res.redirect(pp.approveLink);
+      } catch (e) {
+        // PayPal unreachable/rejected — the inquiry still stands; the seller arranges payment manually.
+        audit('PAYMENT AGENT', 'paypal create order', 'fail', `Order #${orderId}: ${String((e && e.message) || e).slice(0, 200)}`);
+        notify(p.company_id, 'order_request', `New order request for "${p.title.slice(0, 60)}" ×${qty} from ${buyerLabel} (online payment failed to start — arrange payment directly).`, '/orders');
+        return res.redirect(home + '?err=' + encodeURIComponent('We could not start PayPal checkout right now, so your order was sent to the seller as a request. They will arrange payment with you.'));
+      }
+    }
+
+    notify(p.company_id, 'order_request', `New order request for "${p.title.slice(0, 60)}" ×${qty} from ${buyerLabel}${total != null ? ` — total ${fmtAmount(total)} ${currency}` : ''}.`, '/orders');
+    audit('ORDER AGENT', 'order requested', 'pass', `Order #${orderId} (product #${p.id} "${p.title.slice(0, 50)}" ×${qty}) by ${buyerLabel} → seller #${p.company_id}${total != null ? `, total ${total} ${currency}` : ' (quote-only)'}`);
+    res.redirect(home + '?msg=' + encodeURIComponent('Order request sent — the seller has been notified and will arrange payment with you.'));
+  } catch (e) {
+    audit('ORDER AGENT', 'order placement', 'fail', `${req.user && req.user.name}: ${String((e && e.message) || e).slice(0, 200)}`);
+    res.redirect(buyerOrdersPath(req.user) + '?err=' + encodeURIComponent('Your order could not be placed. Please try again.'));
+  }
+}));
+
+// ----- PayPal redirects back (buyer owns the order; capture is the ONLY path to 'paid') -----
+app.get('/paypal/return', requireViewer, ah(async (req, res) => {
+  const token = String(req.query.token || '').slice(0, 80);
+  const home = buyerOrdersPath(req.user);
+  const order = token ? db.prepare('SELECT * FROM product_orders WHERE paypal_order_id = ?').get(token) : null;
+  if (!order || !isOrderBuyer(req.user, order) || order.status !== 'awaiting_payment') {
+    if (order) audit('PAYMENT AGENT', 'paypal return guard', 'fail', `Rejected PayPal return for order #${order.id} (status ${order.status}) by ${req.user.name}`);
+    return res.redirect(home + '?err=' + encodeURIComponent('That payment session is no longer valid.'));
+  }
+  try {
+    const cap = await paypalCapture(order.paypal_order_id);
+    if (cap.status === 'COMPLETED') {
+      db.prepare(`UPDATE product_orders SET status = 'paid' WHERE id = ? AND status = 'awaiting_payment'`).run(order.id);
+      const prod = db.prepare('SELECT title FROM products WHERE id = ?').get(order.product_id);
+      notify(order.seller_company_id, 'order_paid', `💰 PAID order #${order.id}: "${prod ? prod.title.slice(0, 60) : 'product'}" ×${order.qty} — ${order.total_amount != null ? fmtAmount(order.total_amount) + ' ' + order.currency : 'amount on file'}${cap.payerEmail ? ` (payer ${cap.payerEmail})` : ''}.`, '/orders');
+      audit('PAYMENT AGENT', 'order captured', 'pass', `Order #${order.id} captured via PayPal (${order.paypal_order_id}) — ${order.total_amount != null ? order.total_amount + ' ' + order.currency : 'quote'}${cap.payerEmail ? `, payer ${cap.payerEmail}` : ''}`);
+      return res.redirect(home + '?msg=' + encodeURIComponent('Payment received — thank you! The seller has been notified.'));
+    }
+    audit('PAYMENT AGENT', 'order capture', 'fail', `Order #${order.id}: PayPal capture status "${cap.status || 'unknown'}"`);
+    return res.redirect(home + '?err=' + encodeURIComponent('PayPal did not complete the payment. You can try again from your orders page.'));
+  } catch (e) {
+    audit('PAYMENT AGENT', 'order capture', 'fail', `Order #${order.id}: ${String((e && e.message) || e).slice(0, 200)}`);
+    return res.redirect(home + '?err=' + encodeURIComponent('We could not confirm the payment with PayPal. If you were charged, contact support; otherwise try again from your orders page.'));
+  }
+}));
+
+app.get('/paypal/cancel', requireViewer, (req, res) => {
+  const token = String(req.query.token || '').slice(0, 80);
+  const home = buyerOrdersPath(req.user);
+  const order = token ? db.prepare('SELECT * FROM product_orders WHERE paypal_order_id = ?').get(token) : null;
+  if (order && isOrderBuyer(req.user, order) && order.status === 'awaiting_payment') {
+    db.prepare(`UPDATE product_orders SET status = 'cancelled' WHERE id = ? AND status = 'awaiting_payment'`).run(order.id);
+    audit('PAYMENT AGENT', 'order cancelled', 'pass', `Order #${order.id} cancelled at PayPal checkout by the buyer`);
+    return res.redirect(home + '?msg=' + encodeURIComponent('Payment cancelled — no charge was made.'));
+  }
+  res.redirect(home + '?err=' + encodeURIComponent('That payment session is no longer valid.'));
+});
+
+// ----- "Pay now": regenerate a FRESH PayPal order for an awaiting_payment row (avoids stale links) -----
+app.post('/order/:id/pay', requireViewer, rateLimitRoute('order-pay', 20, 60 * 60 * 1000, null), ah(async (req, res) => {
+  const home = buyerOrdersPath(req.user);
+  try {
+    const order = db.prepare('SELECT * FROM product_orders WHERE id = ?').get(parseInt(req.params.id, 10));
+    if (!order || !isOrderBuyer(req.user, order)) {
+      audit('PAYMENT AGENT', 'pay-now guard', 'fail', `${req.user.name} tried to pay order #${req.params.id} they do not own`);
+      return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Not your order</h2><p class="muted">Only the buyer can pay for an order.</p></div>', req.user));
+    }
+    if (order.status !== 'awaiting_payment' || order.total_amount == null) {
+      return res.redirect(home + '?err=' + encodeURIComponent('This order is not awaiting online payment.'));
+    }
+    if (!paypalConfigured()) return res.redirect(home + '?err=' + encodeURIComponent('Online payment is not configured right now — the seller will arrange payment with you.'));
+    const base = `${req.protocol}://${req.get('host')}`;
+    const pp = await paypalCreateOrder(order.total_amount, order.currency, `${base}/paypal/return`, `${base}/paypal/cancel`);
+    db.prepare(`UPDATE product_orders SET paypal_order_id = ? WHERE id = ? AND status = 'awaiting_payment'`).run(pp.id, order.id);
+    audit('PAYMENT AGENT', 'pay-now link refreshed', 'pass', `Order #${order.id}: new PayPal order ${pp.id} issued to ${req.user.name}`);
+    res.redirect(pp.approveLink);
+  } catch (e) {
+    audit('PAYMENT AGENT', 'pay-now', 'fail', `Order #${req.params.id}: ${String((e && e.message) || e).slice(0, 200)}`);
+    res.redirect(home + '?err=' + encodeURIComponent('We could not start PayPal checkout right now. Please try again in a moment.'));
+  }
+}));
+
+// ----- Company orders: purchases I placed + sales on my products -----
+app.get('/orders', requireCompany, (req, res) => {
+  const names = companyNameMap();
+  const placed = db.prepare('SELECT * FROM product_orders WHERE buyer_company_id = ? ORDER BY id DESC LIMIT 200').all(req.user.id);
+  const incoming = db.prepare('SELECT * FROM product_orders WHERE seller_company_id = ? ORDER BY id DESC LIMIT 200').all(req.user.id);
+  const body = `
+  <div class="feed-head" style="margin-bottom:10px">
+    <div>
+      <div class="kicker">Product orders</div>
+      <h1 style="font-size:1.75rem;margin-top:4px">🧾 Orders</h1>
+    </div>
+    <a class="btn btn-sm btn-outline" href="/products">← Catalog</a>
+  </div>
+  <h2 class="sec-h">📥 Orders for my products (${incoming.length})</h2>
+  <p class="muted" style="margin:-6px 0 10px">Buyers' requests and paid orders on your listings. "Requested" orders are inquiries — contact the buyer to arrange payment; "paid" orders were settled via PayPal.</p>
+  ${ordersTableHtml(incoming, names, { showBuyer: true })}
+  <h2 class="sec-h" style="margin-top:18px">📤 Orders I placed (${placed.length})</h2>
+  ${ordersTableHtml(placed, names, { showSeller: true, payNow: req.user })}`;
+  res.send(page('Orders', body, req.user, req.query.msg, req.query.err, 'box'));
+});
+
+// ----- Admin: every product order on the platform -----
+app.get('/admin/orders', requireAdmin, (req, res) => {
+  const names = companyNameMap();
+  const orders = db.prepare('SELECT * FROM product_orders ORDER BY id DESC LIMIT 500').all();
+  const configured = paypalConfigured();
+  const body = `
+  <div class="feed-head" style="margin-bottom:10px">
+    <div>
+      <div class="kicker">Admin · product orders</div>
+      <h1 style="font-size:1.75rem;margin-top:4px">🧾 Product orders (${orders.length})</h1>
+    </div>
+    <a class="btn btn-sm btn-outline" href="/admin/dashboard">← Dashboard</a>
+  </div>
+  <p class="muted" style="margin-bottom:12px">PayPal checkout is <b>${configured ? `configured (${PAYPAL_ENV})` : 'NOT configured'}</b> — orders ${configured ? 'with a numeric price go through PayPal capture' : 'are recorded as seller-handled requests'}.</p>
+  ${ordersTableHtml(orders, names, { showBuyer: true, showSeller: true })}`;
+  res.send(page('Product orders', body, req.user, req.query.msg, req.query.err));
+});
+
 // ============================= CONTRACT ROUTES =============================
 /** Standard B2B terms clauses shown on every contract. Clause 10 reflects the live platform commission. */
 function contractClauses() {
@@ -6019,16 +7184,46 @@ function latestContract(dealId) {
   return db.prepare('SELECT * FROM contracts WHERE deal_id = ? ORDER BY id DESC LIMIT 1').get(dealId);
 }
 
+// ----- SHIPPING TENDERS: once a deal is closed, Logistics companies bid to ship it -----
+db.exec(`
+CREATE TABLE IF NOT EXISTS shipping_bids (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  deal_id INTEGER NOT NULL,
+  company_id INTEGER NOT NULL,        -- the bidding shipping company
+  amount_text TEXT NOT NULL,          -- e.g. "USD 4,500 all-in" (free text, ≤120)
+  transit_days TEXT DEFAULT '',       -- e.g. "12–14 days"
+  note TEXT DEFAULT '',               -- ≤500
+  status TEXT NOT NULL DEFAULT 'pending',  -- pending | accepted | rejected | withdrawn
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_shipping_bids_deal ON shipping_bids(deal_id, status);
+`);
+/** Eligibility: an approved company in the Logistics category may bid to ship closed deals.
+ *  shipping_type is optional here — existing Logistics companies are grandfathered (it is
+ *  required only for NEW registrations). */
+function isShippingCompany(user) {
+  if (!user || user.isAdmin || user.isPerson) return false;
+  const c = db.prepare('SELECT category FROM companies WHERE id = ?').get(user.id);
+  return !!c && c.category === 'Logistics';
+}
+/** A deal counts as closed once the contract is finalized (approved) or the status says so. */
+function dealIsClosed(deal) { return !!deal && (deal.contract_state === 'approved' || deal.status === 'closed'); }
+/** Short route line for bid cards: "Jebel Ali → Rotterdam · CIF". Never leaks deal value fields. */
+function dealRouteLine(deal) {
+  return `📍 ${esc(deal.origin || 'Origin TBD')} → ${esc(deal.destination || 'Destination TBD')} · ⚓ ${esc(deal.incoterm || 'CIF')}`;
+}
+
 // ----- Deal detail page: shows deal + contract status (visible to both parties and the admin) -----
 function requireCompanyOrAdmin(req, res, next) {
   const user = currentUser(req);
   if (!user) return res.redirect('/login?err=' + encodeURIComponent('Please sign in.'));
+  if (user.isPerson) return res.redirect('/products?err=' + encodeURIComponent('That area is for registered companies. Individual buyers can browse and order products.'));
   req.user = user;
   next();
 }
 /** True when the user may view deal_documents for this deal: owner, a requesting company, the contracted buyer, or admin. */
 function canViewDealDocs(user, deal) {
-  if (!user || !deal) return false;
+  if (!user || !deal || user.isPerson) return false;
   if (user.isAdmin) return true;
   if (user.id === deal.company_id) return true;
   if (dealBuyerId(deal) === user.id) return true;
@@ -6038,7 +7233,7 @@ function canViewDealDocs(user, deal) {
  *  with a negotiation row on the deal (any state), the contracted party, or the admin. Everyone else
  *  sees "value shared privately" — values are only exchanged inside the negotiation. */
 function canViewDealTerms(user, deal) {
-  if (!user || !deal) return false;
+  if (!user || !deal || user.isPerson) return false;
   if (user.isAdmin) return true;
   if (user.id === deal.company_id) return true;
   if (dealBuyerId(deal) === user.id) return true;
@@ -6288,6 +7483,69 @@ app.get('/deal/:id', requireCompanyOrAdmin, ah(async (req, res) => {
     </div>`;
   }
 
+  // ---- 🚢 Shipping bids (closed deals only): Logistics companies bid to ship; the deal parties accept ONE bid.
+  // Bidders see the route/incoterm/title only — deal value fields are never rendered here. ----
+  let shipHtml = '';
+  if (dealIsClosed(deal)) {
+    const route = dealRouteLine(deal);
+    if (isOwner || isBuyer || req.user.isAdmin) {
+      const bids = db.prepare(`SELECT b.*, c.name AS bidder_name, c.shipping_type AS bidder_shipping_type
+        FROM shipping_bids b JOIN companies c ON c.id = b.company_id
+        WHERE b.deal_id = ? ORDER BY b.created_at DESC LIMIT 50`).all(deal.id);
+      const hasAccepted = bids.some((x) => x.status === 'accepted');
+      const bidList = bids.length ? bids.map((x) => `
+        <div style="padding:8px 0;border-top:1px dashed var(--border-soft)">
+          <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center">
+            <div>
+              <a href="/company/${x.company_id}"><b>${esc(x.bidder_name)}</b></a>
+              ${x.bidder_shipping_type ? `<span class="chip" title="Shipping type">🚢 ${esc(x.bidder_shipping_type)}</span>` : ''}<br>
+              <b>${esc(x.amount_text)}</b>${x.transit_days ? ` · ⏱️ ${esc(x.transit_days)}` : ''}${x.note ? `<br><span class="muted">“${esc(x.note)}”</span>` : ''}<br>
+              <span class="muted">${esc(x.created_at.slice(0, 16).replace('T', ' '))} UTC</span>
+            </div>
+            <div style="text-align:right">
+              ${x.status === 'accepted' ? '<span class="badge badge-approved">ACCEPTED ✅</span>'
+                : x.status === 'rejected' ? '<span class="badge badge-rejected">Not selected</span>'
+                : x.status === 'withdrawn' ? '<span class="badge">Withdrawn</span>'
+                : `<span class="badge badge-pending">Pending</span>${!hasAccepted && !req.user.isAdmin ? `
+                   <form method="POST" action="/deal/${deal.id}/ship-bid/${x.id}/accept" onsubmit="return confirm('Accept the shipping bid from ${esc(x.bidder_name)} (${esc(x.amount_text)})? All other pending bids will be rejected.');" style="margin-top:6px">
+                     <button class="btn btn-sm btn-green" type="submit">Accept bid ✅</button>
+                   </form>` : ''}`}
+            </div>
+          </div>
+        </div>`).join('') : '<p class="muted">No shipping bids yet — Logistics companies can bid from this page.</p>';
+      shipHtml = `<div class="card" data-reveal>
+        <h3>🚢 Shipping bids</h3>
+        <p class="muted" style="margin-bottom:6px">${route}</p>
+        ${hasAccepted ? '<p><span class="badge badge-contract">Shipping assigned ✓</span></p>' : ''}
+        ${bidList}
+      </div>`;
+    } else if (isShippingCompany(req.user)) {
+      const myBid = db.prepare(`SELECT * FROM shipping_bids WHERE deal_id = ? AND company_id = ? AND status IN ('pending','accepted') ORDER BY id DESC LIMIT 1`).get(deal.id, req.user.id);
+      const myBidHtml = myBid ? `
+        <p style="margin-top:8px">Your bid: <b>${esc(myBid.amount_text)}</b>${myBid.transit_days ? ` · ⏱️ ${esc(myBid.transit_days)}` : ''}
+          ${myBid.status === 'accepted' ? '<span class="badge badge-approved">ACCEPTED ✅ — you are shipping this deal!</span>' : '<span class="badge badge-pending">Pending — waiting for the deal parties</span>'}</p>
+        ${myBid.note ? `<p class="muted">“${esc(myBid.note)}”</p>` : ''}
+        ${myBid.status === 'pending' ? `
+        <form method="POST" action="/deal/${deal.id}/ship-bid/withdraw" onsubmit="return confirm('Withdraw your shipping bid? You can bid again later while the deal is unassigned.');">
+          <button class="btn btn-sm btn-outline" type="submit">Withdraw my bid</button>
+        </form>` : ''}` : `
+        <form method="POST" action="/deal/${deal.id}/ship-bid">
+          <label>Your price *</label><input type="text" name="amount_text" required maxlength="120" placeholder="e.g. USD 4,500 all-in">
+          <div class="grid2" style="gap:10px">
+            <div><label>Transit time (optional)</label><input type="text" name="transit_days" maxlength="60" placeholder="e.g. 12–14 days"></div>
+            <div><label>Note (optional)</label><input type="text" name="note" maxlength="500" placeholder="Vessel/flight details, insurance, handling…"></div>
+          </div>
+          <button class="btn" type="submit">Place shipping bid 🚢</button>
+          <p class="muted" style="margin-top:6px">The deal value stays private — you see the route and incoterm only. The deal owner or buyer accepts one bid.</p>
+        </form>`;
+      shipHtml = `<div class="card" data-reveal>
+        <h3>🚢 Bid to ship this deal</h3>
+        <p class="muted" style="margin-bottom:6px">${route}</p>
+        ${myBidHtml}
+      </div>`;
+    }
+  }
+
   const body = `
   <div class="card card-deal js-tilt">
     <div class="card__glare" aria-hidden="true"></div>
@@ -6311,6 +7569,7 @@ app.get('/deal/:id', requireCompanyOrAdmin, ah(async (req, res) => {
   ${paymentHtml}
   ${escrowPanelHtml(deal, req.user, isOwner, isBuyer)}
   ${statusHtml}
+  ${shipHtml}
   ${mapHtml}
   ${receivingAgentCardHtml(deal, req.user, isOwner, isBuyer)}
   ${proofHtml}
@@ -6323,12 +7582,15 @@ app.get('/deal/:id', requireCompanyOrAdmin, ah(async (req, res) => {
 app.post('/deal/:id/status', (req, res) => {
   const user = currentUser(req);
   if (!user) return res.redirect('/login?err=' + encodeURIComponent('Please sign in.'));
+  // Persons have no deal pipeline — their id space overlaps company ids, so they must never
+  // reach the party comparisons below.
+  if (user.isPerson) return res.redirect('/products?err=' + encodeURIComponent('That area is for registered companies.'));
   const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
   if (!deal) return res.redirect(user.isAdmin ? '/admin/dashboard' : '/timeline?err=' + encodeURIComponent('Deal not found.'));
   const back = user.isAdmin ? '/admin/dashboard' : `/deal/${deal.id}`;
-  const isOwner = !user.isAdmin && user.id === deal.company_id;
+  const isOwner = !user.isAdmin && !user.isPerson && user.id === deal.company_id;
   const buyerId = dealBuyerId(deal);
-  const isBuyer = !user.isAdmin && buyerId === user.id;
+  const isBuyer = !user.isAdmin && !user.isPerson && buyerId === user.id;
   if (!user.isAdmin && !isOwner && !isBuyer) {
     audit('DEAL AGENT', 'status update guard', 'fail', `${user.name} attempted to update status on deal #${deal.id} without being a party`);
     return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Parties only</h2><p class="muted">Only the deal owner, the contracted buyer and the admin can advance the deal status.</p></div>', user));
@@ -6400,6 +7662,86 @@ app.post('/deal/:id/status', (req, res) => {
   if (user.isAdmin || isBuyer) notify(deal.company_id, 'deal_status', label, `/deal/${deal.id}`);
   if (user.isAdmin || isOwner) { if (buyerId) notify(buyerId, 'deal_status', label, `/deal/${deal.id}`); }
   res.redirect(back + '?msg=' + encodeURIComponent(`Deal status updated to "${newStatus}".${stockMsg}`));
+});
+
+// ----- SHIPPING TENDERS: bid / accept / withdraw on closed deals -----
+/** POST /deal/:id/ship-bid — a Logistics company (not a deal party) bids to ship a closed deal. */
+app.post('/deal/:id/ship-bid', requireCompany, rateLimitRoute('ship-bid', 30, 60 * 60 * 1000, null), (req, res) => {
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!deal) return res.redirect('/tenders?err=' + encodeURIComponent('Deal not found.'));
+  const back = `/deal/${deal.id}`;
+  const dealNum = deal.deal_number || ('#' + deal.id);
+  if (!dealIsClosed(deal)) {
+    audit('TENDER AGENT', 'shipping bid guard', 'fail', `${req.user.name} tried to bid to ship deal ${dealNum} which is not closed`);
+    return res.redirect(back + '?err=' + encodeURIComponent('Shipping bids open once the deal is closed (contract finalized).'));
+  }
+  if (!isShippingCompany(req.user)) {
+    audit('TENDER AGENT', 'shipping bid guard', 'fail', `${req.user.name} tried to bid to ship deal ${dealNum} without being a Logistics company`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Shipping companies only</h2><p class="muted">Only companies registered in the Logistics category can bid to ship a deal.</p></div>', req.user));
+  }
+  const buyerId = dealBuyerId(deal);
+  if (req.user.id === deal.company_id || (buyerId && req.user.id === buyerId)) {
+    audit('TENDER AGENT', 'shipping bid guard', 'fail', `${req.user.name} tried to bid to ship their own deal ${dealNum}`);
+    return res.redirect(back + '?err=' + encodeURIComponent('Deal parties cannot bid to ship their own deal.'));
+  }
+  const existing = db.prepare(`SELECT id FROM shipping_bids WHERE deal_id = ? AND company_id = ? AND status = 'pending' LIMIT 1`).get(deal.id, req.user.id);
+  if (existing) return res.redirect(back + '?err=' + encodeURIComponent('You already have a pending bid on this deal — withdraw it first to re-bid.'));
+  const amountText = String(req.body.amount_text || '').trim().slice(0, 120);
+  if (!amountText) return res.redirect(back + '?err=' + encodeURIComponent('Your price is required (e.g. "USD 4,500 all-in").'));
+  const transitDays = String(req.body.transit_days || '').trim().slice(0, 60);
+  const note = String(req.body.note || '').trim().slice(0, 500);
+  db.prepare(`INSERT INTO shipping_bids (deal_id, company_id, amount_text, transit_days, note, status, created_at) VALUES (?,?,?,?,?, 'pending', ?)`)
+    .run(deal.id, req.user.id, amountText, transitDays, note, now());
+  audit('TENDER AGENT', 'shipping bid placed', 'pass', `${req.user.name} bid "${amountText}" to ship deal ${dealNum} (${deal.origin || '?'} → ${deal.destination || '?'})`);
+  notify(deal.company_id, 'shipping_bid', `🚢 New shipping bid on ${dealNum} ("${deal.title}") from ${req.user.name}: ${amountText}`, back);
+  if (buyerId && buyerId !== deal.company_id) notify(buyerId, 'shipping_bid', `🚢 New shipping bid on ${dealNum} ("${deal.title}") from ${req.user.name}: ${amountText}`, back);
+  res.redirect(back + '?msg=' + encodeURIComponent('Your shipping bid was placed — the deal parties have been notified.'));
+});
+
+/** POST /deal/:id/ship-bid/:bidId/accept — the deal owner or contracted buyer accepts ONE shipping bid. */
+app.post('/deal/:id/ship-bid/:bidId/accept', requireCompany, (req, res) => {
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!deal) return res.redirect('/tenders?err=' + encodeURIComponent('Deal not found.'));
+  const back = `/deal/${deal.id}`;
+  const dealNum = deal.deal_number || ('#' + deal.id);
+  const isOwner = req.user.id === deal.company_id;
+  const buyerId = dealBuyerId(deal);
+  const isBuyer = !!buyerId && buyerId === req.user.id;
+  if (!isOwner && !isBuyer) {
+    audit('TENDER AGENT', 'shipping bid accept guard', 'fail', `${req.user.name} tried to accept a shipping bid on deal ${dealNum} without being a party`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Parties only</h2><p class="muted">Only the deal owner or the contracted buyer can accept a shipping bid.</p></div>', req.user));
+  }
+  const bid = db.prepare('SELECT * FROM shipping_bids WHERE id = ? AND deal_id = ?').get(parseInt(req.params.bidId, 10), deal.id);
+  if (!bid) return res.redirect(back + '?err=' + encodeURIComponent('Shipping bid not found.'));
+  if (bid.status !== 'pending') return res.redirect(back + '?err=' + encodeURIComponent('That bid is no longer pending.'));
+  const already = db.prepare(`SELECT id FROM shipping_bids WHERE deal_id = ? AND status = 'accepted' LIMIT 1`).get(deal.id);
+  if (already) {
+    audit('TENDER AGENT', 'shipping bid accept guard', 'fail', `${req.user.name} tried to accept a second shipping bid on deal ${dealNum}`);
+    return res.redirect(back + '?err=' + encodeURIComponent('A shipping bid was already accepted for this deal.'));
+  }
+  const winner = db.prepare('SELECT name FROM companies WHERE id = ?').get(bid.company_id);
+  db.transaction(() => {
+    db.prepare(`UPDATE shipping_bids SET status = 'accepted' WHERE id = ?`).run(bid.id);
+    db.prepare(`UPDATE shipping_bids SET status = 'rejected' WHERE deal_id = ? AND status = 'pending'`).run(deal.id);
+  })();
+  audit('TENDER AGENT', 'shipping bid accepted', 'pass', `${req.user.name} accepted ${winner ? winner.name : '#' + bid.company_id}'s shipping bid ("${bid.amount_text}") on deal ${dealNum}`);
+  notify(bid.company_id, 'shipping_bid', `🎉 Your shipping bid on ${dealNum} ("${deal.title}") was accepted — you are shipping this deal!`, back);
+  res.redirect(back + '?msg=' + encodeURIComponent(`Shipping bid accepted — ${winner ? winner.name : 'the winner'} has been notified. All other pending bids were rejected.`));
+});
+
+/** POST /deal/:id/ship-bid/withdraw — the bidding company withdraws its own pending bid. */
+app.post('/deal/:id/ship-bid/withdraw', requireCompany, (req, res) => {
+  const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!deal) return res.redirect('/tenders?err=' + encodeURIComponent('Deal not found.'));
+  const back = `/deal/${deal.id}`;
+  const bid = db.prepare(`SELECT * FROM shipping_bids WHERE deal_id = ? AND company_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1`).get(deal.id, req.user.id);
+  if (!bid) {
+    audit('TENDER AGENT', 'shipping bid withdraw guard', 'fail', `${req.user.name} tried to withdraw a shipping bid on deal ${deal.deal_number || '#' + deal.id} without a pending bid`);
+    return res.redirect(back + '?err=' + encodeURIComponent('You have no pending shipping bid on this deal.'));
+  }
+  db.prepare(`UPDATE shipping_bids SET status = 'withdrawn' WHERE id = ?`).run(bid.id);
+  audit('TENDER AGENT', 'shipping bid withdrawn', 'pass', `${req.user.name} withdrew their shipping bid on deal ${deal.deal_number || '#' + deal.id}`);
+  res.redirect(back + '?msg=' + encodeURIComponent('Your shipping bid was withdrawn. You can bid again while the deal is unassigned.'));
 });
 
 // ----- POST /deal/:id/payment-confirm — a deal party confirms it sent its commission share (bank transfer) -----
@@ -6491,7 +7833,7 @@ app.get('/payments/:id/proof', (req, res) => {
   if (!user) return res.redirect('/login?err=' + encodeURIComponent('Please sign in.'));
   const p = db.prepare('SELECT * FROM commission_payments WHERE id = ?').get(parseInt(req.params.id, 10));
   if (!p || !p.proof_media_id) return res.status(404).send(page('Not found', '<div class="card"><h2>Payment proof not found</h2></div>', user));
-  if (!user.isAdmin && p.company_id !== user.id) {
+  if (!user.isAdmin && (user.isPerson || p.company_id !== user.id)) {
     audit('PAYMENT AGENT', 'proof download guard', 'fail', `Unauthorized proof download attempt on payment #${p.id} by ${user.name}`);
     return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Private payment proof</h2><p class="muted">Only the paying company and the admin can download this receipt.</p></div>', user));
   }
@@ -6899,6 +8241,9 @@ app.get('/deal/:id/contract/download', requireCompanyOrAdmin, (req, res) => {
 function canViewSigningRoom(req, deal, contract) {
   const user = currentUser(req);
   if (!user) return false;
+  // Persons are never deal parties — their id space overlaps company ids, so they may never
+  // enter a signing room (the pre-signing branch would otherwise let any logged-in person in).
+  if (user.isPerson) return false;
   if (user.isAdmin) return true;
   if (user.id === deal.company_id) return true;                    // deal owner
   if (contract) return user.id === contract.signer_company_id;     // after signing: signer only
@@ -7574,7 +8919,7 @@ function getNegotiation(id) {
 }
 /** True when the user is the buyer, the seller, or an admin. */
 function isNegParty(user, neg) {
-  if (!user || !neg) return false;
+  if (!user || !neg || user.isPerson) return false;   // buyer_id/seller_id are company ids; persons share the id space
   return user.isAdmin || user.id === neg.buyer_id || user.id === neg.seller_id;
 }
 /** Append an event to the negotiation timeline (drives the rounds view). */
@@ -8188,6 +9533,8 @@ function getPrivateContract(id) {
 }
 /** Privacy guard: only the sender, the recipient and the admin may view a private contract. */
 function canViewPrivateContract(user, pc) {
+  // Persons share the company id space — never let a person id match sender/recipient company ids.
+  if (user && user.isPerson) return false;
   return !!user && !!pc && (user.isAdmin || user.id === pc.sender_company_id || user.id === pc.recipient_company_id);
 }
 /** Platform-fee helpers for private contracts (HTML / plain-text variants) — dynamic commission. */
@@ -8643,10 +9990,10 @@ app.get('/media/:id', (req, res) => {
   const m = db.prepare('SELECT * FROM media WHERE id = ?').get(parseInt(req.params.id, 10));
   if (!m) return res.status(404).send(page('Not found', '<div class="card"><h2>Media not found</h2></div>', user));
   // IDOR fix: media used as a commission payment proof (sensitive PDF) is private —
-  // only the owning company or an admin may download it. All other media (avatars, post
-  // attachments, headers) stays visible to any logged-in user, by design.
+  // only the owning company or an admin may download it. Persons (individual buyers) can
+  // never access proofs — their id space overlaps company ids, so match only real companies.
   const proofUse = db.prepare('SELECT id, company_id FROM commission_payments WHERE proof_media_id = ?').get(m.id);
-  if (proofUse && !user.isAdmin && proofUse.company_id !== user.id) {
+  if (proofUse && !user.isAdmin && (user.isPerson || proofUse.company_id !== user.id)) {
     audit('DOCUMENT AGENT', 'media access', 'fail', `Unauthorized payment-proof media access attempt: media #${m.id} (payment #${proofUse.id}) by ${user.name}`);
     return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Private document</h2><p class="muted">Only the owning company and the admin can download this document.</p></div>', user));
   }
@@ -8663,7 +10010,7 @@ app.get('/documents/:id', (req, res) => {
   if (!user) return res.redirect('/login?err=' + encodeURIComponent('Please sign in to view documents.'));
   const doc = db.prepare('SELECT * FROM documents WHERE id = ?').get(parseInt(req.params.id, 10));
   if (!doc) return res.status(404).send(page('Not found', '<div class="card"><h2>Document not found</h2></div>', user));
-  if (!user.isAdmin && doc.company_id !== user.id) {
+  if (!user.isAdmin && (user.isPerson || doc.company_id !== user.id)) {
     audit('DOCUMENT AGENT', 'document access', 'fail', `Unauthorized document access attempt: doc #${doc.id} by ${user.name}`);
     return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Private document</h2><p class="muted">Only the owning company and the admin can download this document.</p></div>', user));
   }
@@ -9052,10 +10399,18 @@ app.get('/dashboard', requireCompany, (req, res) => {
 
   // My deals table + per-deal chart data
   const myDeals = db.prepare('SELECT * FROM deals WHERE company_id = ? ORDER BY created_at DESC LIMIT 50').all(myId);
+  // Batch the per-deal social counts (was 2 COUNT queries per deal row).
+  const myLikeCounts = new Map(), myCommentCounts = new Map();
+  if (myDeals.length) {
+    const ids = myDeals.map(d => d.id);
+    const ph = ids.map(() => '?').join(',');
+    for (const r of db.prepare(`SELECT target_id, COUNT(*) AS n FROM likes WHERE target_type = 'deal' AND target_id IN (${ph}) GROUP BY target_id`).all(...ids)) myLikeCounts.set(r.target_id, r.n);
+    for (const r of db.prepare(`SELECT target_id, COUNT(*) AS n FROM comments WHERE target_type = 'deal' AND target_id IN (${ph}) GROUP BY target_id`).all(...ids)) myCommentCounts.set(r.target_id, r.n);
+  }
   const barLabels = [], barLikes = [], barComments = [];
   const dealsRows = myDeals.length ? myDeals.map(d => {
-    const likes = count(`SELECT COUNT(*) AS n FROM likes WHERE target_type = 'deal' AND target_id = ?`, d.id);
-    const comments = count(`SELECT COUNT(*) AS n FROM comments WHERE target_type = 'deal' AND target_id = ?`, d.id);
+    const likes = myLikeCounts.get(d.id) || 0;
+    const comments = myCommentCounts.get(d.id) || 0;
     const ct = latestContract(d.id);
     barLabels.push(d.title.length > 18 ? d.title.slice(0, 18) + '…' : d.title);
     barLikes.push(likes);
@@ -9132,8 +10487,21 @@ app.get('/dashboard', requireCompany, (req, res) => {
     </div>
   </div>`;
 
+  // License expiry detector: warn 30 days ahead so the company renews BEFORE the gate locks it out.
+  let licenseWarnHtml = '';
+  const licExpDash = String(req.user.licenseExpiry || '');
+  if (/^\d{4}-\d{2}-\d{2}$/.test(licExpDash)) {
+    const daysLeft = Math.round((new Date(licExpDash + 'T00:00:00Z') - new Date(now().slice(0, 10) + 'T00:00:00Z')) / 86400000);
+    if (daysLeft >= 0 && daysLeft <= 30) {
+      licenseWarnHtml = `<div class="card" data-reveal style="border-left:4px solid var(--warning,#FFB454)">
+        ⚠️ <b>Your trade license expires ${daysLeft === 0 ? 'today' : `in ${daysLeft} day${daysLeft === 1 ? '' : 's'}`} (${esc(licExpDash)}).</b>
+        Renew it in time — expired licenses are locked out of Dealzoin automatically. You can upload the renewed license from the lock page when it expires, or ask the admin to update your record.</div>`;
+    }
+  }
+
   const body = `
   <h2 class="sec-h" style="margin-top:0;margin-bottom:14px">📊 ${esc(t(lang, 'dash.title'))}</h2>
+  ${licenseWarnHtml}
   <div class="card" style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
     <div><h3 style="margin-bottom:2px">📥 ${esc(t(lang, 'dash.inbox'))}</h3>
       <p class="muted">Contracts and counter offers on your deals awaiting your decision.</p></div>
@@ -9292,7 +10660,9 @@ app.get('/chat/:id', (req, res) => {
   const convId = parseInt(req.params.id, 10);
   const conv = db.prepare('SELECT * FROM conversations WHERE id = ?').get(convId);
   if (!conv) return res.status(404).send(page('Not found', '<div class="card"><h2>Conversation not found</h2></div>', user));
-  const member = !user.isAdmin && isMember(convId, user.id);
+  // Persons are never conversation members — conversation_members.company_id is company-keyed
+  // and shares the person id space, so a person must never match a membership row.
+  const member = !user.isAdmin && !user.isPerson && isMember(convId, user.id);
   if (!user.isAdmin && !member) {
     return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Private conversation</h2><p class="muted">Only members of this conversation can view it.</p></div>', user));
   }
@@ -9487,7 +10857,7 @@ function eventsForCompany(companyId) {
 }
 /** True when the user may see the join link: creator, participant, or admin. */
 function canJoinEvent(user, ev) {
-  if (!user || !ev) return false;
+  if (!user || !ev || user.isPerson) return false;    // creator_company_id / event_participants.company_id are company-keyed
   if (user.isAdmin) return true;
   if (ev.creator_company_id === user.id) return true;
   return !!db.prepare('SELECT 1 FROM event_participants WHERE event_id = ? AND company_id = ?').get(ev.id, user.id);
@@ -9672,7 +11042,7 @@ function resolveCallRoom(roomId, user) {
   if (!conv) return null;
   const names = companyNameMap();
   return { key: 'chat-' + id, kind: 'chat', id, title: convDisplayName(conv, user.isAdmin ? 0 : user.id, names),
-    backUrl: '/chat/' + id, allowed: !!(user.isAdmin || isMember(id, user.id)) };
+    backUrl: '/chat/' + id, allowed: !!(user.isAdmin || (!user.isPerson && isMember(id, user.id))) };
 }
 /** Names of the companies allowed in a room — rendered as the roster on the call page. */
 function callRoomRoster(room) {
@@ -10182,9 +11552,10 @@ app.post('/call/:room/signal', (req, res) => {
 });
 
 // ============================= GLOBAL SHIPMENT TRACKING MAP (/tracking) =============================
-/** Client script for the global tracking map: one pulsing marker per in-transit deal
- *  (gold = other companies, mint = mine), popups with route + status, fit-bounds. Defensive:
- *  missing Leaflet or empty marker data degrades to a themed fallback note, never an error. */
+/** Client script for the deal-activity map: one numbered pin chip per in-transit deal
+ *  (mint = my company is a party, gold = other companies), a thin dashed origin→destination
+ *  polyline per deal, popups with deal number + type + counterpart + status + route, fit-bounds.
+ *  Defensive: missing Leaflet or empty marker data degrades to a themed fallback note, never an error. */
 const TRACKING_MAP_SCRIPT = `<script>(function(){
   var el=document.getElementById('tracking-map');
   if(!el)return;
@@ -10194,6 +11565,9 @@ const TRACKING_MAP_SCRIPT = `<script>(function(){
   var deals=window.DZ_TRACKING_DEALS||[];
   if(!deals.length){fallback('No geocoded shipments in transit right now.');return;}
   try{
+    var cs=(window.getComputedStyle?getComputedStyle(document.documentElement):null);
+    var mint=((cs&&cs.getPropertyValue('--mint'))||'#3FE0B0').trim()||'#3FE0B0';
+    var gold=((cs&&cs.getPropertyValue('--gold'))||'#F58A3A').trim()||'#F58A3A';
     var map=L.map(el,{scrollWheelZoom:true});
     L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18,attribution:'&copy; OpenStreetMap contributors'}).addTo(map);
     var bounds=[];
@@ -10201,9 +11575,15 @@ const TRACKING_MAP_SCRIPT = `<script>(function(){
       var lat=parseFloat(d.lat),lng=parseFloat(d.lng);
       if(!isFinite(lat)||!isFinite(lng))return;
       bounds.push([lat,lng]);
-      var cls=d.mine?'dz-pulse dz-pulse-mint':'dz-pulse dz-pulse-gold';
-      L.marker([lat,lng],{icon:L.divIcon({className:'dz-pulse-wrap',html:'<span class="'+cls+'"></span>',iconSize:[14,14],iconAnchor:[7,7]})}).addTo(map)
-        .bindPopup('<b>Deal '+escH(d.num)+'</b> · '+escH(d.type)+'<br>📍 '+escH(d.origin)+' → '+escH(d.dest)+'<br>Status: '+escH(d.status)+'<br><a href="/deal/'+encodeURIComponent(d.id)+'">Open deal →</a>');
+      var lineColor=d.mine?mint:gold;
+      var oLat=parseFloat(d.oLat),oLng=parseFloat(d.oLng),dLat=parseFloat(d.dLat),dLng=parseFloat(d.dLng);
+      if(isFinite(oLat)&&isFinite(oLng)&&isFinite(dLat)&&isFinite(dLng)){
+        L.polyline([[oLat,oLng],[dLat,dLng]],{color:lineColor,weight:1.5,dashArray:'5 7',opacity:.65}).addTo(map);
+        bounds.push([oLat,oLng]);bounds.push([dLat,dLng]);
+      }
+      var cls=d.mine?'dz-pin dz-pin-mint':'dz-pin dz-pin-gold';
+      L.marker([lat,lng],{icon:L.divIcon({className:'dz-pin-wrap',html:'<span class="'+cls+'">'+escH(d.short||d.num)+'</span>',iconSize:[26,20],iconAnchor:[13,10]})}).addTo(map)
+        .bindPopup('<b>Deal '+escH(d.num)+'</b> · '+escH(d.type)+'<br>🤝 '+escH(d.cp||'')+'<br>📍 '+escH(d.origin)+' → '+escH(d.dest)+'<br>Status: '+escH(d.status)+'<br><a href="/deal/'+encodeURIComponent(d.id)+'">Open deal →</a>');
     });
     if(bounds.length>1)map.fitBounds(bounds,{padding:[40,40]});
     else if(bounds.length===1)map.setView(bounds[0],6);
@@ -10211,8 +11591,10 @@ const TRACKING_MAP_SCRIPT = `<script>(function(){
   }catch(e){fallback('🗺️ Map could not be rendered here.');}
 })();</script>`;
 
-// Full-width tracking map: every in-transit (dispatched/shipped) CIF/FOB/CFR deal as a pulsing marker.
-// Logged-in companies + admin. Coordinates are geocoded lazily; deal values are never shown.
+// Deal Activity page (/tracking): full-width map of in-transit (dispatched/shipped) deals as
+// numbered pin chips with dashed origin→destination routes, plus tables of every active deal
+// and active negotiation on the network. Logged-in companies + admin. Coordinates are geocoded
+// lazily; deal values are never shown anywhere on this page.
 app.get('/tracking', requireCompanyOrAdmin, ah(async (req, res) => {
   let deals = [];
   try {
@@ -10220,52 +11602,138 @@ app.get('/tracking', requireCompanyOrAdmin, ah(async (req, res) => {
     // ('none' = legacy/not-yet-finalized deals keep existing behavior; 'paid' = unlocked).
     deals = db.prepare(`SELECT * FROM deals WHERE status IN ('dispatched','shipped') AND COALESCE(payment_status, 'none') != 'pending_payment' ORDER BY id DESC LIMIT 200`).all();
   } catch (e) { deals = []; }
+  const names = companyNameMap();
   const markers = [];
   for (const d of deals) {
     try {
       const geo = await dealGeo(d);
       if (!validLatLng(geo.oLat, geo.oLng) || !validLatLng(geo.dLat, geo.dLng)) continue;
       const t = statusProgress(d);
+      const buyerId = dealBuyerId(d);
       // "Mine" = my company's deal, my contracted purchase, or a deal I'm negotiating to buy
       // (same insider audience as canViewDealTerms — values are still never shown here).
-      const mine = !req.user.isAdmin && (req.user.id === d.company_id || dealBuyerId(d) === req.user.id
+      const mine = !req.user.isAdmin && (req.user.id === d.company_id || buyerId === req.user.id
         || !!db.prepare('SELECT 1 FROM negotiations WHERE deal_id = ? AND buyer_id = ? LIMIT 1').get(d.id, req.user.id));
+      // Counterpart shown in the popup: the other party when the viewer is a party,
+      // otherwise the deal's owner (⇄ contracted buyer when one exists).
+      const ownerName = names.get(d.company_id) || 'Unknown';
+      const buyerName = buyerId ? (names.get(buyerId) || 'Unknown') : '';
+      const cp = !req.user.isAdmin && req.user.id === d.company_id ? (buyerName || 'Buyer TBD')
+        : (!req.user.isAdmin && buyerId === req.user.id) ? ownerName
+        : (buyerName ? ownerName + ' ⇄ ' + buyerName : ownerName);
+      // Short pin label: the last numeric group of the deal number ("DZ-2026-0042" → "42").
+      const numStr = d.deal_number || ('#' + d.id);
+      const m = String(numStr).match(/(\d+)(?!.*\d)/);
       markers.push({
         id: d.id,
-        num: d.deal_number || ('#' + d.id),
+        num: numStr,
+        short: m ? String(parseInt(m[1], 10)) : String(d.id),
         type: DEAL_TYPES.includes(d.deal_type) ? d.deal_type : 'sell',
         origin: d.origin || 'Origin',
         dest: d.destination || 'Destination',
         status: d.status || 'open',
+        cp: cp,
         lat: Math.round((geo.oLat + (geo.dLat - geo.oLat) * t) * 1e5) / 1e5,
         lng: Math.round((geo.oLng + (geo.dLng - geo.oLng) * t) * 1e5) / 1e5,
+        oLat: geo.oLat,
+        oLng: geo.oLng,
+        dLat: geo.dLat,
+        dLng: geo.dLng,
         mine: mine
       });
     } catch (e) { /* deals that fail to geocode are skipped from the map (still listed below) */ }
   }
-  const strip = deals.length ? `<div class="track-strip">${deals.map((d, i) => `
-    <div class="card track-card" data-reveal style="--i:${Math.min(i, 8)}">
-      <h4><a href="/deal/${d.id}">${esc(d.deal_number || '#' + d.id)}</a> ${dealStatusChip(d)}</h4>
-      <div class="muted" style="font-size:12px">${esc(d.title.slice(0, 60))}</div>
-      <div style="font-size:12px;margin-top:4px">📍 ${esc(d.origin || '?')} → ${esc(d.destination || 'destination TBD')}</div>
-    </div>`).join('')}</div>`
-    : '<div class="card" data-reveal><p class="muted">No shipments in transit right now. CIF/FOB/CFR deals appear here once they reach <b>dispatched</b> or <b>shipped</b>.</p></div>';
+  // Active deals: every non-terminal deal (terminal = delivered | closed | cancelled), with the
+  // same commission gate as the map. Owner + contracted buyer names come from JOINs (no N+1).
+  let activeDeals = [];
+  try {
+    activeDeals = db.prepare(`SELECT d.id, d.deal_number, d.title, d.deal_type, d.origin, d.destination, d.status,
+        d.company_id, d.contract_party_id, d.created_at,
+        o.name AS owner_name, b.name AS buyer_name
+      FROM deals d
+      LEFT JOIN companies o ON o.id = d.company_id
+      LEFT JOIN companies b ON b.id = d.contract_party_id
+      WHERE COALESCE(d.status, 'open') NOT IN ('delivered','closed','cancelled')
+        AND COALESCE(d.payment_status, 'none') != 'pending_payment'
+      ORDER BY d.id DESC LIMIT 100`).all();
+  } catch (e) { activeDeals = []; }
+  // Active negotiations: every negotiation not in a terminal state (DONE | REJECTED | EXPIRED).
+  let activeNegs = [];
+  try {
+    activeNegs = db.prepare(`SELECT n.id, n.deal_id, n.buyer_id, n.seller_id, n.state, n.updated_at,
+        d.deal_number, d.title AS deal_title,
+        b.name AS buyer_name, s.name AS seller_name
+      FROM negotiations n
+      LEFT JOIN deals d ON d.id = n.deal_id
+      LEFT JOIN companies b ON b.id = n.buyer_id
+      LEFT JOIN companies s ON s.id = n.seller_id
+      WHERE n.state NOT IN ('DONE','REJECTED','EXPIRED')
+      ORDER BY n.updated_at DESC LIMIT 100`).all();
+  } catch (e) { activeNegs = []; }
+  const statsHtml = `<div class="stats">
+    <div class="stat" data-reveal style="--i:0"><div class="num gold">${deals.length}</div><div class="lbl">In transit</div></div>
+    <div class="stat" data-reveal style="--i:1"><div class="num mint">${activeDeals.length}</div><div class="lbl">Active deals</div></div>
+    <div class="stat" data-reveal style="--i:2"><div class="num mint">${activeNegs.length}</div><div class="lbl">Active negotiations</div></div>
+  </div>`;
   const mapHtml = markers.length
-    ? `<div id="tracking-map" class="map-embed map-full" role="img" aria-label="Global shipment tracking map"></div>
+    ? `<div id="tracking-map" class="map-embed map-full" role="img" aria-label="Deal activity map"></div>
        <script>window.DZ_TRACKING_DEALS=${jsJson(markers)};</script>
        ${TRACKING_MAP_SCRIPT}`
-    : `<div class="card map-placeholder" data-reveal style="margin-top:14px"><h3>🗺️ Global tracking map</h3>
+    : `<div class="card map-placeholder" data-reveal style="margin-top:14px"><h3>🗺️ Deal activity map</h3>
        <p class="muted" style="margin-top:8px">${deals.length ? 'Map activates once origin &amp; destination are geocoded for the in-transit deals.' : 'Map activates once CIF/FOB/CFR deals are dispatched or shipped.'}</p></div>`;
+  const mineRow = '<td style="box-shadow:inset 3px 0 0 var(--mint)">';
+  const dealRows = activeDeals.map(d => {
+    const mine = !req.user.isAdmin && (d.company_id === req.user.id || d.contract_party_id === req.user.id);
+    const t = DEAL_TYPES.includes(d.deal_type) ? d.deal_type : 'sell';
+    const st = d.status || 'open';
+    const parties = esc(d.owner_name || 'Unknown') + (d.buyer_name ? ' ⇄ ' + esc(d.buyer_name) : '');
+    return `<tr>
+      ${mine ? mineRow : '<td>'}<a href="/deal/${d.id}"><b>${esc(d.deal_number || '#' + d.id)}</b></a></td>
+      <td>${esc((d.title || '').slice(0, 60))}</td>
+      <td><span class="chip chip-${t}">${t === 'sell' ? 'Selling' : 'Buying'}</span></td>
+      <td>${esc(d.origin || '?')} → ${esc(d.destination || 'TBD')}</td>
+      <td><span class="status-chip st-${esc(st)}">${esc(st)}</span></td>
+      <td>${parties}</td>
+      <td class="muted">${esc((d.created_at || '').slice(0, 10))}</td>
+    </tr>`;
+  }).join('');
+  const dealsCard = `<div class="card" data-reveal style="margin-top:14px">
+    <div class="feed-head" style="margin-bottom:8px"><h3 style="margin:0">📦 Active deals</h3><span class="hint-chip">${activeDeals.length} on the network</span></div>
+    ${activeDeals.length
+      ? `<table><tr><th>Deal #</th><th>Title</th><th>Type</th><th>Route</th><th>Status</th><th>Parties</th><th>Date</th></tr>${dealRows}</table>`
+      : '<p class="muted">No active deals right now. New deals appear here as soon as they are posted.</p>'}
+  </div>`;
+  const negRows = activeNegs.map(n => {
+    const mine = !req.user.isAdmin && (n.buyer_id === req.user.id || n.seller_id === req.user.id);
+    return `<tr>
+      ${mine ? mineRow : '<td>'}${n.deal_id ? `<a href="/deal/${n.deal_id}"><b>${esc(n.deal_number || '#' + n.deal_id)}</b></a>` : '<span class="muted">—</span>'}</td>
+      <td>${esc((n.deal_title || '').slice(0, 60))}</td>
+      <td>${esc(n.buyer_name || 'Unknown')}</td>
+      <td>${esc(n.seller_name || 'Unknown')}</td>
+      <td>${statusBadge(n.state)}</td>
+      <td class="muted">${esc((n.updated_at || '').slice(0, 16).replace('T', ' '))}</td>
+      <td><a href="/negotiation/${n.id}">Open room →</a></td>
+    </tr>`;
+  }).join('');
+  const negsCard = `<div class="card" data-reveal style="margin-top:14px">
+    <div class="feed-head" style="margin-bottom:8px"><h3 style="margin:0">🤝 Active negotiations</h3><span class="hint-chip">${activeNegs.length} in progress</span></div>
+    ${activeNegs.length
+      ? `<table><tr><th>Deal #</th><th>Deal title</th><th>Buyer</th><th>Seller</th><th>Stage</th><th>Last activity</th><th></th></tr>${negRows}</table>`
+      : '<p class="muted">No active negotiations right now. LOIs and offers appear here while they are being worked.</p>'}
+  </div>`;
   const body = `
   <div class="card" data-reveal>
-    <div class="kicker">Live logistics</div>
-    <h2>🌍 Shipment tracking</h2>
-    <p class="muted">Every in-transit CIF/FOB/CFR deal on the network — <span style="color:var(--mint)">mint</span> markers are your shipments,
-      <span style="color:var(--gold)">gold</span> markers are other companies'. Deal values are never shown.</p>
+    <div class="kicker">Deal activity</div>
+    <h1 style="font-size:1.75rem;margin-top:4px">🗺️ Deal Activity</h1>
+    <p class="muted" style="margin-top:6px">Live map of in-transit shipments, plus every active deal and negotiation on the network.
+      <span style="color:var(--mint)">Mint</span> pins are deals where your company is a party,
+      <span style="color:var(--gold)">gold</span> pins are other companies'. Deal values are never shown.</p>
   </div>
-  ${strip}
-  ${mapHtml}`;
-  res.send(page('Shipment tracking', body, req.user, req.query.msg, req.query.err, 'globe', markers.length ? LEAFLET_HEAD : ''));
+  ${statsHtml}
+  ${mapHtml}
+  ${dealsCard}
+  ${negsCard}`;
+  res.send(page('Deal Activity', body, req.user, req.query.msg, req.query.err, 'globe', markers.length ? LEAFLET_HEAD : ''));
 }));
 
 // ============================= ADMIN ROUTES =============================
@@ -10439,7 +11907,9 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
     contractsPending: count(`SELECT COUNT(*) AS n FROM contracts WHERE status = 'pending_admin'`) +
                       count(`SELECT COUNT(*) AS n FROM private_contracts WHERE status = 'pending_admin'`) +
                       count(`SELECT COUNT(*) AS n FROM negotiations WHERE state = 'PENDING_ADMIN'`),
-    follows: count('SELECT COUNT(*) AS n FROM follows')
+    follows: count('SELECT COUNT(*) AS n FROM follows'),
+    persons: count('SELECT COUNT(*) AS n FROM persons'),
+    shippingBids: count('SELECT COUNT(*) AS n FROM shipping_bids')
   };
   // Platform commission: the live admin-adjustable pct of the summed value of approved (finalized) deals, per currency.
   const feePct = platformFeePct();
@@ -10460,11 +11930,15 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
   const collectedRows = db.prepare(`SELECT currency, SUM(amount) AS s FROM commission_payments WHERE status = 'approved' GROUP BY currency ORDER BY currency`).all();
   const collectedText = collectedRows.length ? collectedRows.map(r => `${esc(r.currency)} ${fmtAmount(r.s || 0)}`).join(' · ') : '—';
   const pendingPayCount = count(`SELECT COUNT(*) AS n FROM commission_payments WHERE status = 'pending'`);
+  const pendingReviews = count(`SELECT COUNT(*) AS n FROM review_requests WHERE status IN ('pending','in_review')`);
+  const newIdeas = count(`SELECT COUNT(*) AS n FROM agent_ideas WHERE status = 'new'`);
   const statsHtml = `<div class="stats">${[
     ['Total companies', stats.companies, ''], ['Pending', stats.pending, ''], ['Approved', stats.approved, ' mint'],
     ['Flagged ⚠️', stats.flagged, ''], ['Deals', stats.deals, ' gold'], ['Contracts pending', stats.contractsPending, ' gold'],
-    ['Follows', stats.follows, '']
+    ['Follows', stats.follows, ''], ['Persons 👤', stats.persons, ' mint'], ['🚢 Shipping bids', stats.shippingBids, ' mint']
   ].map(([l, n, cls], ti) => `<div class="stat card--cut js-tilt" data-reveal style="--i:${Math.min(ti, 8)}" data-num="${String(ti + 1).padStart(2, '0')}"><div class="num${cls}" data-count="${n}">${n}</div><div class="lbl">${l}</div></div>`).join('')}
+    <a href="/admin/reviews" class="stat card--cut js-tilt" data-reveal style="--i:6;text-decoration:none;color:inherit;display:block" data-num="07"><div class="num${pendingReviews ? ' gold' : ''}" data-count="${pendingReviews}">${pendingReviews}</div><div class="lbl">🆘 Review requests — open</div></a>
+    <a href="/admin/ideas" class="stat card--cut js-tilt" data-reveal style="--i:7;text-decoration:none;color:inherit;display:block" data-num="08"><div class="num${newIdeas ? ' mint' : ''}" data-count="${newIdeas}">${newIdeas}</div><div class="lbl">🛰️ Strategy Agent — new ideas</div></a>
     <div class="stat card--cut js-tilt" data-reveal style="--i:7" data-num="08"><div class="num gold" style="font-size:1.15rem;line-height:1.4">${commissionText}</div><div class="lbl">Platform commission (approved deals) · ${feePct}%</div></div>
     <div class="stat card--cut js-tilt" data-reveal style="--i:8" data-num="09"><div class="num gold" style="font-size:1.15rem;line-height:1.4">${collectedText}</div><div class="lbl">💰 Commission collected · ${pendingPayCount} payment${pendingPayCount === 1 ? '' : 's'} pending</div></div></div>`;
 
@@ -10659,7 +12133,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
 
   const body = `
   <h2 class="sec-h" style="margin-top:0;margin-bottom:14px">🛡️ Admin dashboard</h2>
-  <div class="feed-actions" style="margin:0 0 14px"><a class="btn btn-sm btn-outline" href="/admin/documents">🗄️ Document vault</a> <a class="btn btn-sm btn-outline" href="/admin/security">🛡️ Security Center</a></div>
+  <div class="feed-actions" style="margin:0 0 14px"><a class="btn btn-sm btn-outline" href="/admin/documents">🗄️ Document vault</a> <a class="btn btn-sm btn-outline" href="/admin/persons">👤 Persons</a> <a class="btn btn-sm btn-outline" href="/admin/orders">🧾 Orders</a> <a class="btn btn-sm btn-outline" href="/admin/security">🛡️ Security Center</a></div>
   ${statsHtml}
   <div class="card" data-reveal><h3>Pending companies</h3>
     <table><tr><th>Company</th><th>Registered</th><th>Actions</th></tr>${pendingHtml}</table></div>
@@ -11095,7 +12569,229 @@ app.post('/admin/companies/:id/reputation', requireAdmin, (req, res) => {
   res.redirect('/admin/dashboard?msg=' + encodeURIComponent(`Reputation for ${c.name} set to ${rep === 0 ? 'Unrated' : rep + '★'}.`));
 });
 
-// ----- RESEARCH AGENT: Wikipedia lookup + admin-confirmed intelligence fields -----
+// ----- RESEARCH AGENT: multi-source public-footprint research (all keyless & free) -----
+/** Strip control chars, collapse whitespace, cap length — applied to ALL untrusted fetched text. */
+function cleanText(s, max) {
+  return String(s == null ? '' : s)
+    .replace(/[\u0000-\u001F\u007F-\u009F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, max || 300);
+}
+/** Decode the handful of HTML entities common in <title>/<meta> text. */
+function decodeBasicEntities(s) {
+  return String(s || '')
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#0?39;|&apos;/g, "'");
+}
+/** Render the research_source column (' · '-joined URLs) as individual safe links. */
+function sourceLinksHtml(src) {
+  return String(src || '').split(' · ').map(u => u.trim())
+    .filter(u => /^https?:\/\//i.test(u))
+    .map(u => `<a href="${esc(u)}" rel="noopener noreferrer nofollow">${esc(u)}</a>`).join(' · ');
+}
+/** fetch() JSON with a hard timeout; throws (with .httpStatus) on non-2xx. */
+async function fetchJsonTimed(url, timeoutMs) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs || 6000);
+  try {
+    const r = await fetch(url, { signal: ctrl.signal, redirect: 'follow',
+      headers: { 'User-Agent': 'Dealzoin Research Agent (KYC verification)', 'Accept': 'application/json' } });
+    if (!r.ok) { const err = new Error('HTTP ' + r.status); err.httpStatus = r.status; throw err; }
+    return await r.json();
+  } finally { clearTimeout(timer); }
+}
+
+/** Source 1 — Wikipedia REST summary (prose; good for a field/description snippet). */
+async function srcWikipedia(name) {
+  const apiUrl = 'https://en.wikipedia.org/api/rest_v1/page/summary/' + encodeURIComponent(name);
+  let data;
+  try { data = await fetchJsonTimed(apiUrl, 6000); }
+  catch (e) { if (e.httpStatus === 404) return null; throw e; }
+  if (!data || !data.extract) return null;
+  const pageUrl = (data.content_urls && data.content_urls.desktop && data.content_urls.desktop.page) || apiUrl;
+  const summary = cleanText(String(data.extract).split(/(?<=[.!?])\s+/)[0], 300);
+  const facts = [['Summary', summary]];
+  if (data.description) facts.push(['Short description', cleanText(data.description, 120)]);
+  return { label: 'Wikipedia', url: cleanText(pageUrl, 300), facts, summary };
+}
+
+/** Pull datavalue payloads for a Wikidata claim property. */
+function wdValues(claims, prop) {
+  const out = [];
+  for (const cl of (claims && claims[prop]) || []) {
+    const dv = cl && cl.mainsnak && cl.mainsnak.datavalue;
+    if (dv && dv.value != null) out.push(dv.value);
+  }
+  return out;
+}
+/** Source 2 — Wikidata search + entity claims (structured company facts). */
+async function srcWikidata(name) {
+  const searchUrl = 'https://www.wikidata.org/w/api.php?action=wbsearchentities&search=' + encodeURIComponent(name) + '&language=en&format=json&limit=3';
+  const s = await fetchJsonTimed(searchUrl, 6000);
+  const hit = s && Array.isArray(s.search) && s.search[0];
+  if (!hit || !hit.id) return null;
+  const ent = await fetchJsonTimed('https://www.wikidata.org/w/api.php?action=wbgetentities&ids=' + encodeURIComponent(hit.id) + '&props=claims|labels|descriptions&languages=en&format=json', 6000);
+  const e = ent && ent.entities && ent.entities[hit.id];
+  if (!e) return null;
+  const claims = e.claims || {};
+  const facts = [];
+  const out = { label: 'Wikidata', url: 'https://www.wikidata.org/wiki/' + hit.id, facts };
+  // Resolve labels for entity-valued claims (country P17, industry P452) in one batch call (best-effort).
+  const labelIds = [...wdValues(claims, 'P17'), ...wdValues(claims, 'P452')]
+    .map(v => v && v.id).filter(Boolean).slice(0, 8);
+  const labelMap = {};
+  if (labelIds.length) {
+    try {
+      const lr = await fetchJsonTimed('https://www.wikidata.org/w/api.php?action=wbgetentities&ids=' + labelIds.map(encodeURIComponent).join('|') + '&props=labels&languages=en&format=json', 6000);
+      for (const id of labelIds) {
+        const lv = lr && lr.entities && lr.entities[id] && lr.entities[id].labels && lr.entities[id].labels.en;
+        if (lv && lv.value) labelMap[id] = lv.value;
+      }
+    } catch (e2) { /* label resolution is best-effort */ }
+  }
+  const inceptionRaw = wdValues(claims, 'P571')[0];
+  if (inceptionRaw && inceptionRaw.time) {
+    const year = String(inceptionRaw.time).replace(/^\+/, '').slice(0, 4);
+    if (/^\d{4}$/.test(year)) { out.inception = year; facts.push(['Inception', year]); }
+  }
+  const empNums = wdValues(claims, 'P1128').map(v => parseFloat(String(v.amount || '').replace('+', ''))).filter(n => Number.isFinite(n));
+  if (empNums.length) {
+    out.employees = '~' + Math.round(Math.max(...empNums)).toLocaleString('en-US');
+    facts.push(['Employees', out.employees]);
+  }
+  const countryId = (wdValues(claims, 'P17')[0] || {}).id;
+  if (countryId && labelMap[countryId]) { out.country = cleanText(labelMap[countryId], 120); facts.push(['Country', out.country]); }
+  const indId = (wdValues(claims, 'P452')[0] || {}).id;
+  if (indId && labelMap[indId]) { out.industry = cleanText(labelMap[indId], 200); facts.push(['Industry', out.industry]); }
+  const site = wdValues(claims, 'P856')[0];
+  if (typeof site === 'string' && /^https?:\/\//i.test(site)) { out.website = cleanText(site, 300); facts.push(['Official website', out.website]); }
+  const desc = e.descriptions && e.descriptions.en && e.descriptions.en.value;
+  if (desc) facts.push(['Description', cleanText(desc, 160)]);
+  if (!facts.length) return null;
+  return out;
+}
+
+/** Source 3 — DuckDuckGo Instant Answer (abstract + official website when present). */
+async function srcDuckDuckGo(name) {
+  const apiUrl = 'https://api.duckduckgo.com/?q=' + encodeURIComponent(name) + '&format=json&no_html=1';
+  const d = await fetchJsonTimed(apiUrl, 6000);
+  if (!d || (!d.AbstractText && !d.OfficialWebsite)) return null;
+  const facts = [];
+  const out = { label: 'DuckDuckGo', url: cleanText(d.AbstractURL || apiUrl, 300), facts };
+  if (d.AbstractText) { out.abstract = cleanText(d.AbstractText, 300); facts.push(['Abstract', out.abstract]); }
+  if (d.AbstractSource) facts.push(['Abstract source', cleanText(d.AbstractSource, 120)]);
+  if (d.OfficialWebsite) { out.officialWebsite = cleanText(d.OfficialWebsite, 300); facts.push(['Official website', out.officialWebsite]); }
+  return out;
+}
+
+/** Source 4 — GLEIF LEI registry (B2B KYC gold: legal name, address, entity status, registration authority). */
+async function srcGleif(name) {
+  const apiUrl = 'https://api.gleif.org/api/v1/lei-records?filter[entity.names]=' + encodeURIComponent(name) + '&page[size]=3';
+  const d = await fetchJsonTimed(apiUrl, 6000);
+  const rec = d && Array.isArray(d.data) && d.data[0];
+  if (!rec) return null;
+  const a = rec.attributes || {};
+  const ent = a.entity || {};
+  const facts = [];
+  const out = { label: 'GLEIF LEI registry', url: '', facts };
+  const lei = a.lei || rec.id || '';
+  if (lei) { out.url = 'https://search.gleif.org/#/record/' + encodeURIComponent(lei); facts.push(['LEI', cleanText(lei, 40)]); }
+  const legalName = ent.legalName && ent.legalName.name;
+  if (legalName) { out.legalName = cleanText(legalName, 200); facts.push(['Legal name', out.legalName]); }
+  const addr = ent.legalAddress || ent.headquartersAddress || {};
+  if (addr.country) { out.country = cleanText(addr.country, 8); facts.push(['Legal address country', out.country]); }
+  if (addr.city) facts.push(['Legal address city', cleanText(addr.city, 120)]);
+  const status = a.entityStatus || ent.status;
+  if (status) { out.entityStatus = cleanText(status, 40); facts.push(['Entity status', out.entityStatus]); }
+  const reg = a.registrationAuthority || {};
+  const regId = reg.registrationAuthorityID || reg.registrationAuthorityEntityID;
+  if (regId) facts.push(['Registration authority', cleanText(regId, 120)]);
+  if (!facts.length) return null;
+  if (!out.url) out.url = apiUrl;
+  return out;
+}
+
+/** Source 5 — the company's own website: a live homepage is itself a verification signal. */
+async function srcWebsite(website) {
+  let u;
+  try { u = new URL(String(website || '').trim()); } catch (e) { throw new Error('invalid website URL on file'); }
+  if (!/^https?:$/i.test(u.protocol)) throw new Error('website URL is not http(s)');
+  const wantHost = u.hostname.toLowerCase().replace(/^www\./, '');
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 6000);
+  try {
+    const r = await fetch(u.toString(), { signal: ctrl.signal, redirect: 'follow',
+      headers: { 'User-Agent': 'Dealzoin Research Agent (KYC verification)', 'Accept': 'text/html,*/*' } });
+    if (!r.ok) { const err = new Error('HTTP ' + r.status); err.httpStatus = r.status; throw err; }
+    // Never follow redirects away from the company's stated host (no arbitrary URL following).
+    const finalHost = (new URL(r.url)).hostname.toLowerCase().replace(/^www\./, '');
+    if (finalHost !== wantHost && !finalHost.endsWith('.' + wantHost) && !wantHost.endsWith('.' + finalHost)) {
+      throw new Error('homepage redirected off the stated website host (' + wantHost + ' → ' + finalHost + ')');
+    }
+    const out = { label: 'Company website', url: cleanText(r.url, 300), facts: [['Status', 'Live — HTTP ' + r.status]] };
+    const ctype = String(r.headers.get('content-type') || '');
+    if (!/text\/html|application\/xhtml/i.test(ctype)) return out; // reachable but not HTML — still a signal
+    // Read at most ~200KB of the homepage.
+    const chunks = []; let total = 0;
+    const reader = r.body.getReader();
+    while (total < 200 * 1024) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value); total += value.length;
+    }
+    try { await r.body.cancel(); } catch (e) { /* stream already consumed */ }
+    const html = Buffer.concat(chunks.map(c2 => Buffer.from(c2))).toString('utf8');
+    const tm = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    if (tm && tm[1].trim()) { out.title = cleanText(decodeBasicEntities(tm[1]), 200); out.facts.push(['Homepage title', out.title]); }
+    const mm = html.match(/<meta[^>]+name=["']description["'][^>]*>/i);
+    const cm = mm && mm[0].match(/content=["']([\s\S]*?)["']/i);
+    if (cm && cm[1].trim()) { out.description = cleanText(decodeBasicEntities(cm[1]), 300); out.facts.push(['Meta description', out.description]); }
+    return out;
+  } finally { clearTimeout(timer); }
+}
+
+/**
+ * Multi-source company research. Queries Wikipedia, Wikidata, DuckDuckGo, the GLEIF LEI
+ * registry and the company's own website IN PARALLEL; every source is keyless and each
+ * request has a ~6s timeout. Never throws — per-source outcomes are reported in `sources`.
+ */
+async function researchCompany(name, website) {
+  const jobs = [
+    ['Wikipedia', srcWikipedia(name)],
+    ['Wikidata', srcWikidata(name)],
+    ['DuckDuckGo', srcDuckDuckGo(name)],
+    ['GLEIF LEI registry', srcGleif(name)]
+  ];
+  if (website) jobs.push(['Company website', srcWebsite(website)]);
+  const settled = await Promise.allSettled(jobs.map(j => j[1]));
+  const sources = settled.map((s, i) => {
+    const label = jobs[i][0];
+    if (s.status === 'rejected') {
+      const msg = s.reason && s.reason.name === 'AbortError' ? 'timed out (6s)' : cleanText((s.reason && s.reason.message) || 'request failed', 160);
+      return { label, url: '', status: 'error', facts: [], note: msg };
+    }
+    const v = s.value;
+    if (!v || !(v.facts || []).length) return { label, url: '', status: 'none', facts: [], note: '' };
+    return { label, url: v.url || '', status: 'found', facts: v.facts, note: '', data: v };
+  });
+  const found = {};
+  for (const s of sources) if (s.status === 'found') found[s.label] = s.data;
+  // Merge precedence for structured fields: Wikidata > GLEIF > Wikipedia/DuckDuckGo prose.
+  const wd = found['Wikidata'] || {}, gl = found['GLEIF LEI registry'] || {},
+    wp = found['Wikipedia'] || {}, ddg = found['DuckDuckGo'] || {}, ws = found['Company website'] || {};
+  const merged = {
+    field: cleanText(wd.industry || wp.summary || ddg.abstract || ws.description || '', 300),
+    employees: cleanText(wd.employees || '', 80),
+    country: wd.country || gl.country || '',
+    inception: wd.inception || '',
+    website: wd.website || ddg.officialWebsite || ''
+  };
+  const sourceUrls = sources.filter(s => s.status === 'found' && s.url).map(s => s.url).slice(0, 3).join(' · ').slice(0, 500);
+  return { sources, merged, sourceUrls, gleif: found['GLEIF LEI registry'] || null, anyFound: sources.some(s => s.status === 'found') };
+}
+
+// ----- RESEARCH AGENT: multi-source lookup + admin-confirmed intelligence fields -----
 app.get('/admin/companies/:id/research', requireAdmin, (req, res) => {
   const c = db.prepare('SELECT * FROM companies WHERE id = ?').get(parseInt(req.params.id, 10));
   if (!c) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Company not found.'));
@@ -11127,13 +12823,36 @@ app.get('/admin/companies/:id/research', requireAdmin, (req, res) => {
     </form>` : ''}
     ${hasBank ? COPY_BTN_SCRIPT : ''}
   </div>`;
+  // License expiry card: shows the detected expiry, lets admin set/clear it manually.
+  const today = now().slice(0, 10);
+  const licExp = String(c.license_expiry || '');
+  const licBadge = !licExp ? '<span class="badge">unknown</span>'
+    : licExp < today ? `<span class="badge badge-rejected">EXPIRED ${esc(licExp)}</span>`
+    : `<span class="badge badge-pass">valid until ${esc(licExp)}</span>`;
+  const licenseCard = `
+  <div class="card" style="max-width:560px;margin:18px auto 0" data-reveal>
+    <div class="kicker">📜 LICENSE EXPIRY DETECTOR</div>
+    <h3 style="margin:6px 0 8px">Trade license — ${licBadge}</h3>
+    ${licExp && licExp < today ? '<p class="muted">This company is currently <b>locked to the renewal page</b> until a valid license is provided.</p>' : ''}
+    <form method="POST" action="/admin/companies/${c.id}/license" style="margin-top:6px">
+      <label>Set expiry date (admin override)</label>
+      <div class="grid2" style="gap:10px">
+        <input type="date" name="license_expiry" value="${esc(licExp)}">
+        <button class="btn btn-sm" type="submit">Save expiry</button>
+      </div>
+    </form>
+    ${licExp ? `<form method="POST" action="/admin/companies/${c.id}/license" style="margin-top:8px" onsubmit="return confirm('Clear the license expiry record? The company will no longer be gated.');">
+      <input type="hidden" name="license_expiry" value="">
+      <button class="btn btn-sm btn-outline" type="submit">Clear expiry record</button>
+    </form>` : ''}
+  </div>`;
   const body = `
   <div class="card" style="max-width:560px;margin:0 auto">
     <div class="kicker">🔬 Research Agent</div>
     <h2 style="margin:6px 0 10px">Company intelligence — ${esc(c.name)}</h2>
-    <p class="muted" style="margin-bottom:12px">Review and edit the researched fields, then save. They appear on the public company profile.</p>
+    <p class="muted" style="margin-bottom:12px">The Research Agent checks Wikipedia, Wikidata, the GLEIF LEI registry, DuckDuckGo, and the company's own website, then shows a per-source breakdown. Review and edit the researched fields, then save — they appear on the public company profile.</p>
     ${c.trade_license ? `<p class="muted" style="margin-bottom:12px">🪪 Trade license: <b>${esc(c.trade_license)}</b></p>` : ''}
-    ${c.research_source ? `<p class="muted" style="margin-bottom:12px">Source: <a href="${esc(c.research_source)}" rel="noopener noreferrer nofollow">${esc(c.research_source)}</a></p>` : ''}
+    ${c.research_source ? `<p class="muted" style="margin-bottom:12px">Sources: ${sourceLinksHtml(c.research_source)}</p>` : ''}
     <form method="POST" action="/admin/companies/${c.id}/research">
       <label>Market value</label><input type="text" name="market_value" maxlength="120" value="${esc(c.market_value || '')}" placeholder="e.g. $2.8T (2024)">
       <label>Field / industry</label><input type="text" name="field" maxlength="200" value="${esc(c.field || '')}" placeholder="e.g. Consumer electronics and software">
@@ -11142,8 +12861,330 @@ app.get('/admin/companies/:id/research', requireAdmin, (req, res) => {
       <a class="btn btn-outline" href="/admin/dashboard" style="margin-left:8px">Back</a>
     </form>
   </div>
-  ${bankKycCard}`;
+  ${bankKycCard}
+  ${licenseCard}`;
   res.send(page('Research — ' + c.name, body, req.user, req.query.msg, req.query.err));
+});
+
+// Admin override for the license expiry detector: set a new expiry date or clear the record.
+app.post('/admin/companies/:id/license', requireAdmin, (req, res) => {
+  const c = db.prepare('SELECT * FROM companies WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!c) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Company not found.'));
+  const v = String((req.body || {}).license_expiry || '').trim();
+  if (v && !/^\d{4}-\d{2}-\d{2}$/.test(v)) {
+    return res.redirect(`/admin/companies/${c.id}/research?err=` + encodeURIComponent('Please pick a valid date (YYYY-MM-DD), or clear the record.'));
+  }
+  db.prepare('UPDATE companies SET license_expiry = ? WHERE id = ?').run(v, c.id);
+  audit('ONBOARDING AGENT', 'license expiry admin override', 'pass',
+    v ? `Admin set license expiry for "${c.name}" (#${c.id}) → ${v}` : `Admin cleared license expiry record for "${c.name}" (#${c.id})`);
+  res.redirect(`/admin/companies/${c.id}/research?msg=` + encodeURIComponent(v ? `License expiry for ${c.name} set to ${v}.` : `License expiry record cleared for ${c.name}.`));
+});
+
+// Clear onboarding/AI flags — admin "skip the agent review" override.
+app.post('/admin/companies/:id/clear-flags', requireAdmin, (req, res) => {
+  const c = db.prepare('SELECT * FROM companies WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!c) return res.redirect('/admin/dashboard?err=' + encodeURIComponent('Company not found.'));
+  db.prepare(`UPDATE companies SET flagged = 0, flag_reasons = '' WHERE id = ?`).run(c.id);
+  audit('ONBOARDING AGENT', 'admin clear flags', 'pass', `Admin cleared AI-agent flags on "${c.name}" (#${c.id}) — override/skip review`);
+  res.redirect((req.get('referer') || '/admin/dashboard').split('?')[0] + '?msg=' + encodeURIComponent(`Flags cleared for ${c.name} — agent review skipped.`));
+});
+
+// ----- Admin console: review requests from users (KYC issues, license locks, …) -----
+app.get('/admin/reviews', requireAdmin, (req, res) => {
+  const filter = ['pending', 'in_review', 'resolved', 'dismissed'].includes(req.query.status) ? req.query.status : '';
+  const rows = filter
+    ? db.prepare('SELECT * FROM review_requests WHERE status = ? ORDER BY id DESC LIMIT 100').all(filter)
+    : db.prepare(`SELECT * FROM review_requests ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'in_review' THEN 1 ELSE 2 END, id DESC LIMIT 100`).all();
+  const counts = {};
+  for (const r of db.prepare('SELECT status, COUNT(*) AS n FROM review_requests GROUP BY status').all()) counts[r.status] = r.n;
+
+  const rowsHtml = rows.length ? rows.map((r) => {
+    const company = r.company_id ? db.prepare('SELECT * FROM companies WHERE id = ?').get(r.company_id) : null;
+    const catLabel = (REVIEW_CATEGORIES.find(([k]) => k === r.category) || [, '❓ Other'])[1];
+    // OVERRIDE PANEL: skip any AI-agent review for the requesting company, right from the request.
+    const overrides = company ? `
+      <div style="margin-top:8px;padding:8px;border:1px dashed var(--border-soft);border-radius:8px">
+        <b>⚡ Quick overrides (skip AI-agent reviews):</b>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px;align-items:center">
+          ${company.status !== 'approved' ? `<form method="POST" action="/admin/companies/${company.id}/approve"><button class="btn btn-sm btn-green" type="submit">Approve company</button></form>` : ''}
+          ${company.flagged ? `<form method="POST" action="/admin/companies/${company.id}/clear-flags"><button class="btn btn-sm btn-outline" type="submit">Clear AI flags ⚠️</button></form>` : ''}
+          <form method="POST" action="/admin/companies/${company.id}/license" style="display:flex;gap:6px;align-items:center">
+            <input type="date" name="license_expiry" value="${esc(company.license_expiry || '')}" title="License expiry">
+            <button class="btn btn-sm btn-outline" type="submit">Set license</button>
+          </form>
+          ${company.license_expiry ? `<form method="POST" action="/admin/companies/${company.id}/license"><input type="hidden" name="license_expiry" value=""><button class="btn btn-sm btn-outline" type="submit">Clear license lock</button></form>` : ''}
+          <a class="btn btn-sm btn-outline" href="/admin/companies/${company.id}/research">Research &amp; bank KYC →</a>
+        </div>
+        <span class="muted">Status: <b>${esc(company.status)}</b>${company.flagged ? ` · flagged: ${esc(company.flag_reasons || '')}` : ''} · license: ${esc(company.license_expiry || 'unknown')}</span>
+      </div>` : '';
+    return `
+    <div class="card" data-reveal style="margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center">
+        <span><b>#${r.id}</b> · ${esc(catLabel)} · by <b>${esc(r.author_name)}</b></span>
+        ${reviewStatusBadge(r.status)}
+      </div>
+      <p style="margin:6px 0;white-space:pre-wrap">${esc(r.comment)}</p>
+      <span class="muted">Sent ${esc(r.created_at.slice(0, 16).replace('T', ' '))} UTC${r.resolved_at ? ` · closed ${esc(r.resolved_at.slice(0, 16).replace('T', ' '))} UTC` : ''}</span>
+      ${r.admin_note ? `<p class="ok" style="margin:6px 0 0">🛡️ Your note: ${esc(r.admin_note)}</p>` : ''}
+      ${overrides}
+      <form method="POST" action="/admin/reviews/${r.id}" style="margin-top:8px">
+        <div class="grid2" style="gap:10px">
+          <select name="status">${optionsHtml(['pending', 'in_review', 'resolved', 'dismissed'], r.status)}</select>
+          <input type="text" name="admin_note" maxlength="500" value="${esc(r.admin_note || '')}" placeholder="Reply note (visible to the user)">
+        </div>
+        <button class="btn btn-sm" type="submit">Save</button>
+      </form>
+    </div>`;
+  }).join('') : '<div class="card muted">No requests here. 🎉</div>';
+
+  const body = `
+  <div class="kicker">Admin console</div>
+  <h2 style="margin:4px 0 14px">🆘 Review requests</h2>
+  <div class="card" data-reveal style="margin-bottom:12px">
+    <b>Filter:</b>
+    <a href="/admin/reviews">All</a> ·
+    <a href="/admin/reviews?status=pending">Pending (${counts.pending || 0})</a> ·
+    <a href="/admin/reviews?status=in_review">In review (${counts.in_review || 0})</a> ·
+    <a href="/admin/reviews?status=resolved">Resolved (${counts.resolved || 0})</a> ·
+    <a href="/admin/reviews?status=dismissed">Dismissed (${counts.dismissed || 0})</a>
+  </div>
+  ${rowsHtml}
+  <p><a href="/admin/dashboard">← Back to admin dashboard</a></p>`;
+  res.send(page('Review requests', body, req.user, req.query.msg, req.query.err));
+});
+
+app.post('/admin/reviews/:id', requireAdmin, (req, res) => {
+  const r = db.prepare('SELECT * FROM review_requests WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!r) return res.redirect('/admin/reviews?err=' + encodeURIComponent('Request not found.'));
+  const status = ['pending', 'in_review', 'resolved', 'dismissed'].includes((req.body || {}).status) ? req.body.status : r.status;
+  const note = String((req.body || {}).admin_note || '').trim().slice(0, 500);
+  const closed = (status === 'resolved' || status === 'dismissed');
+  db.prepare('UPDATE review_requests SET status = ?, admin_note = ?, resolved_at = ? WHERE id = ?')
+    .run(status, note, closed ? now() : '', r.id);
+  // Notify the company user; persons see the answer on their requests page.
+  if (r.company_id && (closed || note)) {
+    notify(r.company_id, 'review', `🛡️ Admin ${status === 'resolved' ? 'resolved' : status === 'dismissed' ? 'closed' : 'updated'} your review request #${r.id}${note ? `: "${note.slice(0, 200)}"` : ''}`, '/review-request');
+  }
+  audit('SECURITY AGENT', 'review request handled', 'pass', `Admin set review request #${r.id} → ${status}${note ? ` with note "${note.slice(0, 120)}"` : ''}`);
+  res.redirect('/admin/reviews?msg=' + encodeURIComponent(`Request #${r.id} updated → ${status}.`));
+});
+
+// ============================ STRATEGY AGENT ============================
+// An always-on researcher working for the admin: every few hours it picks a strategic topic,
+// researches it on the open internet (Wikipedia + DuckDuckGo, no API keys needed), writes up
+// findings, and brainstorms NEW feature/growth ideas for Dealzoin. Feed lives at /admin/ideas.
+db.exec(`
+CREATE TABLE IF NOT EXISTS agent_ideas (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  topic      TEXT NOT NULL,
+  kind       TEXT NOT NULL DEFAULT 'idea',     -- research | idea | brainstorm
+  title      TEXT NOT NULL,
+  body       TEXT NOT NULL,
+  sources    TEXT DEFAULT '',                  -- ' · '-joined URLs
+  status     TEXT NOT NULL DEFAULT 'new',      -- new | saved | dismissed
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_ideas_status ON agent_ideas(status, id);
+`);
+
+const STRATEGY_TOPICS = [
+  { key: 'b2b-trends', label: 'B2B marketplace trends', entities: ['B2B e-commerce', 'Electronic marketplace'], ideas: [
+    { t: 'RFQ fast lane', b: 'Auto-match every new buy tender to the 10 most relevant suppliers by category + past activity, and pre-fill a draft bid they can send with one tap. Speed-to-first-bid is the #1 driver of tender liquidity.' },
+    { t: 'Verified-only as the brand', b: 'Make "every company is license-verified" the headline on the landing page and in every notification email. Alibaba cannot say this — it is your strongest wedge.' },
+    { t: 'Escrow-first checkout for products', b: 'Extend the deal escrow flow to product orders: hold the buyer\'s PayPal payment until delivery confirmation. Trust is the reason B2B buyers abandon marketplaces.' },
+    { t: 'Trust score per company', b: 'Publish a visible trust score (KYC verified + signed contracts + on-time payments + completed shipments). Reward high scores with search ranking boosts.' },
+    { t: 'Category weeks', b: 'Run themed weeks (Metals week, Agri week): feature 5 verified suppliers per category on the explore page and notify matching buyers. Cheap, repeatable, creates urgency.' } ] },
+  { key: 'uae-gcc-trade', label: 'UAE & GCC trade', entities: ['Economy of the United Arab Emirates', 'Khalifa Port'], ideas: [
+    { t: 'Free-zone onboarding partnerships', b: 'Approach UAE free zones (JAFZA, KIZAD, DIFC) to offer Dealzoin as their members\' trade network. Free zones actively look for member perks — one partnership can bring hundreds of verified companies.' },
+    { t: 'Arabic-first push', b: 'The platform already has RTL/Arabic strings — finish the translation and market it. Most global B2B platforms treat Arabic as an afterthought; local buyers notice.' },
+    { t: 'Re-export hub angle', b: 'The UAE is a re-export giant. Add an "origin → via UAE → destination" route field on deals so traders can market re-export logistics explicitly.' },
+    { t: 'Government tender alignment', b: 'Mirror the sealed-bid tender flow in your marketing toward UAE procurement norms — sealed bids until deadline is exactly how government procurement works here.' },
+    { t: 'Ramadan / seasonal trade calendar', b: 'Build a seasonal demand calendar (Ramadan food commodities, construction pre-summer) and prompt sellers to stock + post products 6 weeks ahead of each peak.' } ] },
+  { key: 'competitors', label: 'Competitor watch', entities: ['Alibaba Group', 'TradeKey'], ideas: [
+    { t: 'Undercut on fee transparency', b: 'Alibaba\'s fees are opaque. Publish your commission rate openly on the landing page with a calculator — transparency converts frustrated importers.' },
+    { t: 'Sealed tenders as a differentiator', b: 'No major B2B marketplace offers sealed-bid tenders with public opening. Put "fair bidding, sealed until deadline" in the pitch deck and demo video.' },
+    { t: 'Integrated shipping marketplace', b: 'Alibaba outsources logistics to third parties. Your shipping tenders keep freight inside the platform — emphasize the closed loop: deal → contract → escrow → shipping.' },
+    { t: 'Signing rooms', b: 'In-platform contract signing with OTP is rare among competitors. Record a 30-second demo of the full signing flow for social proof.' },
+    { t: 'Human admin override story', b: 'Marketplaces are infamous for faceless moderation. Advertise that every AI decision on Dealzoin can be appealed to a human admin — you just built this.' } ] },
+  { key: 'logistics', label: 'Logistics & shipping', entities: ['Freight forwarder', 'Containerization'], ideas: [
+    { t: 'Carrier scoreboard', b: 'Rank shipping companies on completed deliveries, average bid spread, and response time. Public rankings push carriers to bid sharper.' },
+    { t: 'Multimodal bundling', b: 'Let a sea carrier and a land carrier co-bid a route as a bundle (sea + last-mile). Multimodal is where GCC logistics is heading.' },
+    { t: 'ETA tracking page', b: 'Extend the tracking map: carriers post position updates on active shipments, buyers see live ETAs. Retention feature for both sides.' },
+    { t: 'Freight rate index', b: 'Aggregate anonymized shipping bids into a monthly "Dealzoin freight index" per corridor — free PR and a reason for journalists to cite you.' },
+    { t: 'Insurance add-on partnerships', b: 'Cargo insurance is the most-asked logistics add-on. Partner with an insurer and offer one-click quotes on accepted shipping bids.' } ] },
+  { key: 'fintech', label: 'Trade finance & escrow', entities: ['Escrow', 'Trade finance'], ideas: [
+    { t: 'Milestone payments', b: 'Split big deal payments into milestones (production → shipping → delivery), each releasing part of the escrow. Unlocks larger deals from cautious buyers.' },
+    { t: 'Local payment rails', b: 'PayPal is a start — UAE buyers will ask for bank transfer and local gateways (Stripe, Telr, Network International). Add the second rail before churn asks for it.' },
+    { t: 'Invoice factoring intro', b: 'Sellers wait 30-90 days on B2B invoices. Partner with a factoring provider; take a referral fee on financed invoices.' },
+    { t: 'Dispute mediation SLA', b: 'Publish a 48-hour admin mediation SLA on escrow disputes. A written SLA converts better than any badge.' },
+    { t: 'Credit lines for repeat buyers', b: 'After 3 completed escrow deals, offer qualified buyers "pay after delivery" terms with platform guarantee — financed by the commission float.' } ] },
+  { key: 'growth', label: 'Growth & marketing', entities: ['Network effect', 'Digital marketing'], ideas: [
+    { t: 'Two-sided referral loop', b: 'Buyer invites a supplier → both get a commission discount on their next closed deal. Referrals are the cheapest growth for marketplaces.' },
+    { t: 'SEO category pages', b: 'Generate public landing pages per category + emirate ("verified copper suppliers in Abu Dhabi"). Programmatic SEO is how Alibaba gets most of its traffic.' },
+    { t: 'Supplier onboarding kit', b: 'A 1-page PDF + 3-minute video: "post your first product in 5 minutes". Every support question you answer twice becomes part of the kit.' },
+    { t: 'Deal-of-the-week newsletter', b: 'Weekly email with the best open tender + newest verified supplier. Even 200 subscribers create a habit loop.' },
+    { t: 'LinkedIn founder content', b: 'Post the journey of building a verified-only B2B network in Abu Dhabi — founder-led content outperforms ads for early B2B platforms.' } ] }
+];
+
+function ideaSourceNote(facts) {
+  const f = (facts || []).filter(Boolean).find(Boolean);
+  return f ? `\n\n📚 Context from research: ${f}` : '';
+}
+
+/** Insert an idea/research card unless an identical title exists from the last 30 days. */
+function insertIdea(topic, kind, title, body, sources) {
+  const since = new Date(Date.now() - 30 * 86400000).toISOString();
+  const dupe = db.prepare('SELECT id FROM agent_ideas WHERE title = ? AND created_at > ?').get(title, since);
+  if (dupe) return null;
+  const info = db.prepare('INSERT INTO agent_ideas (topic, kind, title, body, sources, status, created_at) VALUES (?,?,?,?,?, \'new\', ?)')
+    .run(topic, kind, title.slice(0, 200), body.slice(0, 4000), String(sources || '').slice(0, 500), now());
+  return info.lastInsertRowid;
+}
+
+/** Research one topic on the open internet and write a findings card + fresh idea cards. */
+async function runStrategyTopic(topic) {
+  const facts = [], srcUrls = [];
+  for (const ent of topic.entities.slice(0, 2)) {
+    const [wp, ddg] = await Promise.allSettled([srcWikipedia(ent), srcDuckDuckGo(ent)]);
+    if (wp.status === 'fulfilled' && wp.value && wp.value.summary) { facts.push(wp.value.summary); if (wp.value.url) srcUrls.push(wp.value.url); }
+    if (ddg.status === 'fulfilled' && ddg.value && ddg.value.abstract) { facts.push(ddg.value.abstract); if (ddg.value.url) srcUrls.push(ddg.value.url); }
+  }
+  const srcLine = srcUrls.slice(0, 4).join(' · ');
+  const body = facts.length
+    ? `Findings on "${topic.label}":\n\n` + facts.map((f) => `• ${f}`).join('\n')
+    : `The agent could not reach external sources this cycle for "${topic.label}" (network restricted or sources down) — ideas below are generated from the built-in strategy pool.`;
+  insertIdea(topic.key, 'research', `🔬 Research: ${topic.label}`, body, srcLine);
+  // Fresh ideas: skip any title already suggested in the last 30 days so the feed keeps changing.
+  const since = new Date(Date.now() - 30 * 86400000).toISOString();
+  const used = new Set(db.prepare('SELECT title FROM agent_ideas WHERE topic = ? AND created_at > ?').all(topic.key, since).map((r) => r.title));
+  const fresh = topic.ideas.filter((i) => !used.has('💡 ' + i.t));
+  const pool = fresh.length ? fresh : topic.ideas;   // pool exhausted → recycle oldest ideas
+  const picks = [...pool].sort(() => Math.random() - 0.5).slice(0, 2);
+  for (const p of picks) insertIdea(topic.key, 'idea', '💡 ' + p.t, p.b + ideaSourceNote(facts), srcLine);
+  return { facts: facts.length, ideas: picks.length };
+}
+
+let strategyRunning = false;
+/** One strategy cycle: research the least-recently-covered topic. Safe to call anytime. */
+async function strategyCycle(trigger) {
+  if (strategyRunning) return null;
+  strategyRunning = true;
+  try {
+    const lastRows = db.prepare('SELECT topic, MAX(created_at) AS last FROM agent_ideas GROUP BY topic').all();
+    const lastMap = {};
+    for (const r of lastRows) lastMap[r.topic] = r.last;
+    const next = [...STRATEGY_TOPICS].sort((a, b) => String(lastMap[a.key] || '').localeCompare(String(lastMap[b.key] || '')))[0];
+    const res = await runStrategyTopic(next);
+    audit('STRATEGY AGENT', 'research cycle', 'pass', `${trigger || 'auto'}: researched "${next.label}" — ${res.facts} finding(s), ${res.ideas} new idea(s)`);
+    return next.label;
+  } catch (e) {
+    try { audit('STRATEGY AGENT', 'research cycle', 'fail', `${trigger || 'auto'} cycle error: ${e.message}`); } catch (e2) {}
+    return null;
+  } finally { strategyRunning = false; }
+}
+// Always-on schedule: first cycle 3 minutes after boot, then every 6 hours. unref() so the
+// timers never keep a process alive (and never block requests — cycles are fire-and-forget).
+try { setTimeout(() => { strategyCycle('auto'); }, 3 * 60 * 1000).unref(); } catch (e) {}
+try { setInterval(() => { strategyCycle('auto'); }, 6 * 60 * 60 * 1000).unref(); } catch (e) {}
+
+/** On-demand brainstorm: live research on the question + related stored ideas + next steps. */
+async function strategyBrainstorm(question) {
+  const STOP = new Set(['with', 'from', 'that', 'this', 'have', 'what', 'when', 'how', 'can', 'the', 'and', 'for', 'should', 'would', 'could', 'about', 'into', 'dealzoin']);
+  const kws = question.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter((w) => w.length > 3 && !STOP.has(w)).slice(0, 4);
+  const query = kws.join(' ') || question.slice(0, 60);
+  const facts = [], srcUrls = [];
+  const [wp, ddg] = await Promise.allSettled([srcWikipedia(query), srcDuckDuckGo(query)]);
+  if (wp.status === 'fulfilled' && wp.value && wp.value.summary) { facts.push(wp.value.summary); if (wp.value.url) srcUrls.push(wp.value.url); }
+  if (ddg.status === 'fulfilled' && ddg.value && ddg.value.abstract) { facts.push(ddg.value.abstract); if (ddg.value.url) srcUrls.push(ddg.value.url); }
+  // Related ideas from the agent's own earlier research.
+  const related = [];
+  if (kws.length) {
+    const like = kws.map(() => '(title LIKE ? OR body LIKE ?)').join(' OR ');
+    const args = kws.flatMap((k) => [`%${k}%`, `%${k}%`]);
+    try { related.push(...db.prepare(`SELECT title, body FROM agent_ideas WHERE status != 'dismissed' AND (${like}) ORDER BY id DESC LIMIT 4`).all(...args)); } catch (e) {}
+  }
+  const body =
+    `🧠 Brainstorm on: "${question}"\n\n` +
+    `📚 RESEARCH FINDINGS:\n` + (facts.length ? facts.map((f) => `• ${f}`).join('\n') : '• No live findings — sources unreachable right now; using stored research below.') +
+    `\n\n🔗 RELATED IDEAS FROM EARLIER RESEARCH:\n` + (related.length ? related.map((r) => `• ${r.title}`).join('\n') : '• None stored yet — run a few research cycles to build the knowledge base.') +
+    `\n\n🚀 SUGGESTED NEXT STEPS:\n` +
+    `• Pilot: pick 5 friendly companies and test the idea with them for 2 weeks.\n` +
+    `• Measure: define one number that proves it works (bids per tender, orders per week, …) before building the full version.\n` +
+    `• Protect: check whether competitors already do this — if yes, do it verified-only, which they cannot copy.`;
+  const id = insertIdea('brainstorm', 'brainstorm', `🧠 ${question.slice(0, 90)}`, body, srcUrls.slice(0, 4).join(' · '));
+  return id;
+}
+
+function ideaKindBadge(kind) {
+  return kind === 'research' ? '<span class="badge badge-flow">🔬 RESEARCH</span>'
+    : kind === 'brainstorm' ? '<span class="badge badge-contract">🧠 BRAINSTORM</span>'
+    : '<span class="badge badge-agent">💡 IDEA</span>';
+}
+
+// Admin idea feed.
+app.get('/admin/ideas', requireAdmin, (req, res) => {
+  const filter = ['new', 'saved', 'dismissed'].includes(req.query.status) ? req.query.status : '';
+  const rows = filter
+    ? db.prepare('SELECT * FROM agent_ideas WHERE status = ? ORDER BY id DESC LIMIT 100').all(filter)
+    : db.prepare(`SELECT * FROM agent_ideas WHERE status != 'dismissed' ORDER BY (status = 'new') DESC, id DESC LIMIT 100`).all();
+  const newCount = db.prepare(`SELECT COUNT(*) AS n FROM agent_ideas WHERE status = 'new'`).get().n;
+  const lastRun = db.prepare('SELECT MAX(created_at) AS t FROM agent_ideas').get().t || '';
+  const cards = rows.length ? rows.map((r) => `
+    <div class="card" data-reveal style="margin-bottom:10px;${r.status === 'new' ? 'border-left:4px solid var(--gold,#c9a227)' : ''}">
+      <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center">
+        <span>${ideaKindBadge(r.kind)} <b>${esc(r.title)}</b></span>
+        <span class="muted">${esc(r.created_at.slice(0, 16).replace('T', ' '))} UTC ${r.status === 'saved' ? '· ⭐ saved' : ''}</span>
+      </div>
+      <p style="white-space:pre-wrap;margin:8px 0">${esc(r.body)}</p>
+      ${r.sources ? `<p class="muted" style="margin:0 0 6px">Sources: ${sourceLinksHtml(r.sources)}</p>` : ''}
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        ${r.status !== 'saved' ? `<form method="POST" action="/admin/ideas/${r.id}/status"><input type="hidden" name="status" value="saved"><button class="btn btn-sm btn-outline" type="submit">⭐ Save</button></form>` : ''}
+        ${r.status !== 'dismissed' ? `<form method="POST" action="/admin/ideas/${r.id}/status"><input type="hidden" name="status" value="dismissed"><button class="btn btn-sm btn-outline" type="submit">✖️ Dismiss</button></form>` : ''}
+        ${r.status !== 'new' ? `<form method="POST" action="/admin/ideas/${r.id}/status"><input type="hidden" name="status" value="new"><button class="btn btn-sm btn-outline" type="submit">↩️ Move to new</button></form>` : ''}
+      </div>
+    </div>`).join('') : '<div class="card muted">No ideas yet — press "Research now" to run the agent.</div>';
+  const body = `
+  <div class="kicker">Strategy Agent</div>
+  <h2 style="margin:4px 0 14px">🛰️ Strategy Agent — research &amp; ideas</h2>
+  <div class="card" data-reveal style="margin-bottom:12px">
+    <p class="muted" style="margin-top:0">Your always-on researcher: every 6 hours it picks a strategic topic, researches it on the
+    open internet (Wikipedia + DuckDuckGo), writes up findings, and brainstorms new ideas for Dealzoin. <b>${newCount}</b> new item${newCount === 1 ? '' : 's'}${lastRun ? ` · last research ${esc(lastRun.slice(0, 16).replace('T', ' '))} UTC` : ''}.</p>
+    <form method="POST" action="/admin/ideas/run" style="display:inline"><button class="btn" type="submit">🔬 Research now</button></form>
+    <a class="btn btn-outline" href="/admin/dashboard" style="margin-left:8px">← Dashboard</a>
+    <form method="POST" action="/admin/ideas/brainstorm" style="margin-top:12px">
+      <label>🧠 Brainstorm with the agent</label>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <input type="text" name="question" required maxlength="300" placeholder="e.g. How can I attract shipping companies from Saudi Arabia?" style="flex:1;min-width:260px">
+        <button class="btn" type="submit">Brainstorm</button>
+      </div>
+    </form>
+  </div>
+  <div class="card" data-reveal style="margin-bottom:12px">
+    <b>Filter:</b> <a href="/admin/ideas">Active</a> · <a href="/admin/ideas?status=new">New</a> · <a href="/admin/ideas?status=saved">⭐ Saved</a> · <a href="/admin/ideas?status=dismissed">Dismissed</a>
+  </div>
+  ${cards}`;
+  res.send(page('Strategy Agent', body, req.user, req.query.msg, req.query.err));
+});
+
+app.post('/admin/ideas/run', requireAdmin, ah(async (req, res) => {
+  const label = await strategyCycle('manual');
+  res.redirect('/admin/ideas?msg=' + encodeURIComponent(label ? `Research cycle complete — topic: ${label}.` : 'A research cycle is already running — check back in a minute.'));
+}));
+
+app.post('/admin/ideas/brainstorm', requireAdmin, rateLimitRoute('idea-brainstorm', 20, 60 * 60 * 1000, '/admin/ideas'), ah(async (req, res) => {
+  const q = String((req.body || {}).question || '').trim().slice(0, 300);
+  if (q.length < 5) return res.redirect('/admin/ideas?err=' + encodeURIComponent('Type a question first (a few words).'));
+  const id = await strategyBrainstorm(q);
+  audit('STRATEGY AGENT', 'brainstorm', 'pass', `Admin brainstorm: "${q.slice(0, 120)}"`);
+  res.redirect('/admin/ideas?msg=' + encodeURIComponent(id ? 'Brainstorm card added to the feed below 🧠' : 'A very similar brainstorm already exists in the feed.'));
+}));
+
+app.post('/admin/ideas/:id/status', requireAdmin, (req, res) => {
+  const r = db.prepare('SELECT * FROM agent_ideas WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!r) return res.redirect('/admin/ideas?err=' + encodeURIComponent('Idea not found.'));
+  const status = ['new', 'saved', 'dismissed'].includes((req.body || {}).status) ? req.body.status : r.status;
+  db.prepare('UPDATE agent_ideas SET status = ? WHERE id = ?').run(status, r.id);
+  res.redirect('/admin/ideas?msg=' + encodeURIComponent(`"${r.title.slice(0, 60)}" → ${status}.`));
 });
 
 app.post('/admin/companies/:id/research', requireAdmin, ah(async (req, res) => {
@@ -11160,38 +13201,30 @@ app.post('/admin/companies/:id/research', requireAdmin, ah(async (req, res) => {
     return res.redirect('/admin/dashboard?msg=' + encodeURIComponent(`Intelligence saved for ${c.name}.`));
   }
 
-  // Research branch: "Run research" button — query the public Wikipedia summary API (no key, 5s timeout).
-  let suggestion = null, sourceUrl = '', failReason = '';
-  try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 5000);
-    const r = await fetch('https://en.wikipedia.org/api/rest_v1/page/summary/' + encodeURIComponent(c.name), {
-      signal: ctrl.signal, headers: { 'User-Agent': 'Dealzoin Research Agent' }
-    });
-    clearTimeout(timer);
-    if (r.ok) {
-      const data = await r.json();
-      if (data && data.extract) {
-        const firstSentence = String(data.extract).split(/(?<=[.!?])\s+/)[0].trim().slice(0, 200);
-        suggestion = firstSentence;
-        sourceUrl = (data.content_urls && data.content_urls.desktop && data.content_urls.desktop.page) || '';
-      } else {
-        failReason = 'no summary extract returned';
-      }
-    } else {
-      failReason = `Wikipedia API HTTP ${r.status}`;
-    }
-  } catch (e) {
-    failReason = e.name === 'AbortError' ? 'Wikipedia API timed out (5s)' : `fetch error: ${e.message}`;
-  }
+  // Research branch: "Run research" button — multi-source keyless lookup (Wikipedia, Wikidata,
+  // DuckDuckGo, GLEIF LEI registry, and the company's own website), all queried in parallel.
+  // researchCompany never throws; per-source failures are reported in the breakdown below.
+  const research = await researchCompany(c.name, c.website);
 
-  if (suggestion) {
-    // Never overwrite non-empty fields — only fill in blanks.
-    if (!c.field) db.prepare('UPDATE companies SET field = ? WHERE id = ?').run(suggestion, c.id);
-    if (sourceUrl) db.prepare('UPDATE companies SET research_source = ? WHERE id = ?').run(sourceUrl, c.id);
-    audit('RESEARCH AGENT', 'research run', 'pass', `Research for "${c.name}" — Wikipedia summary found${c.field ? ' (field kept: already set)' : `, suggested field: "${suggestion}"`}${sourceUrl ? ', source: ' + sourceUrl : ''}. Trade license: ${c.trade_license || 'not provided'}`);
+  // Merge: never overwrite non-empty intel fields — only fill in blanks.
+  const applied = [];
+  if (research.merged.field && !c.field) {
+    db.prepare('UPDATE companies SET field = ? WHERE id = ?').run(research.merged.field.slice(0, 300), c.id);
+    applied.push(`field ← "${research.merged.field.slice(0, 80)}"`);
+  }
+  if (research.merged.employees && !c.employees) {
+    db.prepare('UPDATE companies SET employees = ? WHERE id = ?').run(research.merged.employees.slice(0, 80), c.id);
+    applied.push(`employees ← "${research.merged.employees}"`);
+  }
+  if (research.sourceUrls) {
+    db.prepare('UPDATE companies SET research_source = ? WHERE id = ?').run(research.sourceUrls.slice(0, 500), c.id);
+    applied.push('source links recorded');
+  }
+  const foundLabels = research.sources.filter(s => s.status === 'found').map(s => s.label);
+  if (research.anyFound) {
+    audit('RESEARCH AGENT', 'research run', 'pass', `Research for "${c.name}" — found via ${foundLabels.join(', ')}${applied.length ? '; applied: ' + applied.join('; ') : ' (no blank fields to fill)'}. Trade license: ${c.trade_license || 'not provided'}`);
   } else {
-    audit('RESEARCH AGENT', 'research run', 'fail', `Research for "${c.name}" — no public summary found (${failReason || 'not found'}). Trade license: ${c.trade_license || 'not provided'}`);
+    audit('RESEARCH AGENT', 'research run', 'fail', `Research for "${c.name}" — no public footprint found across ${research.sources.length} sources. Trade license: ${c.trade_license || 'not provided'}`);
   }
 
   // Trust & KYC upgrade: mine the company's uploaded profile PDF for field/employees hints.
@@ -11219,10 +13252,43 @@ app.post('/admin/companies/:id/research', requireAdmin, ah(async (req, res) => {
   } catch (e) {
     audit('RESEARCH AGENT', 'profile PDF mining', 'fail', `Research for "${c.name}" — profile PDF mining error: ${e.message}`);
   }
-  // Redirect to the edit form so the admin can confirm/edit before saving.
-  res.redirect(`/admin/companies/${c.id}/research?` + (suggestion
-    ? 'msg=' + encodeURIComponent('Research found a public summary — review and save.')
-    : 'err=' + encodeURIComponent('No public data found for "' + c.name + '" (' + (failReason || 'not found') + '). You can still fill the fields manually.')));
+  // Render the per-source breakdown — transparency about what each source contributed is
+  // the point of the multi-source upgrade. All fetched text is escaped via esc().
+  const statusBadge = s => s.status === 'found' ? '<span class="badge badge-pass">✅ found</span>'
+    : s.status === 'error' ? '<span class="badge badge-sealed">⚠️ error</span>'
+    : '<span class="badge">❌ no result</span>';
+  const srcRows = research.sources.map(s => `
+    <tr>
+      <td style="white-space:nowrap"><b>${esc(s.label)}</b></td>
+      <td>${statusBadge(s)}${s.note ? `<div class="muted" style="margin-top:4px">${esc(s.note)}</div>` : ''}</td>
+      <td>${s.facts.length ? s.facts.map(([k, v]) => `<div style="margin-bottom:3px"><span class="muted">${esc(k)}:</span> ${esc(v)}</div>`).join('') : '<span class="muted">—</span>'}</td>
+      <td>${s.url ? `<a href="${esc(s.url)}" rel="noopener noreferrer nofollow">source ↗</a>` : '<span class="muted">—</span>'}</td>
+    </tr>`).join('');
+  // A GLEIF LEI record is a STRONG verification signal (LEI issuance requires validated
+  // registration documents) — surface it prominently above the breakdown.
+  const gleifBanner = research.gleif ? `
+  <div class="card" data-reveal style="border-color:var(--success)">
+    <h3 style="margin:0 0 8px">🟢 GLEIF LEI match — <span class="badge badge-pass">strong verification signal</span></h3>
+    <p class="muted" style="margin:0">A Legal Entity Identifier record exists for this company${research.gleif.legalName ? ` (<b>${esc(research.gleif.legalName)}</b>)` : ''}${research.gleif.entityStatus ? ` — entity status: <b>${esc(research.gleif.entityStatus)}</b>` : ''}. LEI issuance requires validated registration documents, so this materially supports verification.</p>
+  </div>` : '';
+  const summaryHtml = research.anyFound
+    ? `<p class="muted">Queried ${research.sources.length} keyless public sources in parallel. ${applied.length ? 'Auto-filled blank intel fields: ' + esc(applied.join('; ')) + '.' : 'No blank intel fields needed filling.'}${profileNote ? ' Profile PDF: ' + esc(profileNote) + '.' : ''} Review and save on the edit page.</p>`
+    : `<div class="card" data-reveal><h3 style="margin:0 0 8px">🔍 No public footprint found</h3>
+      <p class="muted" style="margin:0">None of the ${research.sources.length} public sources returned data for "${esc(c.name)}". This is a legitimate KYC result — an absent public footprint is itself a verification signal. You can still fill the intelligence fields manually.</p></div>`;
+  const body = `
+  <div class="card" style="max-width:860px;margin:0 auto">
+    <div class="kicker">🔬 Research Agent — multi-source report</div>
+    <h2 style="margin:6px 0 10px">${esc(c.name)}</h2>
+    ${gleifBanner}
+    ${summaryHtml}
+    <table style="margin-top:14px"><tr><th>Source</th><th>Result</th><th>Facts contributed</th><th>Link</th></tr>${srcRows}</table>
+    <div style="margin-top:14px">
+      <a class="btn" href="/admin/companies/${c.id}/research">Review &amp; edit intelligence →</a>
+      <a class="btn btn-outline" href="/admin/dashboard" style="margin-left:8px">Back to dashboard</a>
+    </div>
+  </div>`;
+  res.send(page('Research results — ' + c.name, body, req.user,
+    research.anyFound ? 'Research complete — per-source breakdown below.' : '', ''));
 }));
 
 // ----- Batch C (3): admin bank-KYC override (pins the BANK RESEARCH AGENT verdict) -----
@@ -11524,7 +13590,7 @@ const zoAuditThrottle = new Map(); // session/IP key -> last audit ts (max 1 age
 /** Tiny live counters for account-aware answers — a handful of indexed COUNTs, computed lazily. */
 function zoQuickStats(user) {
   const s = { openDeals: 0, pendingPayments: 0, contracts: 0, unreadChats: 0, unreadNotifs: 0, activeNegotiations: 0 };
-  if (!user || user.isAdmin) return s;
+  if (!user || user.isAdmin || user.isPerson) return s;   // all queries below are company-keyed — persons share the id space
   try { s.openDeals = db.prepare(`SELECT COUNT(*) AS n FROM deals WHERE company_id = ? AND COALESCE(status, 'open') = 'open'`).get(user.id).n; } catch (e) { /* keep 0 */ }
   try { s.pendingPayments = db.prepare(`SELECT COUNT(*) AS n FROM deals WHERE company_id = ? AND payment_status = 'pending_payment'`).get(user.id).n; } catch (e) { /* keep 0 */ }
   try { s.contracts = db.prepare('SELECT COUNT(*) AS n FROM contracts WHERE signer_company_id = ? OR owner_company_id = ?').get(user.id, user.id).n; } catch (e) { /* keep 0 */ }
@@ -11570,7 +13636,7 @@ const ZO_KNOWLEDGE = [
       links: [{ label: 'Browse products', href: '/products' }, { label: 'Post a product', href: '/products/new' }], sug: ['How do I post a deal?', 'What is MOQ?'] }) },
   { id: 'moq_explain', scope: 'public',
     kw: [['what is moq', 7], ['moq mean', 6], ['minimum order quantity', 7], ['what does moq', 7]],
-    reply: () => ({ text: 'MOQ stands for Minimum Order Quantity — the smallest amount a seller will accept for an order (e.g. "500 units" or "1 × 20ft container"). It is standard in B2B trade: sellers set it so production and shipping stay economical. On Dealzoin you set the MOQ on each product listing, and it shows as a chip buyers see before they contact you.',
+    reply: () => ({ text: 'MOQ stands for Minimum Order Quantity — the smallest amount a seller will accept for an order (e.g. "500 units" or "100 kg"). It is standard in B2B trade: sellers set it so production and shipping stay economical. On Dealzoin you set the MOQ on each product listing, and it shows as a chip buyers see before they contact you.',
       links: [{ label: 'Post a product', href: '/products/new' }], sug: ['How do I post a product?', 'How do I post a deal?'] }) },
   { id: 'deal_numbers', scope: 'public',
     kw: [['deal number', 6], ['deal numbers', 6], ['numbering', 3], ['reference number', 3], ['dz', 2]],
@@ -11677,6 +13743,14 @@ const ZO_KNOWLEDGE = [
     reply: () => ({ text: 'I can explain: registration & KYC, posting buy/sell deals, the LOI → PO → signing pipeline, counter offers, commission & the payment gate, shipment tracking & incoterms, chats, private contracts, notifications, calendar & video calls, sub-accounts, reputation, account security, themes and uploads. Just ask in plain words!',
       links: [], sug: ZO_STARTERS }) },
 
+  { id: 'shipping_register', scope: 'public',
+    kw: [['shipping company', 7], ['logistics register', 8], ['register logistics', 8], ['freight company', 7], ['freight company sign up', 9], ['freight forwarder', 6], ['logistics company', 6], ['shipping type', 6], ['register as a shipping', 8], ['carrier register', 7]],
+    reply: () => ({ text: 'Shipping companies register like any other company — on the signup page choose the category "Logistics", then pick your shipping type: Sea freight, Air freight, Land freight or Multimodal. After admin approval you can bid to ship closed deals from their deal pages.',
+      links: [{ label: 'Register company', href: '/signup' }], sug: ['How do I register?', 'Which KYC documents do I need?'] }) },
+  { id: 'shipping_bids', scope: 'user',
+    kw: [['shipping bid', 8], ['shipping bids', 8], ['ship my deal', 8], ['freight bid', 8], ['logistics bid', 8], ['bid to ship', 8], ['ship this deal', 8], ['who ships', 5], ['find a carrier', 6], ['shipping opportunities', 7]],
+    reply: () => ({ text: 'When a deal is closed (contract finalized), Logistics companies can bid to ship it: open the deal page and use the "🚢 Bid to ship this deal" card — you see the route and incoterm, never the deal value. The deal owner or buyer accepts ONE bid; the winner is notified and all other bids are rejected. Open shipping opportunities are also listed on the Tenders board.',
+      links: [{ label: 'Tenders board', href: '/tenders' }], sug: ['What are incoterms?', 'How does tracking work?'] }) },
   // ----- Security & privacy (Security Agent answers) -----
   { id: 'account_security', scope: 'public',
     kw: [['is my account secure', 8], ['account security', 7], ['how secure', 6], ['security', 4], ['secure', 4], ['safety', 4], ['safe', 3], ['hack', 4], ['hacked', 5], ['hacker', 4], ['protect my account', 6], ['account protection', 6], ['is it safe', 6], ['is dealzoin safe', 7]],
@@ -11903,7 +13977,7 @@ app.post('/lang', (req, res) => {
   if (SUPPORTED_LANGS.includes(lang)) {
     res.setHeader('Set-Cookie', `dz_lang=${lang}; Path=/; Max-Age=${365 * 24 * 3600}; SameSite=Lax`);
     const u = currentUser(req);
-    if (u && !u.isAdmin) {
+    if (u && !u.isAdmin && !u.isPerson) {   // companies.id is company-keyed — a person id must never update a company row
       try { db.prepare('UPDATE companies SET lang = ? WHERE id = ?').run(lang, u.id); } catch (e) { /* cookie still set */ }
     }
   }
@@ -12364,13 +14438,144 @@ CREATE TABLE IF NOT EXISTS tender_bids (
 );
 CREATE INDEX IF NOT EXISTS idx_tender_bids_tender ON tender_bids(tender_id);
 CREATE INDEX IF NOT EXISTS idx_tenders_company ON tenders(company_id, status);
+-- Tender attachments: spec sheets, drawings, RFQ PDFs/images uploaded by the tender owner.
+-- Files live in the media table; this table links them to the tender.
+CREATE TABLE IF NOT EXISTS tender_files (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  tender_id  INTEGER NOT NULL,
+  company_id INTEGER NOT NULL,
+  media_id   INTEGER NOT NULL,
+  filename   TEXT DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tender_files_tender ON tender_files(tender_id);
+-- SAM.gov-style bidding workflow:
+--  tender_follows    — watchlist ("Follow") + public "Interested vendors" list
+--  tender_updates    — amendment / notice history (posted → amended → closed → award notice | cancelled)
+--  tender_questions  — public Q&A: vendors ask, owner answers, everyone sees the answer
+CREATE TABLE IF NOT EXISTS tender_follows (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  tender_id  INTEGER NOT NULL,
+  company_id INTEGER NOT NULL,
+  kind       TEXT NOT NULL DEFAULT 'follow',   -- follow | interested
+  created_at TEXT NOT NULL,
+  UNIQUE(tender_id, company_id, kind)
+);
+CREATE TABLE IF NOT EXISTS tender_updates (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  tender_id  INTEGER NOT NULL,
+  note       TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tender_questions (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  tender_id   INTEGER NOT NULL,
+  company_id  INTEGER NOT NULL,
+  question    TEXT NOT NULL,
+  answer      TEXT DEFAULT '',
+  answered_at TEXT DEFAULT '',
+  created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tender_follows_tender ON tender_follows(tender_id);
+CREATE INDEX IF NOT EXISTS idx_tender_updates_tender ON tender_updates(tender_id);
+CREATE INDEX IF NOT EXISTS idx_tender_questions_tender ON tender_questions(tender_id);
 `);
+// Award signing: awarded_at stamps the award; winner_signed_at / winner_sign_name record the
+// WINNING BIDDER's signature — only the winner can sign, and only once.
+try { db.exec(`ALTER TABLE tenders ADD COLUMN awarded_at TEXT DEFAULT ''`); } catch (e) {}
+try { db.exec(`ALTER TABLE tenders ADD COLUMN winner_signed_at TEXT DEFAULT ''`); } catch (e) {}
+try { db.exec(`ALTER TABLE tenders ADD COLUMN winner_sign_name TEXT DEFAULT ''`); } catch (e) {}
+
+const TENDER_FILE_MAX_BYTES = 8 * 1024 * 1024;  // 8 MB per attachment
+const TENDER_FILE_MAX_COUNT = 5;                 // per tender
+const TENDER_FILE_IMAGE_EXT = { png: 1, jpg: 1, jpeg: 1, gif: 1, webp: 1 };
+
+/** Multer middleware for tender attachments ("files" field, up to 5 PDF/image files).
+ *  Extension + MIME whitelist, then magic-byte sniffing; friendly redirect on rejection. */
+function tenderFilesUpload(req, res, next) {
+  const back = (req.get('referer') || '/tenders').split('?')[0];
+  const fail = (msg) => res.redirect(back + '?err=' + encodeURIComponent(msg));
+  const mw = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: TENDER_FILE_MAX_BYTES, files: TENDER_FILE_MAX_COUNT },
+    fileFilter: (rq, file, cb) => {
+      const ext = String(file.originalname || '').split('.').pop().toLowerCase();
+      const mime = String(file.mimetype || '').toLowerCase();
+      const okPdf = ext === 'pdf' && (mime === 'application/pdf' || mime === 'application/x-pdf');
+      const okImage = TENDER_FILE_IMAGE_EXT[ext] && mime.startsWith('image/');
+      if (okPdf || okImage) return cb(null, true);
+      cb(new Error('Tender files must be PDF documents or images (png, jpg, gif, webp).'));
+    }
+  }).array('files', TENDER_FILE_MAX_COUNT);
+  mw(req, res, (err) => {
+    if (err) {
+      const msg = err.code === 'LIMIT_FILE_SIZE' ? 'Each tender file is limited to 8 MB.'
+        : err.code === 'LIMIT_FILE_COUNT' || err.code === 'LIMIT_UNEXPECTED_FILE' ? `You can attach at most ${TENDER_FILE_MAX_COUNT} files.`
+        : (err.message || 'Upload rejected.');
+      return fail(msg);
+    }
+    for (const f of (req.files || [])) {
+      const ext = String(f.originalname || '').split('.').pop().toLowerCase();
+      const realPdf = isPdfBuffer(f.buffer);
+      const realImage = isImageBuffer(f.buffer);
+      if (!realPdf && !realImage) return fail('Upload rejected: "' + String(f.originalname || '').slice(0, 80) + '" is not a real PDF or image file.');
+      if (realPdf && ext !== 'pdf') return fail('Upload rejected: file content does not match its extension.');
+      if (realImage && !TENDER_FILE_IMAGE_EXT[ext]) return fail('Upload rejected: file content does not match its extension.');
+    }
+    next();
+  });
+}
+
+/** Persist tender attachment files (already sniffed) into media + tender_files. Returns count saved. */
+function saveTenderFiles(tenderId, companyId, files) {
+  let n = 0;
+  for (const f of (files || [])) {
+    try {
+      const mediaId = saveMedia(companyId, f);
+      db.prepare('INSERT INTO tender_files (tender_id, company_id, media_id, filename, created_at) VALUES (?,?,?,?,?)')
+        .run(tenderId, companyId, mediaId, String(f.originalname || '').slice(0, 200), now());
+      n++;
+    } catch (e) { /* a single bad file must not sink the tender */ }
+  }
+  return n;
+}
+
+/** Attachment chip list for the tender page. */
+function tenderFilesHtml(tenderId, isOwner) {
+  const files = db.prepare('SELECT * FROM tender_files WHERE tender_id = ? ORDER BY id').all(tenderId);
+  const list = files.length ? files.map((f) => `
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0;border-bottom:1px solid var(--line,#eee)">
+      <span>📎 <a href="/tender-file/${f.id}"><b>${esc(f.filename || ('file-' + f.id))}</b></a></span>
+      ${isOwner ? `<form method="POST" action="/tenders/${tenderId}/files/${f.id}/delete" style="margin:0" onsubmit="return confirm('Delete this attachment?');"><button class="btn btn-sm btn-outline" type="submit">Delete</button></form>` : ''}
+    </div>`).join('') : '<p class="muted" style="margin:6px 0">No attachments yet.</p>';
+  const addForm = (isOwner && files.length < TENDER_FILE_MAX_COUNT) ? `
+    <form method="POST" action="/tenders/${tenderId}/files" enctype="multipart/form-data" style="margin-top:10px">
+      <label class="file-btn file-btn-sm"><span class="file-btn-text" data-default="📎 Add spec sheets / drawings (PDF or image)">📎 Add spec sheets / drawings (PDF or image)</span>
+        <input type="file" class="file-input" name="files" accept="application/pdf,.pdf,image/*" multiple></label>
+      <button class="btn btn-sm btn-outline" type="submit">Upload</button>
+      <p class="muted" style="margin:6px 0 0">Up to ${TENDER_FILE_MAX_COUNT} files, 8 MB each — PDF or images. Visible to all companies on the tender.</p>
+    </form>` : (isOwner ? `<p class="muted" style="margin-top:8px">Attachment limit reached (${TENDER_FILE_MAX_COUNT}).</p>` : '');
+  return `<div class="card" data-reveal><h3>📎 Tender files (${files.length})</h3>${list}${addForm}</div>`;
+}
 
 function tenderExpired(t) { return !!(t.deadline && t.deadline.slice(0, 10) < now().slice(0, 10)); }
 function tenderBadge(t) {
-  if (t.status === 'awarded') return '<span class="badge badge-approved">AWARDED</span>';
+  if (t.status === 'awarded') return t.winner_signed_at
+    ? '<span class="badge badge-approved">AWARDED · SIGNED ✍️</span>'
+    : '<span class="badge badge-approved">AWARDED</span>';
+  if (t.status === 'cancelled') return '<span class="badge badge-rejected">CANCELLED</span>';
+  if (t.status === 'closed') return '<span class="badge badge-contract">CLOSED</span>';
   if (tenderExpired(t)) return '<span class="badge badge-rejected">EXPIRED</span>';
   return '<span class="badge badge-pass">OPEN</span>';
+}
+/** Notify every company following (or bidding on) a tender — amendments, cancellation, award. */
+function notifyTenderFollowers(tenderId, text, link) {
+  try {
+    const ids = new Set();
+    for (const r of db.prepare('SELECT company_id FROM tender_follows WHERE tender_id = ?').all(tenderId)) ids.add(r.company_id);
+    for (const r of db.prepare('SELECT company_id FROM tender_bids WHERE tender_id = ?').all(tenderId)) ids.add(r.company_id);
+    for (const id of ids) notify(id, 'tender', text, link || `/tenders/${tenderId}`);
+  } catch (e) { /* follower notifications are best-effort */ }
 }
 
 app.get('/tenders', requireCompany, (req, res) => {
@@ -12387,6 +14592,12 @@ app.get('/tenders', requireCompany, (req, res) => {
     SELECT b.*, t.title AS tender_title, t.tender_number, t.status AS tender_status, t.deadline
     FROM tender_bids b JOIN tenders t ON t.id = b.tender_id
     WHERE b.company_id = ? ORDER BY b.created_at DESC LIMIT 30`).all(myId);
+  // Closed / awarded tenders stay listed — sealed bids become public after the deadline or close.
+  const decided = db.prepare(`
+    SELECT t.*, c.name AS poster_name,
+      (SELECT COUNT(*) FROM tender_bids b WHERE b.tender_id = t.id) AS bids
+    FROM tenders t JOIN companies c ON c.id = t.company_id
+    WHERE t.status != 'open' ORDER BY t.created_at DESC LIMIT 20`).all();
 
   const rowHtml = (t) => `
     <div class="card" style="margin-bottom:10px" data-reveal>
@@ -12397,36 +14608,43 @@ app.get('/tenders', requireCompany, (req, res) => {
           <span class="muted">${esc(t.category || '—')} · ${t.quantity ? fmtAmount(t.quantity) + ' ' + esc(t.unit) : 'qty open'} · ${esc(t.incoterm || 'CIF')} → ${esc(t.destination || 'anywhere')}</span><br>
           <span class="muted">by ${esc(t.poster_name || '')}${t.company_id === myId ? ' <span class="badge badge-agent">YOUR TENDER</span>' : ''} · deadline ${esc(t.deadline || '—')} · ${t.bids} bid${t.bids === 1 ? '' : 's'}</span>
         </div>
-        <div style="text-align:right">${tenderBadge(t)}<br><a class="btn btn-sm btn-outline" style="margin-top:6px" href="/tenders/${t.id}">${t.company_id === myId ? 'Review bids' : 'View & bid'}</a></div>
+        <div style="text-align:right">${tenderBadge(t)}<br><a class="btn btn-sm btn-outline" style="margin-top:6px" href="/tenders/${t.id}">${t.status !== 'open' ? 'View bids' : t.company_id === myId ? 'Review bids' : 'View & bid'}</a></div>
       </div>
     </div>`;
 
+  // 🚢 Shipping opportunities: closed deals still waiting for a shipping company (no accepted bid yet).
+  const shipOpps = db.prepare(`
+    SELECT d.id, d.deal_number, d.title, d.origin, d.destination, d.incoterm,
+      COALESCE((SELECT MAX(ct.decided_at) FROM contracts ct WHERE ct.deal_id = d.id AND ct.status = 'approved'), d.created_at) AS closed_at,
+      (SELECT COUNT(*) FROM shipping_bids b WHERE b.deal_id = d.id AND b.status != 'withdrawn') AS bids
+    FROM deals d
+    WHERE (d.contract_state = 'approved' OR d.status = 'closed')
+      AND NOT EXISTS (SELECT 1 FROM shipping_bids b WHERE b.deal_id = d.id AND b.status = 'accepted')
+    ORDER BY closed_at DESC LIMIT 40`).all();
+  const canShip = isShippingCompany(req.user);
+
   const body = `
   <div class="kicker">Trading tenders</div>
-  <h2 style="margin:4px 0 14px">📋 Tenders board</h2>
+  <div class="feed-head" style="margin:4px 0 14px">
+    <h2 style="margin:0">📋 Tenders board</h2>
+    <a class="btn" href="/tenders/new">➕ Post a tender</a>
+  </div>
   <div class="card" data-reveal>
-    <h3>➕ Post a buy tender</h3>
-    <p class="muted">Describe what you need — suppliers in the matching category are notified instantly, and any company can bid. When you award a bid, the deal + negotiation open automatically.</p>
-    <form method="POST" action="/tenders">
-      <label>Tender title *</label><input type="text" name="title" required maxlength="160" placeholder="e.g. 500 MT copper cathodes, CIF Rotterdam">
-      <div class="grid2" style="gap:10px">
-        <div><label>Category *</label><select name="category" required><option value="">— choose —</option>${optionsHtml(COMPANY_CATEGORIES, '')}</select>${otherInputHtml('category', '')}</div>
-        <div><label>Bid deadline *</label><input type="date" name="deadline" required min="${now().slice(0, 10)}"></div>
-      </div>
-      <div class="grid2" style="gap:10px">
-        <div><label>Quantity</label><input type="number" name="quantity" min="0" step="any" placeholder="e.g. 500"></div>
-        <div><label>Unit</label><select name="unit">${optionsHtml(DEAL_CARGO_UNITS, 'MT')}</select></div>
-      </div>
-      <div class="grid2" style="gap:10px">
-        <div><label>Destination</label><input type="text" name="destination" maxlength="160" placeholder="e.g. Rotterdam, NL"></div>
-        <div><label>Incoterm</label><select name="incoterm">${optionsHtml(DEAL_INCOTERMS, 'CIF')}</select></div>
-      </div>
-      <label>Specification / notes</label><textarea name="description" rows="3" maxlength="4000" placeholder="Grades, packaging, inspection, payment expectations…"></textarea>
-      <button class="btn" type="submit">Publish tender 📣</button>
-    </form>
+    <h3>🚢 Shipping opportunities</h3>
+    <p class="muted" style="margin-bottom:8px">Closed deals looking for a carrier — ${canShip ? 'open a deal and place your shipping bid.' : 'Logistics companies can bid to ship these from the deal page.'}</p>
+    ${shipOpps.length ? shipOpps.map((d) => `
+      <div style="padding:8px 0;border-top:1px dashed var(--border-soft);display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center">
+        <div>
+          <b><a href="/deal/${d.id}">${esc(d.title)}</a></b> <span class="muted">№ ${esc(d.deal_number || ('DZ-' + d.id))}</span><br>
+          <span class="muted">📍 ${esc(d.origin || 'Origin TBD')} → ${esc(d.destination || 'Destination TBD')} · ⚓ ${esc(d.incoterm || 'CIF')} · ${d.bids} bid${d.bids === 1 ? '' : 's'} · closed ${esc(String(d.closed_at || '').slice(0, 10))}</span>
+        </div>
+        <a class="btn btn-sm ${canShip ? '' : 'btn-outline'}" href="/deal/${d.id}">${canShip ? 'Bid 🚢' : 'View deal'}</a>
+      </div>`).join('') : '<p class="muted">No closed deals are waiting for a carrier right now.</p>'}
   </div>
   <h3 style="margin:18px 0 8px">🔥 Open tenders</h3>
   ${open.length ? open.map(rowHtml).join('') : '<div class="card muted">No open tenders yet — be the first to post one.</div>'}
+  <h3 style="margin:18px 0 8px">🔓 Recently closed &amp; awarded</h3>
+  ${decided.length ? decided.map(rowHtml).join('') : '<div class="card muted">Closed and awarded tenders will appear here — bids become public once a tender closes.</div>'}
   <h3 style="margin:18px 0 8px">🗂️ My tenders</h3>
   ${mine.length ? mine.map((t) => `
     <div class="card" style="margin-bottom:10px" data-reveal>
@@ -12445,7 +14663,7 @@ app.get('/tenders', requireCompany, (req, res) => {
   res.send(page('Tenders', body, req.user, req.query.msg, req.query.err, 'tenders'));
 });
 
-app.post('/tenders', requireCompany, (req, res) => {
+app.post('/tenders', requireCompany, rateLimitRoute('tender-post', 30, 60 * 60 * 1000, '/tenders'), tenderFilesUpload, (req, res) => {
   const b = req.body || {};
   const title = String(b.title || '').trim().slice(0, 160);
   if (!title) return res.redirect('/tenders?err=' + encodeURIComponent('Tender title is required.'));
@@ -12465,14 +14683,49 @@ app.post('/tenders', requireCompany, (req, res) => {
                          VALUES (?,?,?,?,?,?,?,?,?, 'open', ?)`)
     .run(req.user.id, title, category, description, quantity, unit, destination, incoterm, deadline, ts).lastInsertRowid;
   db.prepare('UPDATE tenders SET tender_number = ? WHERE id = ?').run('DZ-TND-' + id, id);
+  // Attachments (spec sheets, drawings) — already magic-byte verified by tenderFilesUpload.
+  const filesSaved = saveTenderFiles(id, req.user.id, req.files);
   // CONNECT SUPPLIERS: approved companies in the same category get an instant invite.
   try {
     const matches = db.prepare(`SELECT id FROM companies WHERE id != ? AND status = 'approved' AND lower(category) = lower(?) LIMIT 100`).all(req.user.id, category);
     for (const m of matches) notify(m.id, 'tender', `📋 New tender DZ-TND-${id} in ${category}: "${title}"${quantity ? ` — ${fmtAmount(quantity)} ${unit}` : ''}. Place your bid!`, `/tenders/${id}`);
     if (matches.length) agentInsight(req.user.id, 'DEAL AGENT', 'info', `Tender DZ-TND-${id} published — ${matches.length} supplier${matches.length === 1 ? '' : 's'} in ${category} notified.`);
   } catch (e) { /* invites are best-effort */ }
-  audit('DEAL AGENT', 'tender published', 'pass', `${req.user.name} published tender DZ-TND-${id} ("${title}", ${category})`);
-  res.redirect(`/tenders/${id}?msg=` + encodeURIComponent(`Tender DZ-TND-${id} published — matching suppliers have been notified.`));
+  audit('DEAL AGENT', 'tender published', 'pass', `${req.user.name} published tender DZ-TND-${id} ("${title}", ${category}${filesSaved ? `, ${filesSaved} attachment(s)` : ''})`);
+  res.redirect(`/tenders/${id}?msg=` + encodeURIComponent(`Tender DZ-TND-${id} published — matching suppliers have been notified.${filesSaved ? ` ${filesSaved} file(s) attached.` : ''}`));
+});
+
+// Dedicated posting page — the tenders board links here via the ➕ button (POST stays at /tenders).
+app.get('/tenders/new', requireCompany, (req, res) => {
+  const body = `
+  <div class="kicker">Trading tenders</div>
+  <h2 style="margin:4px 0 14px">➕ Post a buy tender</h2>
+  <div class="card" data-reveal>
+    <p class="muted">Describe what you need — suppliers in the matching category are notified instantly, and any company can bid. When you award a bid, the deal + negotiation open automatically.</p>
+    <form method="POST" action="/tenders" enctype="multipart/form-data">
+      <label>Tender title *</label><input type="text" name="title" required maxlength="160" placeholder="e.g. 500 MT copper cathodes, CIF Rotterdam">
+      <div class="grid2" style="gap:10px">
+        <div><label>Category *</label><select name="category" required><option value="">— choose —</option>${optionsHtml(COMPANY_CATEGORIES, '')}</select>${otherInputHtml('category', '')}</div>
+        <div><label>Bid deadline *</label><input type="date" name="deadline" required min="${now().slice(0, 10)}"></div>
+      </div>
+      <div class="grid2" style="gap:10px">
+        <div><label>Quantity</label><input type="number" name="quantity" min="0" step="any" placeholder="e.g. 500"></div>
+        <div><label>Unit</label><select name="unit">${optionsHtml(DEAL_CARGO_UNITS, 'MT')}</select></div>
+      </div>
+      <div class="grid2" style="gap:10px">
+        <div><label>Destination</label><input type="text" name="destination" maxlength="160" placeholder="e.g. Rotterdam, NL"></div>
+        <div><label>Incoterm</label><select name="incoterm">${optionsHtml(DEAL_INCOTERMS, 'CIF')}</select></div>
+      </div>
+      <label>Specification / notes</label><textarea name="description" rows="3" maxlength="4000" placeholder="Grades, packaging, inspection, payment expectations…"></textarea>
+      <label>Tender files (optional)</label>
+      <label class="file-btn"><span class="file-btn-text" data-default="📎 Attach spec sheets, drawings, RFQ docs…">📎 Attach spec sheets, drawings, RFQ docs…</span>
+        <input type="file" class="file-input" name="files" accept="application/pdf,.pdf,image/*" multiple></label>
+      <p class="muted" style="margin:4px 0 10px">Up to ${TENDER_FILE_MAX_COUNT} files, 8 MB each — PDF or images. Visible to all companies viewing the tender.</p>
+      <button class="btn" type="submit">Publish tender 📣</button>
+    </form>
+    <p class="muted" style="margin-top:10px"><a href="/tenders">← Back to the tenders board</a></p>
+  </div>`;
+  res.send(page('Post a tender', body, req.user, req.query.msg, req.query.err, 'tenders'));
 });
 
 app.get('/tenders/:id', requireCompany, (req, res) => {
@@ -12484,6 +14737,90 @@ app.get('/tenders/:id', requireCompany, (req, res) => {
   const bids = db.prepare(`SELECT b.*, c.name AS bidder_name FROM tender_bids b JOIN companies c ON c.id = b.company_id WHERE b.tender_id = ? ORDER BY b.price ASC`).all(t.id);
   const myBid = bids.find((x) => x.company_id === myId) || null;
   const awardedBid = t.awarded_bid_id ? bids.find((x) => x.id === t.awarded_bid_id) : null;
+  // SEALED BIDS: nobody — not even the owner — sees bid prices until the deadline passes
+  // or the owner closes the tender early. Cancelled tenders never open their bids (SAM.gov rule).
+  const bidsRevealed = t.status === 'awarded' || t.status === 'closed' || (t.status === 'open' && expired);
+  const canAward = isOwner && bidsRevealed && t.status !== 'awarded';
+  const iAmWinner = !!(awardedBid && awardedBid.company_id === myId);
+
+  // SAM.gov workflow state: follow/watchlist, public interested-vendors list, Q&A, notice history.
+  const isFollowing = !!db.prepare('SELECT 1 FROM tender_follows WHERE tender_id = ? AND company_id = ? AND kind = ?').get(t.id, myId, 'follow');
+  const isInterested = !!db.prepare('SELECT 1 FROM tender_follows WHERE tender_id = ? AND company_id = ? AND kind = ?').get(t.id, myId, 'interested');
+  const followCount = db.prepare('SELECT COUNT(*) AS n FROM tender_follows WHERE tender_id = ? AND kind = ?').get(t.id, 'follow').n;
+  const interestedVendors = db.prepare(`SELECT f.company_id, c.name FROM tender_follows f JOIN companies c ON c.id = f.company_id
+                                        WHERE f.tender_id = ? AND f.kind = 'interested' ORDER BY f.created_at ASC`).all(t.id);
+  const tenderUpdates = db.prepare('SELECT * FROM tender_updates WHERE tender_id = ? ORDER BY id DESC LIMIT 20').all(t.id);
+  const tenderQuestions = db.prepare(`SELECT q.*, c.name AS asker_name FROM tender_questions q JOIN companies c ON c.id = q.company_id
+                                      WHERE q.tender_id = ? ORDER BY q.id ASC LIMIT 50`).all(t.id);
+
+  // Award signature card: only the winning bidder gets the signing form; everyone else sees status.
+  const awardSignCard = (t.status === 'awarded') ? (t.winner_signed_at ? `
+  <div class="card" data-reveal>
+    <h3>✍️ Award signature</h3>
+    <p class="ok" style="margin:0">✅ Signed by <b>${esc(t.winner_sign_name)}</b>${awardedBid ? ` on behalf of <b>${esc(awardedBid.bidder_name)}</b>` : ''} on ${esc(String(t.winner_signed_at).slice(0, 16).replace('T', ' '))} UTC — the award is binding.</p>
+  </div>` : (iAmWinner ? `
+  <div class="card" data-reveal style="border-left:4px solid var(--gold,#c9a227)">
+    <h3>✍️ You won — sign the tender award</h3>
+    <p class="muted">By signing, your company accepts the awarded terms: <b>${fmtAmount(awardedBid.price)} ${esc(awardedBid.currency)}</b>, delivery ~${awardedBid.delivery_days} days, ${esc(t.incoterm || 'CIF')}${t.destination ? ` → ${esc(t.destination)}` : ''}. Only the winning bidder can sign this award.</p>
+    <form method="POST" action="/tenders/${t.id}/sign" onsubmit="return confirm('Sign this tender award? This confirms your company accepts the awarded terms.');">
+      <label>Type your full name as signature *</label>
+      <input type="text" name="sign_name" required maxlength="120" placeholder="e.g. Ahmed Al Mansoori">
+      <button class="btn" type="submit">Sign award ✍️</button>
+    </form>
+  </div>` : `
+  <div class="card" data-reveal>
+    <h3>✍️ Award signature</h3>
+    <p class="muted" style="margin:0">Awaiting the winning bidder's signature${awardedBid ? ` (<b>${esc(awardedBid.bidder_name)}</b>)` : ''}. Only they can sign this award.</p>
+  </div>`)) : '';
+
+  // Notice history (SAM.gov "version history"): amendments, closure, award notice, cancellation.
+  const updatesCard = `
+  <div class="card" data-reveal>
+    <h3>📜 Notice history</h3>
+    ${tenderUpdates.length ? tenderUpdates.map((u) => `
+      <div style="padding:6px 0;border-top:1px dashed var(--border-soft)">
+        <span class="muted">${esc(u.created_at.slice(0, 16).replace('T', ' '))} UTC</span> — ${esc(u.note)}
+      </div>`).join('') : '<p class="muted" style="margin:6px 0">Original notice — no amendments yet.</p>'}
+  </div>`;
+
+  // Public Q&A (SAM.gov style): vendors ask while the tender is open; the owner's answers are public.
+  const qaRows = tenderQuestions.length ? tenderQuestions.map((q) => `
+    <div style="padding:8px 0;border-top:1px dashed var(--border-soft)">
+      <b>Q:</b> ${esc(q.question)} <span class="muted">— ${esc(q.asker_name)}, ${esc(q.created_at.slice(0, 10))}</span><br>
+      ${q.answer
+        ? `<b>A:</b> ${esc(q.answer)} <span class="muted">— tender owner, ${esc(String(q.answered_at || '').slice(0, 10))}</span>`
+        : (isOwner
+          ? `<form method="POST" action="/tenders/${t.id}/questions/${q.id}/answer" style="margin-top:6px">
+               <div style="display:flex;gap:8px;flex-wrap:wrap"><input type="text" name="answer" required maxlength="1000" placeholder="Your public answer…" style="flex:1;min-width:220px"><button class="btn btn-sm" type="submit">Answer publicly</button></div>
+             </form>`
+          : '<span class="muted">⏳ Awaiting the owner\'s answer.</span>')}
+    </div>`).join('') : '<p class="muted" style="margin:6px 0">No questions yet.</p>';
+  const askForm = (!isOwner && t.status === 'open' && !expired) ? `
+    <form method="POST" action="/tenders/${t.id}/questions" style="margin-top:10px">
+      <label>Ask the tender owner a question</label>
+      <div style="display:flex;gap:8px;flex-wrap:wrap"><input type="text" name="question" required maxlength="500" placeholder="Specs, delivery, terms…" style="flex:1;min-width:220px"><button class="btn btn-sm" type="submit">Ask ❓</button></div>
+      <p class="muted" style="margin:4px 0 0">Questions and answers are public — all bidders see the same information.</p>
+    </form>` : '';
+  const qaCard = `
+  <div class="card" data-reveal>
+    <h3>❓ Questions &amp; answers (${tenderQuestions.length})</h3>
+    ${qaRows}
+    ${askForm}
+  </div>`;
+
+  // Owner amendment card (SAM.gov amendments): post an update, optionally extend the deadline.
+  const amendCard = (isOwner && t.status === 'open') ? `
+  <div class="card" data-reveal>
+    <h3>✏️ Post an amendment</h3>
+    <form method="POST" action="/tenders/${t.id}/amend">
+      <label>Amendment note *</label>
+      <textarea name="note" rows="2" required maxlength="1000" placeholder="e.g. Specification updated — see new attachment; delivery window changed…"></textarea>
+      <label>Extend bid deadline (optional)</label>
+      <input type="date" name="new_deadline" min="${now().slice(0, 10)}">
+      <button class="btn btn-sm" type="submit">Publish amendment 📣</button>
+      <p class="muted" style="margin:4px 0 0">All followers and bidders are notified immediately.</p>
+    </form>
+  </div>` : '';
 
   const bidRows = bids.length ? bids.map((x) => `
     <tr>
@@ -12492,7 +14829,7 @@ app.get('/tenders/:id', requireCompany, (req, res) => {
       <td>${x.delivery_days} days</td>
       <td class="muted">${esc(x.note || '—')}</td>
       <td>${x.status === 'accepted' ? '<span class="badge badge-approved">WINNER</span>' : x.status === 'rejected' ? '<span class="badge badge-rejected">—</span>' : '<span class="badge badge-pending">pending</span>'}</td>
-      ${isOwner && t.status === 'open' ? `<td><form method="POST" action="/tenders/${t.id}/award" onsubmit="return confirm('Award this tender to ${esc(x.bidder_name)} for ${fmtAmount(x.price)} ${esc(x.currency)}? This opens a deal and negotiation automatically.');"><input type="hidden" name="bid_id" value="${x.id}"><button class="btn btn-sm" type="submit">Award 🏆</button></form></td>` : '<td></td>'}
+      ${canAward ? `<td><form method="POST" action="/tenders/${t.id}/award" onsubmit="return confirm('Award this tender to ${esc(x.bidder_name)} for ${fmtAmount(x.price)} ${esc(x.currency)}? This opens a deal and negotiation automatically.');"><input type="hidden" name="bid_id" value="${x.id}"><button class="btn btn-sm" type="submit">Award 🏆</button></form></td>` : '<td></td>'}
     </tr>`).join('') : '<tr><td colspan="6" class="muted">No bids yet.</td></tr>';
 
   const bidForm = (!isOwner && t.status === 'open' && !expired) ? `
@@ -12524,16 +14861,77 @@ app.get('/tenders/:id', requireCompany, (req, res) => {
     <p class="muted" style="margin:0 0 6px">Posted by <b>${esc(t.poster_name)}</b> · destination <b>${esc(t.destination || '—')}</b> · bid deadline <b>${esc(t.deadline || '—')}</b>${expired && t.status === 'open' ? ' <span class="badge badge-rejected">deadline passed</span>' : ''}</p>
     ${t.description ? `<p style="white-space:pre-wrap">${esc(t.description)}</p>` : ''}
     ${t.status === 'awarded' && awardedBid ? `<p class="ok" style="margin:8px 0 0">🏆 Awarded to <b>${esc(awardedBid.bidder_name)}</b> for ${fmtAmount(awardedBid.price)} ${esc(awardedBid.currency)}.${t.awarded_deal_id && (isOwner || awardedBid.company_id === myId) ? ` <a href="/deal/${t.awarded_deal_id}">Open the deal →</a>` : ''}</p>` : ''}
+    <p class="muted" style="margin:8px 0 0">👁️ ${followCount} following · 🤝 ${interestedVendors.length} interested vendor${interestedVendors.length === 1 ? '' : 's'}${interestedVendors.length ? ': ' + interestedVendors.map((v) => esc(v.name)).join(', ') : ''}</p>
+    ${!isOwner && t.status === 'open' ? `<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+      <form method="POST" action="/tenders/${t.id}/follow" style="margin:0"><button class="btn btn-sm ${isFollowing ? '' : 'btn-outline'}" type="submit">${isFollowing ? '👁️ Following ✓' : '👁️ Follow'}</button></form>
+      <form method="POST" action="/tenders/${t.id}/interested" style="margin:0" onsubmit="return confirm('${isInterested ? 'Remove your company from' : 'Add your company to'} the public interested-vendors list?');"><button class="btn btn-sm ${isInterested ? '' : 'btn-outline'}" type="submit">${isInterested ? '🤝 Interested ✓' : '🤝 I\'m interested'}</button></form>
+    </div>` : ''}
+    ${isOwner && t.status === 'open' ? `<form method="POST" action="/tenders/${t.id}/close" style="margin-top:10px" onsubmit="return confirm('Close this tender now? Bidding stops immediately and all bids become visible.');"><button class="btn btn-sm btn-outline" type="submit">🔒 Close tender &amp; reveal bids</button></form>` : ''}
+    ${isOwner && (t.status === 'open' || t.status === 'closed') ? `<form method="POST" action="/tenders/${t.id}/cancel" style="margin-top:8px" onsubmit="return confirm('CANCEL this tender? Bidders and followers are notified and bids will never be revealed. This cannot be undone.');"><button class="btn btn-sm btn-outline" type="submit">🚫 Cancel tender</button></form>` : ''}
   </div>
+  ${awardSignCard}
+  ${amendCard}
+  ${updatesCard}
+  ${qaCard}
+  ${tenderFilesHtml(t.id, isOwner)}
   ${bidForm}
   <div class="card" data-reveal>
     <h3>💰 Bids (${bids.length})</h3>
-    ${isOwner || t.status === 'awarded' ? `<table><tr><th>Supplier</th><th>Price</th><th>Delivery</th><th>Note</th><th>Status</th><th></th></tr>${bidRows}</table>`
-      : (myBid ? `<p>Your bid: <b>${fmtAmount(myBid.price)} ${esc(myBid.currency)}</b> · ${myBid.delivery_days} days — ${myBid.status === 'accepted' ? '<span class="badge badge-approved">WINNER 🎉</span>' : myBid.status === 'rejected' ? '<span class="badge badge-rejected">Not selected</span>' : '<span class="badge badge-pending">under review</span>'}</p><p class="muted">Other bids are private until the award.</p>` : '<p class="muted">Bids are private — only the tender owner sees them until the award.</p>')}
+    ${bidsRevealed
+      ? `<table><tr><th>Supplier</th><th>Price</th><th>Delivery</th><th>Note</th><th>Status</th><th></th></tr>${bidRows}</table>`
+      : `<p class="muted">🔒 <b>Sealed bids</b> — no one can see bid prices until the bid deadline passes or the tender owner closes the tender.${isOwner ? ` You have received <b>${bids.length}</b> bid(s) so far.` : ''}</p>
+         ${myBid ? `<p>Your bid: <b>${fmtAmount(myBid.price)} ${esc(myBid.currency)}</b> · ${myBid.delivery_days} days — <span class="badge badge-pending">submitted (sealed)</span></p>` : ''}`}
   </div>
   <p><a href="/tenders">← Back to the tenders board</a></p>
   `;
   res.send(page('Tender ' + (t.tender_number || t.id), body, req.user, req.query.msg, req.query.err, 'tenders'));
+});
+
+// Tender attachments: owner can add more files after posting (up to the per-tender cap).
+app.post('/tenders/:id/files', requireCompany, rateLimitRoute('tender-files', 40, 60 * 60 * 1000, '/tenders'), tenderFilesUpload, (req, res) => {
+  const t = db.prepare('SELECT * FROM tenders WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!t) return res.redirect('/tenders?err=' + encodeURIComponent('Tender not found.'));
+  if (t.company_id !== req.user.id) {
+    audit('DEAL AGENT', 'tender file upload', 'fail', `${req.user.name} tried to attach files to tender #${t.id} owned by company #${t.company_id}`);
+    return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('Only the tender owner can manage its files.'));
+  }
+  const have = db.prepare('SELECT COUNT(*) AS n FROM tender_files WHERE tender_id = ?').get(t.id).n;
+  const room = Math.max(0, TENDER_FILE_MAX_COUNT - have);
+  if (!room) return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent(`Attachment limit reached (${TENDER_FILE_MAX_COUNT} files).`));
+  const saved = saveTenderFiles(t.id, req.user.id, (req.files || []).slice(0, room));
+  if (!saved) return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('No file was attached — please choose a PDF or image.'));
+  audit('DEAL AGENT', 'tender file upload', 'pass', `${req.user.name} attached ${saved} file(s) to tender ${t.tender_number || t.id}`);
+  res.redirect(`/tenders/${t.id}?msg=` + encodeURIComponent(`${saved} file(s) attached to the tender.`));
+});
+
+// Tender attachments: owner can delete one (media row goes with it — it was created for this tender).
+app.post('/tenders/:id/files/:fid/delete', requireCompany, rateLimitRoute('tender-files', 40, 60 * 60 * 1000, '/tenders'), (req, res) => {
+  const t = db.prepare('SELECT * FROM tenders WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!t) return res.redirect('/tenders?err=' + encodeURIComponent('Tender not found.'));
+  if (t.company_id !== req.user.id) {
+    audit('DEAL AGENT', 'tender file delete', 'fail', `${req.user.name} tried to delete a file on tender #${t.id} owned by company #${t.company_id}`);
+    return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('Only the tender owner can manage its files.'));
+  }
+  const f = db.prepare('SELECT * FROM tender_files WHERE id = ? AND tender_id = ?').get(parseInt(req.params.fid, 10), t.id);
+  if (!f) return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('Attachment not found.'));
+  db.prepare('DELETE FROM tender_files WHERE id = ?').run(f.id);
+  try { db.prepare('DELETE FROM media WHERE id = ?').run(f.media_id); } catch (e) { /* link row is gone; blob cleanup is best-effort */ }
+  audit('DEAL AGENT', 'tender file delete', 'pass', `${req.user.name} deleted attachment "${f.filename}" from tender ${t.tender_number || t.id}`);
+  res.redirect(`/tenders/${t.id}?msg=` + encodeURIComponent('Attachment deleted.'));
+});
+
+// Tender attachment download: the tenders board is open to all companies, and so are its files.
+// requireCompany keeps persons (ID-space collision class, see M10) and logged-out visitors out.
+app.get('/tender-file/:id', requireCompany, (req, res) => {
+  const f = db.prepare('SELECT tf.*, m.mime, m.data FROM tender_files tf JOIN media m ON m.id = tf.media_id WHERE tf.id = ?')
+    .get(parseInt(req.params.id, 10));
+  if (!f) return res.status(404).send(page('Not found', '<div class="card"><h2>File not found</h2></div>', req.user));
+  res.setHeader('Content-Type', f.mime);
+  res.setHeader('Content-Length', f.data.length);
+  res.setHeader('Content-Disposition', `inline; filename="${String(f.filename || ('file-' + f.id)).replace(/[^\w.\- ()]/g, '_')}"`);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Cache-Control', 'private, max-age=3600');
+  res.send(f.data);
 });
 
 app.post('/tenders/:id/bid', requireCompany, (req, res) => {
@@ -12559,11 +14957,33 @@ app.post('/tenders/:id/bid', requireCompany, (req, res) => {
   res.redirect(`/tenders/${t.id}?msg=` + encodeURIComponent('Your bid was submitted — the tender owner has been notified.'));
 });
 
+// The owner can close a tender at any time: bidding stops and sealed bids are revealed.
+app.post('/tenders/:id/close', requireCompany, rateLimitRoute('tender-close', 30, 60 * 60 * 1000, '/tenders'), (req, res) => {
+  const t = db.prepare('SELECT * FROM tenders WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!t) return res.redirect('/tenders?err=' + encodeURIComponent('Tender not found.'));
+  if (t.company_id !== req.user.id) {
+    audit('DEAL AGENT', 'tender close', 'fail', `${req.user.name} tried to close tender #${t.id} owned by company #${t.company_id}`);
+    return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('Only the tender owner can close it.'));
+  }
+  if (t.status !== 'open') return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('This tender is already closed or awarded.'));
+  db.prepare(`UPDATE tenders SET status = 'closed' WHERE id = ?`).run(t.id);
+  try { db.prepare('INSERT INTO tender_updates (tender_id, note, created_at) VALUES (?,?,?)').run(t.id, '🔒 CLOSED: bidding closed early by the owner — bids are now public.', now()); } catch (e) {}
+  try {
+    const bidders = db.prepare('SELECT DISTINCT company_id FROM tender_bids WHERE tender_id = ?').all(t.id);
+    for (const b of bidders) notify(b.company_id, 'tender', `🔒 Tender ${t.tender_number || ('DZ-TND-' + t.id)} ("${t.title}") was closed by the owner — all bids are now visible.`, `/tenders/${t.id}`);
+  } catch (e) { /* notifications are best-effort */ }
+  audit('DEAL AGENT', 'tender closed', 'pass', `${req.user.name} closed tender ${t.tender_number || t.id} — sealed bids revealed`);
+  res.redirect(`/tenders/${t.id}?msg=` + encodeURIComponent('Tender closed — bidding is over and all bids are now visible. You can award the winning bid below.'));
+});
+
 app.post('/tenders/:id/award', requireCompany, (req, res) => {
   const t = db.prepare('SELECT * FROM tenders WHERE id = ?').get(parseInt(req.params.id, 10));
   if (!t) return res.redirect('/tenders?err=' + encodeURIComponent('Tender not found.'));
   if (t.company_id !== req.user.id) return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('Only the tender owner can award it.'));
-  if (t.status !== 'open') return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('This tender was already awarded.'));
+  if (t.status === 'awarded') return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('This tender was already awarded.'));
+  if (t.status === 'cancelled') return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('This tender was cancelled and cannot be awarded.'));
+  // Sealed-bid rule: awarding requires the bids to be revealed first (deadline passed or owner closed it).
+  if (t.status === 'open' && !tenderExpired(t)) return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('Bids are sealed until the bid deadline — close the tender early to reveal bids and award.'));
   const bid = db.prepare('SELECT * FROM tender_bids WHERE id = ? AND tender_id = ?').get(parseInt((req.body || {}).bid_id, 10), t.id);
   if (!bid) return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('Bid not found.'));
   const winner = db.prepare('SELECT * FROM companies WHERE id = ?').get(bid.company_id);
@@ -12572,7 +14992,7 @@ app.post('/tenders/:id/award', requireCompany, (req, res) => {
   const ts = now();
   const tNum = t.tender_number || ('DZ-TND-' + t.id);
   const tx = db.transaction(() => {
-    db.prepare("UPDATE tenders SET status = 'awarded', awarded_bid_id = ? WHERE id = ?").run(bid.id, t.id);
+    db.prepare("UPDATE tenders SET status = 'awarded', awarded_bid_id = ?, awarded_at = ? WHERE id = ?").run(bid.id, ts, t.id);
     db.prepare("UPDATE tender_bids SET status = 'accepted', updated_at = ? WHERE id = ?").run(ts, bid.id);
     db.prepare("UPDATE tender_bids SET status = 'rejected', updated_at = ? WHERE tender_id = ? AND id != ?").run(ts, t.id, bid.id);
     // Auto-create the winner's SELL deal, prefilled from tender + bid.
@@ -12597,7 +15017,13 @@ app.post('/tenders/:id/award', requireCompany, (req, res) => {
   });
   const { dealId, negId } = tx();
 
-  notify(winner.id, 'tender', `🏆 You WON tender ${tNum} ("${t.title}") — ${fmtAmount(bid.price)} ${bid.currency}! A deal + negotiation opened automatically — send your formal offer.`, `/negotiation/${negId}`);
+  // SAM.gov-style public award notice in the notice history + notify followers.
+  try {
+    db.prepare('INSERT INTO tender_updates (tender_id, note, created_at) VALUES (?,?,?)')
+      .run(t.id, `🏆 AWARD NOTICE: awarded to ${winner.name} for ${fmtAmount(bid.price)} ${bid.currency} (delivery ~${bid.delivery_days} days).`, ts);
+  } catch (e) { /* notice history is best-effort */ }
+  notifyTenderFollowers(t.id, `🏆 Award notice — tender ${tNum} ("${t.title}") was awarded to ${winner.name} for ${fmtAmount(bid.price)} ${bid.currency}.`, `/tenders/${t.id}`);
+  notify(winner.id, 'tender', `🏆 You WON tender ${tNum} ("${t.title}") — ${fmtAmount(bid.price)} ${bid.currency}! Sign the award on the tender page; a deal + negotiation opened automatically.`, `/tenders/${t.id}`);
   try {
     const losers = db.prepare("SELECT company_id FROM tender_bids WHERE tender_id = ? AND status = 'rejected'").all(t.id);
     for (const l of losers) notify(l.company_id, 'tender', `Tender ${tNum} ("${t.title}") was awarded to another supplier. Thanks for bidding!`, `/tenders/${t.id}`);
@@ -12605,7 +15031,138 @@ app.post('/tenders/:id/award', requireCompany, (req, res) => {
   agentInsight(winner.id, 'DEAL AGENT', 'info', `Tender ${tNum} won — deal + negotiation opened automatically at ${fmtAmount(bid.price)} ${bid.currency}.`);
   agentInsight(req.user.id, 'DEAL AGENT', 'info', `Tender ${tNum} awarded to ${winner.name} — negotiation #${negId} opened on the auto-created deal.`);
   audit('DEAL AGENT', 'tender awarded', 'pass', `${req.user.name} awarded tender ${tNum} to ${winner.name} (${fmtAmount(bid.price)} ${bid.currency}); deal #${dealId}, negotiation #${negId}`);
-  res.redirect(`/tenders/${t.id}?msg=` + encodeURIComponent(`Awarded to ${winner.name} — deal and negotiation opened automatically. The supplier has been notified.`));
+  res.redirect(`/tenders/${t.id}?msg=` + encodeURIComponent(`Awarded to ${winner.name} — deal and negotiation opened automatically. The supplier has been notified to sign the award.`));
+});
+
+// Award signing: ONLY the winning bidder's company can sign the tender award, and only once.
+// The signature makes the award binding; the deal + negotiation pipeline continues from there.
+app.post('/tenders/:id/sign', requireCompany, rateLimitRoute('tender-sign', 20, 60 * 60 * 1000, '/tenders'), (req, res) => {
+  const t = db.prepare('SELECT * FROM tenders WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!t) return res.redirect('/tenders?err=' + encodeURIComponent('Tender not found.'));
+  const tNum = t.tender_number || ('DZ-TND-' + t.id);
+  if (t.status !== 'awarded' || !t.awarded_bid_id) {
+    return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('This tender has not been awarded yet — there is nothing to sign.'));
+  }
+  const winBid = db.prepare('SELECT * FROM tender_bids WHERE id = ?').get(t.awarded_bid_id);
+  if (!winBid || winBid.company_id !== req.user.id) {
+    audit('DEAL AGENT', 'tender award sign', 'fail', `${req.user.name} tried to sign tender ${tNum} award — not the winning bidder`);
+    return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('Only the winning bidder can sign this tender award.'));
+  }
+  if (t.winner_signed_at) return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('This award was already signed.'));
+  const signName = String((req.body || {}).sign_name || '').trim().slice(0, 120);
+  if (!signName) return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('Please type your full name to sign.'));
+  const ts = now();
+  db.prepare('UPDATE tenders SET winner_signed_at = ?, winner_sign_name = ? WHERE id = ?').run(ts, signName, t.id);
+  notify(t.company_id, 'tender', `✍️ ${req.user.name} signed the award for tender ${tNum} ("${t.title}") — the award is now binding.`, `/tenders/${t.id}`);
+  audit('DEAL AGENT', 'tender award signed', 'pass', `${req.user.name} signed tender ${tNum} award as "${signName}"`);
+  res.redirect(`/tenders/${t.id}?msg=` + encodeURIComponent('Award signed ✍️ — the award is now binding. Continue in the negotiation to complete the contract.'));
+});
+
+// ----- SAM.gov-style workflow routes: follow, interested vendors, Q&A, amendments, cancel -----
+
+// Follow/unfollow the notice (watchlist) — followers get amendment/cancel/award notifications.
+app.post('/tenders/:id/follow', requireCompany, (req, res) => {
+  const t = db.prepare('SELECT * FROM tenders WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!t) return res.redirect('/tenders?err=' + encodeURIComponent('Tender not found.'));
+  const cur = db.prepare('SELECT id FROM tender_follows WHERE tender_id = ? AND company_id = ? AND kind = ?').get(t.id, req.user.id, 'follow');
+  if (cur) db.prepare('DELETE FROM tender_follows WHERE id = ?').run(cur.id);
+  else db.prepare('INSERT INTO tender_follows (tender_id, company_id, kind, created_at) VALUES (?,?,?,?)').run(t.id, req.user.id, 'follow', now());
+  res.redirect(`/tenders/${t.id}?msg=` + encodeURIComponent(cur ? 'Unfollowed — you will no longer get updates on this tender.' : 'Following — you will be notified of every amendment, Q&A answer, and the award.'));
+});
+
+// Toggle public "interested vendor" status (SAM.gov interested-vendors list).
+app.post('/tenders/:id/interested', requireCompany, (req, res) => {
+  const t = db.prepare('SELECT * FROM tenders WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!t) return res.redirect('/tenders?err=' + encodeURIComponent('Tender not found.'));
+  if (t.company_id === req.user.id) return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('This is your own tender.'));
+  if (t.status !== 'open') return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('This tender is no longer open.'));
+  const cur = db.prepare('SELECT id FROM tender_follows WHERE tender_id = ? AND company_id = ? AND kind = ?').get(t.id, req.user.id, 'interested');
+  if (cur) {
+    db.prepare('DELETE FROM tender_follows WHERE id = ?').run(cur.id);
+  } else {
+    db.prepare('INSERT INTO tender_follows (tender_id, company_id, kind, created_at) VALUES (?,?,?,?)').run(t.id, req.user.id, 'interested', now());
+    notify(t.company_id, 'tender', `🤝 ${req.user.name} marked itself as an interested vendor on tender ${t.tender_number || ('DZ-TND-' + t.id)}.`, `/tenders/${t.id}`);
+  }
+  res.redirect(`/tenders/${t.id}?msg=` + encodeURIComponent(cur ? 'Removed from the interested-vendors list.' : 'You are now listed publicly as an interested vendor.'));
+});
+
+// Public Q&A: any company (not the owner) asks while the tender is open.
+app.post('/tenders/:id/questions', requireCompany, rateLimitRoute('tender-qa', 30, 60 * 60 * 1000, '/tenders'), (req, res) => {
+  const t = db.prepare('SELECT * FROM tenders WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!t) return res.redirect('/tenders?err=' + encodeURIComponent('Tender not found.'));
+  if (t.company_id === req.user.id) return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('You own this tender — answer questions below instead.'));
+  if (t.status !== 'open' || tenderExpired(t)) return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('This tender is no longer accepting questions.'));
+  const q = String((req.body || {}).question || '').trim().slice(0, 500);
+  if (q.length < 5) return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('Please write a real question (at least a few words).'));
+  db.prepare('INSERT INTO tender_questions (tender_id, company_id, question, created_at) VALUES (?,?,?,?)').run(t.id, req.user.id, q, now());
+  notify(t.company_id, 'tender', `❓ New question on tender ${t.tender_number || ('DZ-TND-' + t.id)}: "${q.slice(0, 120)}"`, `/tenders/${t.id}`);
+  audit('DEAL AGENT', 'tender question', 'pass', `${req.user.name} asked a question on tender ${t.tender_number || t.id}`);
+  res.redirect(`/tenders/${t.id}?msg=` + encodeURIComponent('Question posted — the owner has been notified. The answer will be public.'));
+});
+
+// Owner answers a question — answers are public, and the asker + followers are notified.
+app.post('/tenders/:id/questions/:qid/answer', requireCompany, (req, res) => {
+  const t = db.prepare('SELECT * FROM tenders WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!t) return res.redirect('/tenders?err=' + encodeURIComponent('Tender not found.'));
+  if (t.company_id !== req.user.id) {
+    audit('DEAL AGENT', 'tender answer', 'fail', `${req.user.name} tried to answer a question on tender #${t.id} owned by company #${t.company_id}`);
+    return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('Only the tender owner can answer questions.'));
+  }
+  const q = db.prepare('SELECT * FROM tender_questions WHERE id = ? AND tender_id = ?').get(parseInt(req.params.qid, 10), t.id);
+  if (!q) return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('Question not found.'));
+  const a = String((req.body || {}).answer || '').trim().slice(0, 1000);
+  if (a.length < 2) return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('Please write an answer.'));
+  db.prepare('UPDATE tender_questions SET answer = ?, answered_at = ? WHERE id = ?').run(a, now(), q.id);
+  notify(q.company_id, 'tender', `💬 Your question on tender ${t.tender_number || ('DZ-TND-' + t.id)} was answered: "${a.slice(0, 120)}"`, `/tenders/${t.id}`);
+  notifyTenderFollowers(t.id, `💬 New public Q&A on tender ${t.tender_number || ('DZ-TND-' + t.id)} ("${t.title}").`, `/tenders/${t.id}`);
+  audit('DEAL AGENT', 'tender answer', 'pass', `${req.user.name} answered question #${q.id} on tender ${t.tender_number || t.id}`);
+  res.redirect(`/tenders/${t.id}?msg=` + encodeURIComponent('Answer published — all bidders can see it.'));
+});
+
+// Owner posts an amendment (SAM.gov "Updated" notice): note + optional deadline extension.
+app.post('/tenders/:id/amend', requireCompany, rateLimitRoute('tender-amend', 20, 60 * 60 * 1000, '/tenders'), (req, res) => {
+  const t = db.prepare('SELECT * FROM tenders WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!t) return res.redirect('/tenders?err=' + encodeURIComponent('Tender not found.'));
+  if (t.company_id !== req.user.id) {
+    audit('DEAL AGENT', 'tender amend', 'fail', `${req.user.name} tried to amend tender #${t.id} owned by company #${t.company_id}`);
+    return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('Only the tender owner can amend it.'));
+  }
+  if (t.status !== 'open') return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('Only an open tender can be amended.'));
+  const b = req.body || {};
+  const note = String(b.note || '').trim().slice(0, 1000);
+  if (note.length < 5) return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('Please describe the amendment.'));
+  let extMsg = '';
+  const nd = String(b.new_deadline || '').trim();
+  if (nd) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(nd) || nd < now().slice(0, 10)) {
+      return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('The new deadline must be a valid future date.'));
+    }
+    db.prepare('UPDATE tenders SET deadline = ? WHERE id = ?').run(nd, t.id);
+    extMsg = ` Bid deadline extended to ${nd}.`;
+  }
+  db.prepare('INSERT INTO tender_updates (tender_id, note, created_at) VALUES (?,?,?)').run(t.id, `✏️ AMENDMENT: ${note}${extMsg}`, now());
+  notifyTenderFollowers(t.id, `✏️ Tender ${t.tender_number || ('DZ-TND-' + t.id)} ("${t.title}") was amended: ${note.slice(0, 150)}${extMsg}`, `/tenders/${t.id}`);
+  audit('DEAL AGENT', 'tender amended', 'pass', `${req.user.name} amended tender ${t.tender_number || t.id}: "${note.slice(0, 120)}"${extMsg}`);
+  res.redirect(`/tenders/${t.id}?msg=` + encodeURIComponent(`Amendment published — followers and bidders notified.${extMsg}`));
+});
+
+// Owner cancels the tender (SAM.gov cancellation notice): bids stay sealed forever.
+app.post('/tenders/:id/cancel', requireCompany, (req, res) => {
+  const t = db.prepare('SELECT * FROM tenders WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!t) return res.redirect('/tenders?err=' + encodeURIComponent('Tender not found.'));
+  if (t.company_id !== req.user.id) {
+    audit('DEAL AGENT', 'tender cancel', 'fail', `${req.user.name} tried to cancel tender #${t.id} owned by company #${t.company_id}`);
+    return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('Only the tender owner can cancel it.'));
+  }
+  if (t.status !== 'open' && t.status !== 'closed') {
+    return res.redirect(`/tenders/${t.id}?err=` + encodeURIComponent('This tender can no longer be cancelled.'));
+  }
+  const tNum = t.tender_number || ('DZ-TND-' + t.id);
+  db.prepare(`UPDATE tenders SET status = 'cancelled' WHERE id = ?`).run(t.id);
+  db.prepare('INSERT INTO tender_updates (tender_id, note, created_at) VALUES (?,?,?)').run(t.id, '🚫 CANCELLED: this tender was cancelled by the owner. Bids remain sealed.', now());
+  notifyTenderFollowers(t.id, `🚫 Tender ${tNum} ("${t.title}") was cancelled by the owner.`, `/tenders/${t.id}`);
+  audit('DEAL AGENT', 'tender cancelled', 'flag', `${req.user.name} cancelled tender ${tNum} — bids remain sealed`);
+  res.redirect(`/tenders/${t.id}?msg=` + encodeURIComponent('Tender cancelled. Bidders and followers have been notified; bids remain sealed.'));
 });
 
 app.get('/warehouse', requireCompany, (req, res) => {
@@ -12928,6 +15485,8 @@ setInterval(() => {
   try {
     db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(now());
     db.prepare('DELETE FROM verification_codes WHERE expires_at < ?').run(now());
+    // Refresh the query planner's statistics so long-lived dynos keep good plans as data grows.
+    db.pragma('optimize');
   } catch (e) { /* best-effort housekeeping */ }
 }, 3600_000).unref();
 
