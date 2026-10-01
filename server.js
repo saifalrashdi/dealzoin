@@ -2381,6 +2381,8 @@ function sendVerificationCode(email, code) {
           <p>Your login verification code is:</p>
           <p style="font-size:28px;font-weight:bold;letter-spacing:4px">${code}</p>
           <p>This code expires in 10 minutes. If you did not request it, ignore this email.</p>
+          <hr style="border:none;border-top:1px solid #eee;margin:18px 0">
+          <p style="color:#888;font-size:12px">Dealzoin — every company is license-verified.</p>
           </body></html>`
       }).then(() => {
         audit('AUTHENTICATION AGENT', '2FA code delivery', 'pass', `Gmail email sent to ${email}`);
@@ -2412,6 +2414,8 @@ function sendVerificationCode(email, code) {
         <p>Your login verification code is:</p>
         <p style="font-size:28px;font-weight:bold;letter-spacing:4px">${code}</p>
         <p>This code expires in 10 minutes. If you did not request it, ignore this email.</p>
+        <hr style="border:none;border-top:1px solid #eee;margin:18px 0">
+        <p style="color:#888;font-size:12px">Dealzoin — every company is license-verified.</p>
         </body></html>`
     })
   }).then(async (res) => {
@@ -4989,8 +4993,8 @@ app.get('/', (req, res) => {
     <div class="hero-in">
       <div class="coin-hero" role="button" tabindex="0" aria-label="Dealzoin mint coin — activate to flip">Dz</div>
       <div class="kicker a-enter" data-stage="hero" style="--i:0">The B2B deal network</div>
-      <h1 class="display-xl"><span class="w" style="--i:0"><span>Verified</span></span> <span class="w" style="--i:1"><span>Partners.</span></span> <span class="w" style="--i:2"><span>Private</span></span> <span class="w" style="--i:3"><span>Rooms.</span></span> <span class="w" style="--i:4"><span>Signed</span></span> <span class="w" style="--i:5"><span>Deals.</span></span></h1>
-      <p class="a-enter" data-stage="hero" style="--i:2">Dealzoin is the closed network where vetted companies post opportunities, negotiate in private deal rooms, and sign — every step on the record.</p>
+      <h1 class="display-xl"><span class="w" style="--i:0"><span>Every</span></span> <span class="w" style="--i:1"><span>company</span></span> <span class="w" style="--i:2"><span>is</span></span> <span class="w" style="--i:3"><span>license-verified.</span></span></h1>
+      <p class="a-enter" data-stage="hero" style="--i:2">Dealzoin is the closed B2B network where every member is checked against a real trade license — with expiry tracking — before it can post, bid or sell. A claim no open marketplace can make. Private rooms. Signed deals. Every step on the record.</p>
       <div class="a-enter" data-stage="hero" style="--i:3">
       ${user
         ? `<a class="btn js-magnet" href="${user.isAdmin ? '/admin' : (user.isPerson ? '/products' : '/timeline')}">Enter the Deal Floor &rarr;</a>`
@@ -5005,16 +5009,21 @@ app.get('/', (req, res) => {
     <h2 class="display-lg a-enter" data-stage="cards" style="--i:1;margin:6px 0 16px">Built for companies that mean business..</h2>
   </div>
   <div class="steps">
-    <div class="card card--cut js-tilt a-enter" data-stage="cards" style="--i:2" data-num="01"><h3>01 Verified Network</h3><p class="muted">Every company is identity-checked and trade-referenced before it can post. No anonymous offers. Ever.</p></div>
+    <div class="card card--cut js-tilt a-enter" data-stage="cards" style="--i:2" data-num="01"><h3>01 License-Verified Network</h3><p class="muted">Every company is verified against a real trade license — and automatically locked out if that license expires. No anonymous offers. Ever.</p></div>
     <div class="card card--cut is-feature js-tilt a-enter" data-stage="cards" style="--i:3" data-num="02"><h3>02 Private Deal Rooms</h3><p>Negotiate terms, exchange documents and message counterparties in encrypted rooms — sealed until both sides sign.</p></div>
     <div class="card card--cut js-tilt a-enter" data-stage="cards" style="--i:4" data-num="03"><h3>03 The Trust Ledger</h3><p class="muted">Every offer, counter-offer and signature is timestamped to an audit trail your compliance team will actually enjoy.</p></div>
   </div>
+  ${(stCompanies >= 25 && stDeals >= 25 && stClosed >= 25 && stDocs >= 25) ? `
   <div class="stats">
     <div class="stat card--cut rv" style="--i:0" data-num="01"><div class="num gold" data-count="${stCompanies}">${stCompanies}</div><div class="lbl">Verified companies</div></div>
     <div class="stat card--cut rv" style="--i:1" data-num="02"><div class="num gold" data-count="${stDeals}">${stDeals}</div><div class="lbl">Deals posted</div></div>
     <div class="stat card--cut rv" style="--i:2" data-num="03"><div class="num gold" data-count="${stClosed}">${stClosed}</div><div class="lbl">Deals closed</div></div>
     <div class="stat card--cut rv" style="--i:3" data-num="04"><div class="num gold" data-count="${stDocs}">${stDocs}</div><div class="lbl">Documents verified</div></div>
-  </div>`;
+  </div>` : `
+  <div class="card card--cut rv" style="--i:0;text-align:center;padding:26px 20px;max-width:640px;margin:0 auto">
+    <div class="kicker" style="margin-bottom:6px">Launch phase</div>
+    <p style="margin:0;font-size:1.05rem">Now onboarding our <b style="color:var(--gold)">Abu Dhabi launch cohort</b> — every member license-verified before it can post, bid or sell.</p>
+  </div>`}`;
   res.send(page('Welcome', body, user, req.query.msg, req.query.err, undefined, undefined, { lang: reqLang(req) }));
 });
 
@@ -6483,8 +6492,8 @@ app.get('/my/orders', requirePerson, (req, res) => {
     </div>
     <a class="btn btn-sm btn-outline" href="/products">← Browse products</a>
   </div>
-  <p class="muted" style="margin-bottom:12px">"Requested" orders are purchase inquiries — the seller contacts you to arrange payment. Orders "awaiting payment" can be settled online via PayPal with the Pay now button.</p>
-  ${ordersTableHtml(orders, names, { showSeller: true, payNow: req.user })}`;
+  <p class="muted" style="margin-bottom:12px">"Requested" orders are purchase inquiries — the seller contacts you to arrange payment. Orders "awaiting payment" can be settled online via PayPal with the Pay now button. Paid orders are <b>held in escrow</b> 🔒 — the money only reaches the seller after you confirm delivery.</p>
+  ${ordersTableHtml(orders, names, { showSeller: true, payNow: req.user, actor: req.user })}`;
   res.send(page('My Orders', body, req.user, req.query.msg, req.query.err, 'contracts'));
 });
 
@@ -6858,11 +6867,20 @@ app.post('/product/:id/delete', requireCompanyOrAdmin, (req, res) => {
  * When the listing has a numeric price_amount AND PayPal is configured, the buyer is redirected
  * to PayPal to pay; otherwise the order is stored as a 'requested' purchase inquiry and the
  * seller arranges payment manually.
- * Order state machine:
+ * Order state machine (ESCROW — the buyer's money is held by the platform until delivery):
  *   requested         — inquiry only (no numeric price, or PayPal unavailable/failed). Terminal here.
- *   awaiting_payment  — PayPal order created; only way to 'paid' is a successful capture.
- *   paid              — /paypal/return captured the payment (awaiting_payment → paid ONLY).
- *   cancelled         — buyer aborted on the PayPal side (/paypal/cancel). */
+ *   awaiting_payment  — PayPal order created; the only way forward is a successful capture.
+ *   held              — /paypal/return captured the payment; funds sit in the PLATFORM PayPal
+ *                       account (escrow). The seller can now ship; the buyer can dispute.
+ *   shipped           — seller marked the order shipped (optional tracking note).
+ *   released          — buyer confirmed delivery (or admin overrode) → escrow is marked for
+ *                       payout. The actual transfer to the seller is executed by the admin
+ *                       from the platform PayPal dashboard — the site never moves money itself.
+ *   disputed          — buyer or seller raised an issue; escrow is frozen until admin resolves.
+ *   refunded          — admin resolved a dispute/held order in the buyer's favour (manual
+ *                       refund from the platform PayPal dashboard).
+ *   cancelled         — buyer aborted on the PayPal side before capture (/paypal/cancel).
+ * Legacy 'paid' rows (pre-escrow) are treated as released for display purposes. */
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || '';
 const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET || '';
 const PAYPAL_ENV = String(process.env.PAYPAL_ENV || 'sandbox').toLowerCase() === 'live' ? 'live' : 'sandbox';
@@ -6889,6 +6907,12 @@ CREATE INDEX IF NOT EXISTS idx_product_orders_product ON product_orders(product_
 CREATE INDEX IF NOT EXISTS idx_product_orders_buyer_person ON product_orders(buyer_person_id);
 CREATE INDEX IF NOT EXISTS idx_product_orders_buyer_company ON product_orders(buyer_company_id);
 `);
+// Escrow columns (added post-launch — ad-hoc ALTER pattern; every one optional).
+try { db.exec('ALTER TABLE product_orders ADD COLUMN shipped_at TEXT'); } catch (e) { /* exists */ }
+try { db.exec('ALTER TABLE product_orders ADD COLUMN tracking_note TEXT DEFAULT \'\'') ; } catch (e) { /* exists */ }
+try { db.exec('ALTER TABLE product_orders ADD COLUMN delivered_at TEXT'); } catch (e) { /* exists */ }
+try { db.exec('ALTER TABLE product_orders ADD COLUMN disputed_at TEXT'); } catch (e) { /* exists */ }
+try { db.exec('ALTER TABLE product_orders ADD COLUMN dispute_reason TEXT DEFAULT \'\'') ; } catch (e) { /* exists */ }
 
 /** Authenticated PayPal API call with an 8s timeout. THROWS on any failure — routes always wrap in try/catch. */
 async function paypalApi(pathname, { token = null, body = undefined, basicAuth = false } = {}) {
@@ -6942,10 +6966,15 @@ function parseMoqNumber(moq) {
   const m = String(moq || '').match(/^\s*(\d{1,9})/);
   return m ? parseInt(m[1], 10) : null;
 }
-/** Badge for order statuses, mapped onto the existing badge styles. */
+/** Badge for order statuses, mapped onto the existing badge styles. Escrow states get
+ *  explicit labels so both parties always know where the money sits. */
 function orderStatusBadge(status) {
-  const cls = { requested: 'pending', awaiting_payment: 'sealed', paid: 'approved', cancelled: 'rejected' }[status] || 'pending';
-  return `<span class="badge badge-${cls}">${esc(String(status || '').replace(/_/g, ' '))}</span>`;
+  const cls = { requested: 'pending', awaiting_payment: 'sealed', paid: 'approved', cancelled: 'rejected',
+    held: 'sealed', shipped: 'pending', released: 'approved', disputed: 'rejected', refunded: 'rejected' }[status] || 'pending';
+  const label = { held: '🔒 escrow held', shipped: '🚚 shipped — escrow held', released: '✅ escrow released',
+    disputed: '⚠️ disputed — escrow frozen', refunded: '💸 refunded', paid: '✅ paid' }[status]
+    || String(status || '').replace(/_/g, ' ');
+  return `<span class="badge badge-${cls}">${esc(label)}</span>`;
 }
 /** Where a buyer's order list lives, by session type. */
 function buyerOrdersPath(user) { return user && user.isPerson ? '/my/orders' : '/orders'; }
@@ -6969,7 +6998,9 @@ function orderTotalHtml(o) {
     ? `<b style="color:var(--gold)">${fmtAmount(o.total_amount)} ${esc(o.currency || 'USD')}</b>`
     : `<span class="muted">${esc(o.unit_price || 'price on request')}</span>`;
 }
-/** Shared orders table. opts: showBuyer (seller view), showSeller (buyer view), payNow (buyer session user). */
+/** Shared orders table. opts: showBuyer (seller view), showSeller (buyer view),
+ *  payNow (buyer session user), actor (session user allowed escrow actions — buyer and/or
+ *  seller buttons render per row depending on which side of the order the actor is on). */
 function ordersTableHtml(orders, names, opts) {
   opts = opts || {};
   if (!orders.length) return '<p class="muted">No orders yet.</p>';
@@ -6978,15 +7009,34 @@ function ordersTableHtml(orders, names, opts) {
     const payNow = opts.payNow && o.status === 'awaiting_payment' && isOrderBuyer(opts.payNow, o) && paypalConfigured()
       ? `<form method="POST" action="/order/${o.id}/pay" style="display:inline"><button class="btn btn-sm btn-green" type="submit">💳 Pay now</button></form>`
       : '';
+    // ----- Escrow actions (Round 4): rendered only for the actual counterparty -----
+    let escrowActions = '';
+    if (opts.actor && !opts.actor.isAdmin) {
+      const actorIsBuyer = isOrderBuyer(opts.actor, o);
+      const actorIsSeller = !opts.actor.isPerson && o.seller_company_id === opts.actor.id;
+      if (actorIsSeller && o.status === 'held') {
+        escrowActions += ` <form method="POST" action="/order/${o.id}/ship" style="display:inline" onsubmit="var t=prompt('Tracking / shipment note for the buyer (optional):'); if(t===null){return false;} this.tracking_note.value=t;"><input type="hidden" name="tracking_note" value=""><button class="btn btn-sm" type="submit">🚚 Mark shipped</button></form>`;
+      }
+      if (actorIsBuyer && (o.status === 'held' || o.status === 'shipped')) {
+        escrowActions += ` <form method="POST" action="/order/${o.id}/confirm-delivery" style="display:inline" onsubmit="return confirm('Confirm the goods arrived in good order? This RELEASES the held payment to the seller and is audit-logged.')"><button class="btn btn-sm btn-green" type="submit">✅ Confirm delivery</button></form>`;
+      }
+      if ((actorIsBuyer || actorIsSeller) && (o.status === 'held' || o.status === 'shipped')) {
+        escrowActions += ` <form method="POST" action="/order/${o.id}/dispute" style="display:inline" onsubmit="var r=prompt('Describe the issue for the platform team:'); if(!r||r.trim().length<3){return false;} this.reason.value=r.trim();"><input type="hidden" name="reason" value=""><button class="btn btn-sm btn-outline" type="submit">⚠️ Dispute</button></form>`;
+      }
+    }
+    const escrowNote = (o.status === 'shipped' && o.tracking_note)
+      ? `<div class="muted" style="font-size:0.8rem;margin-top:4px">📦 ${esc(String(o.tracking_note).slice(0, 120))}</div>`
+      : (o.status === 'disputed' && o.dispute_reason)
+        ? `<div class="muted" style="font-size:0.8rem;margin-top:4px">⚠️ ${esc(String(o.dispute_reason).slice(0, 120))}</div>` : '';
     return `<tr>
       <td><a href="/product/${o.product_id}">${esc(prod ? prod.title : '(product removed)')}</a></td>
       ${opts.showBuyer ? `<td>${esc(orderBuyerName(o, names))}</td>` : ''}
       ${opts.showSeller ? `<td><a href="/company/${o.seller_company_id}">${esc(names.get(o.seller_company_id) || 'Company')}</a></td>` : ''}
       <td>${o.qty}</td>
       <td>${orderTotalHtml(o)}</td>
-      <td>${orderStatusBadge(o.status)}</td>
+      <td>${orderStatusBadge(o.status)}${escrowNote}</td>
       <td class="muted" style="white-space:nowrap">${esc(o.created_at.slice(0, 16).replace('T', ' '))}</td>
-      <td>${payNow}</td>
+      <td style="white-space:nowrap">${payNow}${escrowActions}</td>
     </tr>`;
   }).join('');
   return `<div class="card" style="overflow-x:auto"><table><thead><tr>
@@ -7065,11 +7115,15 @@ app.get('/paypal/return', requireViewer, ah(async (req, res) => {
   try {
     const cap = await paypalCapture(order.paypal_order_id);
     if (cap.status === 'COMPLETED') {
-      db.prepare(`UPDATE product_orders SET status = 'paid' WHERE id = ? AND status = 'awaiting_payment'`).run(order.id);
+      // ESCROW: the money is captured into the PLATFORM PayPal account and held there until
+      // the buyer confirms delivery (or management resolves a dispute). Status 'held'.
+      db.prepare(`UPDATE product_orders SET status = 'held' WHERE id = ? AND status = 'awaiting_payment'`).run(order.id);
       const prod = db.prepare('SELECT title FROM products WHERE id = ?').get(order.product_id);
-      notify(order.seller_company_id, 'order_paid', `💰 PAID order #${order.id}: "${prod ? prod.title.slice(0, 60) : 'product'}" ×${order.qty} — ${order.total_amount != null ? fmtAmount(order.total_amount) + ' ' + order.currency : 'amount on file'}${cap.payerEmail ? ` (payer ${cap.payerEmail})` : ''}.`, '/orders');
-      audit('PAYMENT AGENT', 'order captured', 'pass', `Order #${order.id} captured via PayPal (${order.paypal_order_id}) — ${order.total_amount != null ? order.total_amount + ' ' + order.currency : 'quote'}${cap.payerEmail ? `, payer ${cap.payerEmail}` : ''}`);
-      return res.redirect(home + '?msg=' + encodeURIComponent('Payment received — thank you! The seller has been notified.'));
+      const amountTxt = order.total_amount != null ? fmtAmount(order.total_amount) + ' ' + order.currency : 'amount on file';
+      notify(order.seller_company_id, 'order_paid', `🔒 ESCROW order #${order.id}: "${prod ? prod.title.slice(0, 60) : 'product'}" ×${order.qty} — ${amountTxt} is held by Dealzoin escrow${cap.payerEmail ? ` (payer ${cap.payerEmail})` : ''}. Ship the goods and mark the order shipped; the funds are released when the buyer confirms delivery.`, '/orders');
+      if (order.buyer_company_id) notify(order.buyer_company_id, 'order_held', `🔒 Your payment for order #${order.id} (${amountTxt}) is held safely in Dealzoin escrow. It is only released to the seller after you confirm delivery.`, '/orders');
+      audit('PAYMENT AGENT', 'order captured to escrow', 'pass', `Order #${order.id} captured via PayPal (${order.paypal_order_id}) → ESCROW HELD — ${order.total_amount != null ? order.total_amount + ' ' + order.currency : 'quote'}${cap.payerEmail ? `, payer ${cap.payerEmail}` : ''}`);
+      return res.redirect(home + '?msg=' + encodeURIComponent('Payment received and held safely in escrow 🔒 — it is only released to the seller after you confirm delivery.'));
     }
     audit('PAYMENT AGENT', 'order capture', 'fail', `Order #${order.id}: PayPal capture status "${cap.status || 'unknown'}"`);
     return res.redirect(home + '?err=' + encodeURIComponent('PayPal did not complete the payment. You can try again from your orders page.'));
@@ -7115,6 +7169,132 @@ app.post('/order/:id/pay', requireViewer, rateLimitRoute('order-pay', 20, 60 * 6
   }
 }));
 
+// ----- ESCROW transitions (Round 4): ship → confirm-delivery → released | dispute → admin resolves -----
+/** Notify whichever side of an order is a company (persons have no bell inbox — they see
+ *  status on /my/orders). */
+function notifyOrderParty(o, side, type, text) {
+  const cid = side === 'buyer' ? o.buyer_company_id : o.seller_company_id;
+  if (cid) notify(cid, type, text, '/orders');
+}
+function orderLabel(o) {
+  const prod = db.prepare('SELECT title FROM products WHERE id = ?').get(o.product_id);
+  return `order #${o.id} ("${prod ? prod.title.slice(0, 50) : 'product'}" ×${o.qty})`;
+}
+
+// Seller marks a held order shipped (optional tracking note).
+app.post('/order/:id/ship', requireCompany, rateLimitRoute('order-ship', 30, 60 * 60 * 1000, '/orders'), (req, res) => {
+  const o = db.prepare('SELECT * FROM product_orders WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!o || o.seller_company_id !== req.user.id) {
+    audit('ESCROW AGENT', 'ship guard', 'fail', `${req.user.name} tried to ship order #${req.params.id} they do not sell`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Not your sale</h2><p class="muted">Only the selling company can mark an order shipped.</p></div>', req.user));
+  }
+  if (o.status !== 'held') return res.redirect('/orders?err=' + encodeURIComponent('Only escrow-held orders can be marked shipped.'));
+  const note = String(req.body.tracking_note || '').slice(0, 200);
+  db.prepare(`UPDATE product_orders SET status = 'shipped', shipped_at = ?, tracking_note = ? WHERE id = ? AND status = 'held'`).run(now(), note, o.id);
+  notifyOrderParty(o, 'buyer', 'order_shipped', `🚚 ${req.user.name} shipped ${orderLabel(o)}${note ? ` — ${note}` : ''}. Confirm delivery when the goods arrive to release the escrowed payment.`);
+  audit('ESCROW AGENT', 'order shipped', 'pass', `${req.user.name} marked order #${o.id} shipped${note ? ` (note: ${note.slice(0, 80)})` : ''} — awaiting buyer delivery confirmation`);
+  res.redirect('/orders?msg=' + encodeURIComponent('Marked as shipped — the buyer has been asked to confirm delivery. The payment stays in escrow until then.'));
+});
+
+// Buyer confirms delivery → escrow released (payout executed manually by management).
+app.post('/order/:id/confirm-delivery', requireViewer, rateLimitRoute('order-confirm', 30, 60 * 60 * 1000, null), (req, res) => {
+  const home = buyerOrdersPath(req.user);
+  const o = db.prepare('SELECT * FROM product_orders WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!o || !isOrderBuyer(req.user, o)) {
+    audit('ESCROW AGENT', 'confirm-delivery guard', 'fail', `${req.user.name} tried to confirm delivery on order #${req.params.id} they did not buy`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Not your order</h2><p class="muted">Only the buyer can confirm delivery.</p></div>', req.user));
+  }
+  if (o.status !== 'held' && o.status !== 'shipped') return res.redirect(home + '?err=' + encodeURIComponent('This order is not awaiting a delivery confirmation.'));
+  const ts = now();
+  db.prepare(`UPDATE product_orders SET status = 'released', delivered_at = ? WHERE id = ? AND status IN ('held','shipped')`).run(ts, o.id);
+  const amountTxt = o.total_amount != null ? fmtAmount(o.total_amount) + ' ' + o.currency : 'the held amount';
+  notify(o.seller_company_id, 'order_released', `✅ Buyer confirmed delivery on ${orderLabel(o)} — ${amountTxt} released from escrow. Dealzoin management will transfer the payout to you from the platform PayPal account.`, '/orders');
+  audit('ESCROW AGENT', 'escrow released', 'pass', `${req.user.name} confirmed delivery on order #${o.id} at ${ts} — ${amountTxt} marked released (manual payout by management)`);
+  res.redirect(home + '?msg=' + encodeURIComponent('Delivery confirmed — the escrowed payment is released to the seller. Thank you for trading on Dealzoin.'));
+});
+
+// Either party raises a dispute → escrow frozen for admin resolution.
+app.post('/order/:id/dispute', requireViewer, rateLimitRoute('order-dispute', 20, 60 * 60 * 1000, null), (req, res) => {
+  const home = buyerOrdersPath(req.user);
+  const o = db.prepare('SELECT * FROM product_orders WHERE id = ?').get(parseInt(req.params.id, 10));
+  const isSeller = o && !req.user.isPerson && !req.user.isAdmin && o.seller_company_id === req.user.id;
+  if (!o || (!isOrderBuyer(req.user, o) && !isSeller)) {
+    audit('ESCROW AGENT', 'order dispute guard', 'fail', `${req.user.name} tried to dispute order #${req.params.id} without being a party`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Parties only</h2><p class="muted">Only the buyer or the seller can dispute an order.</p></div>', req.user));
+  }
+  if (o.status !== 'held' && o.status !== 'shipped') return res.redirect(home + '?err=' + encodeURIComponent('Only escrow-held orders can be disputed.'));
+  const reason = String(req.body.reason || '').trim().slice(0, 300);
+  if (reason.length < 3) return res.redirect(home + '?err=' + encodeURIComponent('Please describe the issue so the platform team can help.'));
+  const ts = now();
+  db.prepare(`UPDATE product_orders SET status = 'disputed', disputed_at = ?, dispute_reason = ? WHERE id = ? AND status IN ('held','shipped')`).run(ts, reason, o.id);
+  notifyOrderParty(o, isSeller ? 'buyer' : 'seller', 'order_dispute', `⚠️ ${req.user.name} opened a dispute on ${orderLabel(o)}: "${reason.slice(0, 120)}". The escrowed payment is frozen until Dealzoin management resolves it.`);
+  audit('ESCROW AGENT', 'order dispute raised', 'flag', `${req.user.name} disputed order #${o.id} at ${ts}: ${reason.slice(0, 160)} — escrow frozen, admin resolves via /admin/escrow`);
+  res.redirect(home + '?msg=' + encodeURIComponent('Dispute opened — the escrowed payment is frozen and Dealzoin management has been alerted.'));
+});
+
+// ----- Admin escrow console: every order with money at stake -----
+app.get('/admin/escrow', requireAdmin, (req, res) => {
+  const names = companyNameMap();
+  const active = db.prepare(`SELECT * FROM product_orders WHERE status IN ('held','shipped','disputed') ORDER BY CASE status WHEN 'disputed' THEN 0 WHEN 'held' THEN 1 ELSE 2 END, id DESC`).all();
+  const settled = db.prepare(`SELECT * FROM product_orders WHERE status IN ('released','refunded') ORDER BY id DESC LIMIT 50`).all();
+  const adminActions = (o) => `
+    <form method="POST" action="/admin/escrow/${o.id}/release" style="display:inline" onsubmit="return confirm('Release the escrowed funds to the SELLER? Execute the actual transfer from the platform PayPal dashboard afterwards.')"><button class="btn btn-sm btn-green" type="submit">✅ Release to seller</button></form>
+    <form method="POST" action="/admin/escrow/${o.id}/refund" style="display:inline" onsubmit="return confirm('Mark this order REFUNDED to the buyer? Execute the actual refund from the platform PayPal dashboard afterwards.')"><button class="btn btn-sm btn-outline" type="submit">💸 Mark refunded</button></form>`;
+  const tableFor = (list, withActions) => {
+    if (!list.length) return '<p class="muted">None.</p>';
+    const rows = list.map(o => {
+      const prod = db.prepare('SELECT title FROM products WHERE id = ?').get(o.product_id);
+      return `<tr>
+        <td>#${o.id}</td>
+        <td><a href="/product/${o.product_id}">${esc(prod ? prod.title : '(removed)')}</a></td>
+        <td>${esc(orderBuyerName(o, names))}</td>
+        <td><a href="/company/${o.seller_company_id}">${esc(names.get(o.seller_company_id) || 'Company')}</a></td>
+        <td>${orderTotalHtml(o)}</td>
+        <td>${orderStatusBadge(o.status)}${o.dispute_reason ? `<div class="muted" style="font-size:0.8rem;margin-top:4px">⚠️ ${esc(o.dispute_reason.slice(0, 120))}</div>` : ''}${o.tracking_note ? `<div class="muted" style="font-size:0.8rem;margin-top:4px">📦 ${esc(o.tracking_note.slice(0, 120))}</div>` : ''}</td>
+        <td class="muted" style="white-space:nowrap">${esc((o.shipped_at || o.created_at).slice(0, 16).replace('T', ' '))}</td>
+        ${withActions ? `<td style="white-space:nowrap">${adminActions(o)}</td>` : ''}
+      </tr>`;
+    }).join('');
+    return `<div class="card" style="overflow-x:auto"><table><thead><tr><th>#</th><th>Product</th><th>Buyer</th><th>Seller</th><th>Total</th><th>Escrow state</th><th>Updated (UTC)</th>${withActions ? '<th>Resolve</th>' : ''}</tr></thead><tbody>${rows}</tbody></table></div>`;
+  };
+  const body = `
+  <div class="feed-head" style="margin-bottom:10px">
+    <div>
+      <div class="kicker">Admin · escrow</div>
+      <h1 style="font-size:1.75rem;margin-top:4px">🔒 Order escrow (${active.length} active)</h1>
+    </div>
+    <a class="btn btn-sm btn-outline" href="/admin/orders">← All orders</a>
+  </div>
+  <p class="muted" style="margin-bottom:12px">Buyers' PayPal payments are captured into the <b>platform PayPal account</b> and held until delivery is confirmed. Releasing or refunding here updates the record and notifies both parties — <b>execute the matching transfer/refund from your PayPal dashboard</b>; the site never moves money by itself.</p>
+  <h2 class="sec-h">⚖️ Active escrow (${active.length})</h2>
+  ${tableFor(active, true)}
+  <h2 class="sec-h" style="margin-top:18px">📜 Recently settled</h2>
+  ${tableFor(settled, false)}`;
+  res.send(page('Order escrow', body, req.user, req.query.msg, req.query.err));
+});
+
+app.post('/admin/escrow/:id/release', requireAdmin, (req, res) => {
+  const o = db.prepare('SELECT * FROM product_orders WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!o || !['held', 'shipped', 'disputed'].includes(o.status)) return res.redirect('/admin/escrow?err=' + encodeURIComponent('Order not found or not in escrow.'));
+  db.prepare(`UPDATE product_orders SET status = 'released', delivered_at = COALESCE(delivered_at, ?) WHERE id = ?`).run(now(), o.id);
+  const amountTxt = o.total_amount != null ? fmtAmount(o.total_amount) + ' ' + o.currency : 'the held amount';
+  notify(o.seller_company_id, 'order_released', `✅ Management released the escrow on ${orderLabel(o)} — ${amountTxt} is yours. The payout is transferred from the platform PayPal account.`, '/orders');
+  notifyOrderParty(o, 'buyer', 'order_released', `✅ Management released the escrowed payment on ${orderLabel(o)} to the seller.`);
+  audit('ESCROW AGENT', 'admin escrow release', 'flag', `Admin released order #${o.id} (${amountTxt}) to seller #${o.seller_company_id}${o.status === 'disputed' ? ' — dispute resolved in seller favour' : ''} (manual payout from platform PayPal)`);
+  res.redirect('/admin/escrow?msg=' + encodeURIComponent(`Order #${o.id} released to the seller — remember to execute the payout in PayPal.`));
+});
+
+app.post('/admin/escrow/:id/refund', requireAdmin, (req, res) => {
+  const o = db.prepare('SELECT * FROM product_orders WHERE id = ?').get(parseInt(req.params.id, 10));
+  if (!o || !['held', 'shipped', 'disputed'].includes(o.status)) return res.redirect('/admin/escrow?err=' + encodeURIComponent('Order not found or not in escrow.'));
+  db.prepare(`UPDATE product_orders SET status = 'refunded' WHERE id = ?`).run(o.id);
+  const amountTxt = o.total_amount != null ? fmtAmount(o.total_amount) + ' ' + o.currency : 'the held amount';
+  notifyOrderParty(o, 'buyer', 'order_refunded', `💸 Management refunded ${amountTxt} on ${orderLabel(o)} — the money is returned from the platform PayPal account.`);
+  notify(o.seller_company_id, 'order_refunded', `💸 Management marked ${orderLabel(o)} as refunded to the buyer${o.dispute_reason ? ` (dispute: "${o.dispute_reason.slice(0, 100)}")` : ''}. No payout will be made.`, '/orders');
+  audit('ESCROW AGENT', 'admin escrow refund', 'flag', `Admin marked order #${o.id} (${amountTxt}) refunded to the buyer${o.status === 'disputed' ? ' — dispute resolved in buyer favour' : ''} (manual refund from platform PayPal)`);
+  res.redirect('/admin/escrow?msg=' + encodeURIComponent(`Order #${o.id} marked refunded — remember to execute the refund in PayPal.`));
+});
+
 // ----- Company orders: purchases I placed + sales on my products -----
 app.get('/orders', requireCompany, (req, res) => {
   const names = companyNameMap();
@@ -7129,10 +7309,10 @@ app.get('/orders', requireCompany, (req, res) => {
     <a class="btn btn-sm btn-outline" href="/products">← Catalog</a>
   </div>
   <h2 class="sec-h">📥 Orders for my products (${incoming.length})</h2>
-  <p class="muted" style="margin:-6px 0 10px">Buyers' requests and paid orders on your listings. "Requested" orders are inquiries — contact the buyer to arrange payment; "paid" orders were settled via PayPal.</p>
-  ${ordersTableHtml(incoming, names, { showBuyer: true })}
+  <p class="muted" style="margin:-6px 0 10px">Buyers' requests and paid orders on your listings. "Requested" orders are inquiries — contact the buyer to arrange payment. Paid orders are <b>held in Dealzoin escrow</b> 🔒: mark them shipped when dispatched — the funds are released when the buyer confirms delivery.</p>
+  ${ordersTableHtml(incoming, names, { showBuyer: true, actor: req.user })}
   <h2 class="sec-h" style="margin-top:18px">📤 Orders I placed (${placed.length})</h2>
-  ${ordersTableHtml(placed, names, { showSeller: true, payNow: req.user })}`;
+  ${ordersTableHtml(placed, names, { showSeller: true, payNow: req.user, actor: req.user })}`;
   res.send(page('Orders', body, req.user, req.query.msg, req.query.err, 'box'));
 });
 
@@ -7147,9 +7327,9 @@ app.get('/admin/orders', requireAdmin, (req, res) => {
       <div class="kicker">Admin · product orders</div>
       <h1 style="font-size:1.75rem;margin-top:4px">🧾 Product orders (${orders.length})</h1>
     </div>
-    <a class="btn btn-sm btn-outline" href="/admin/dashboard">← Dashboard</a>
+    <div><a class="btn btn-sm" href="/admin/escrow">🔒 Escrow console</a> <a class="btn btn-sm btn-outline" href="/admin/dashboard">← Dashboard</a></div>
   </div>
-  <p class="muted" style="margin-bottom:12px">PayPal checkout is <b>${configured ? `configured (${PAYPAL_ENV})` : 'NOT configured'}</b> — orders ${configured ? 'with a numeric price go through PayPal capture' : 'are recorded as seller-handled requests'}.</p>
+  <p class="muted" style="margin-bottom:12px">PayPal checkout is <b>${configured ? `configured (${PAYPAL_ENV})` : 'NOT configured'}</b> — orders ${configured ? 'with a numeric price are captured into escrow (held until delivery confirmation)' : 'are recorded as seller-handled requests'}. Resolve held/disputed orders in the <a href="/admin/escrow">escrow console</a>.</p>
   ${ordersTableHtml(orders, names, { showBuyer: true, showSeller: true })}`;
   res.send(page('Product orders', body, req.user, req.query.msg, req.query.err));
 });
@@ -11932,6 +12112,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
   const pendingPayCount = count(`SELECT COUNT(*) AS n FROM commission_payments WHERE status = 'pending'`);
   const pendingReviews = count(`SELECT COUNT(*) AS n FROM review_requests WHERE status IN ('pending','in_review')`);
   const newIdeas = count(`SELECT COUNT(*) AS n FROM agent_ideas WHERE status = 'new'`);
+  const escrowActive = count(`SELECT COUNT(*) AS n FROM product_orders WHERE status IN ('held','shipped','disputed')`);
   const statsHtml = `<div class="stats">${[
     ['Total companies', stats.companies, ''], ['Pending', stats.pending, ''], ['Approved', stats.approved, ' mint'],
     ['Flagged ⚠️', stats.flagged, ''], ['Deals', stats.deals, ' gold'], ['Contracts pending', stats.contractsPending, ' gold'],
@@ -11939,6 +12120,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
   ].map(([l, n, cls], ti) => `<div class="stat card--cut js-tilt" data-reveal style="--i:${Math.min(ti, 8)}" data-num="${String(ti + 1).padStart(2, '0')}"><div class="num${cls}" data-count="${n}">${n}</div><div class="lbl">${l}</div></div>`).join('')}
     <a href="/admin/reviews" class="stat card--cut js-tilt" data-reveal style="--i:6;text-decoration:none;color:inherit;display:block" data-num="07"><div class="num${pendingReviews ? ' gold' : ''}" data-count="${pendingReviews}">${pendingReviews}</div><div class="lbl">🆘 Review requests — open</div></a>
     <a href="/admin/ideas" class="stat card--cut js-tilt" data-reveal style="--i:7;text-decoration:none;color:inherit;display:block" data-num="08"><div class="num${newIdeas ? ' mint' : ''}" data-count="${newIdeas}">${newIdeas}</div><div class="lbl">🛰️ Strategy Agent — new ideas</div></a>
+    <a href="/admin/escrow" class="stat card--cut js-tilt" data-reveal style="--i:8;text-decoration:none;color:inherit;display:block" data-num="09"><div class="num${escrowActive ? ' gold' : ''}" data-count="${escrowActive}">${escrowActive}</div><div class="lbl">🔒 Order escrow — active</div></a>
     <div class="stat card--cut js-tilt" data-reveal style="--i:7" data-num="08"><div class="num gold" style="font-size:1.15rem;line-height:1.4">${commissionText}</div><div class="lbl">Platform commission (approved deals) · ${feePct}%</div></div>
     <div class="stat card--cut js-tilt" data-reveal style="--i:8" data-num="09"><div class="num gold" style="font-size:1.15rem;line-height:1.4">${collectedText}</div><div class="lbl">💰 Commission collected · ${pendingPayCount} payment${pendingPayCount === 1 ? '' : 's'} pending</div></div></div>`;
 
