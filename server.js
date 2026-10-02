@@ -4999,8 +4999,7 @@ app.get('/', (req, res) => {
       ${user
         ? `<a class="btn js-magnet" href="${user.isAdmin ? '/admin' : (user.isPerson ? '/products' : '/timeline')}">Enter the Deal Floor &rarr;</a>`
         : `<a class="btn js-magnet" href="/signup">Enter the Deal Floor &rarr;</a>
-           &nbsp; <a class="btn btn-outline" href="#why">See how it works</a>
-           &nbsp; <a class="btn btn-outline" href="/signup/person">👤 Register as a person — browse &amp; order products</a>`}
+           &nbsp; <a class="btn btn-outline" href="#why">See how it works</a>`}
       </div>
     </div>
   </div>
