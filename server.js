@@ -5009,7 +5009,7 @@ app.get('/', (req, res) => {
   </div>
   <div class="steps">
     <div class="card card--cut js-tilt a-enter" data-stage="cards" style="--i:2" data-num="01"><h3>01 License-Verified Network</h3><p class="muted">Every company is verified against a real trade license — and automatically locked out if that license expires. No anonymous offers. Ever.</p></div>
-    <div class="card card--cut is-feature js-tilt a-enter" data-stage="cards" style="--i:3" data-num="02"><h3>02 Private Deal Rooms</h3><p>Negotiate terms, exchange documents and message counterparties in encrypted rooms — sealed until both sides sign.</p></div>
+    <div class="card card--cut is-feature js-tilt a-enter" data-stage="cards" style="--i:3" data-num="02"><h3>02 Private Deal Rooms</h3><p>Negotiate terms and exchange documents in private rooms — visible only to the two parties, sealed until both sides sign.</p></div>
     <div class="card card--cut js-tilt a-enter" data-stage="cards" style="--i:4" data-num="03"><h3>03 The Trust Ledger</h3><p class="muted">Every offer, counter-offer and signature is timestamped to an audit trail your compliance team will actually enjoy.</p></div>
   </div>
   ${(stCompanies >= 25 && stDeals >= 25 && stClosed >= 25 && stDocs >= 25) ? `
@@ -5368,7 +5368,6 @@ app.get('/login', (req, res) => {
     </form>
     <p class="muted" style="margin-top:12px">${esc(t(lang, 'auth.noaccount'))} <a href="/signup">${esc(t(lang, 'auth.register'))}</a></p>
     <p class="muted">Team member? Sign in with your own member email &amp; password.</p>
-    <p class="muted">New individual buyer? <a href="/signup/person">Register as a person</a></p>
     <p class="shield-note">🛡️ Protected by Dealzoin security agents</p>
   </div>`;
   res.send(page('Sign in', body, null, req.query.msg, req.query.err, undefined, undefined, { lang }));
@@ -6433,50 +6432,12 @@ function issuePersonLoginCode(req, res, person, auditContext) {
   res.redirect('/verify-login');
 }
 
-// ----- Person registration: minimal form, no company/KYC fields -----
+// ----- Person registration REMOVED (investor positioning: companies-only network).
+// Existing person accounts keep read-only access: login + /my/orders stay live below.
+// /signup/person now redirects to company registration. -----
 app.get('/signup/person', (req, res) => {
-  const body = `
-  <div class="card" style="max-width:460px;margin:0 auto">
-    <div class="kicker">Individual buyer account</div>
-    <h2 style="margin:6px 0 8px">👤 Register as a person</h2>
-    <p class="muted" style="margin-bottom:14px">Browse &amp; order products listed for individual buyers — no company or KYC documents needed. Companies should use the <a href="/signup">company registration</a> instead.</p>
-    <form method="POST" action="/signup/person">
-      <label>Full name</label><input type="text" name="name" required maxlength="120">
-      <label>Email</label><input type="email" name="email" required maxlength="160">
-      <label>Password (min 8 characters)</label><input type="password" name="password" required minlength="8" maxlength="200">
-      <button class="btn" type="submit">Create person account</button>
-    </form>
-    <p class="muted" style="margin-top:12px">Already registered? <a href="/login">Sign in</a></p>
-    <p class="shield-note">🛡️ Protected by the Authentication Agent (email 2FA on every sign-in)</p>
-  </div>`;
-  res.send(page('Register as a person', body, currentUser(req), req.query.msg, req.query.err));
-});
-
-app.post('/signup/person', rateLimitRoute('signup-person', 5, 60 * 60 * 1000, '/signup/person'), (req, res) => {
-  const name = String(req.body.name || '').trim().slice(0, 120);
-  const email = String(req.body.email || '').trim().toLowerCase().slice(0, 160);
-  const password = String(req.body.password || '');
-  const back = '/signup/person?err=';
-  if (!name || !email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    return res.redirect(back + encodeURIComponent('Please fill in your name and a valid email.'));
-  }
-  if (password.length < 8) {
-    return res.redirect(back + encodeURIComponent('Password must be at least 8 characters.'));
-  }
-  // One identity per email across the whole platform: persons AND companies (and team members).
-  const dupe = db.prepare('SELECT id FROM persons WHERE email = ?').get(email)
-    || db.prepare('SELECT id FROM companies WHERE email = ?').get(email)
-    || db.prepare('SELECT id FROM company_members WHERE email = ?').get(email);
-  if (dupe) {
-    audit('AUTHENTICATION AGENT', 'person signup', 'fail', `Duplicate email rejected at person signup: ${email}`);
-    return res.redirect(back + encodeURIComponent('An account with this email already exists. Try signing in.'));
-  }
-  const salt = newSalt();
-  const info = db.prepare('INSERT INTO persons (name, email, password_hash, salt, status, created_at) VALUES (?,?,?,?,?,?)')
-    .run(name, email, hashPassword(password, salt), salt, 'active', now());
-  const person = { id: info.lastInsertRowid, name, email };
-  audit('AUTHENTICATION AGENT', 'person signup', 'pass', `Person account #${person.id} created for ${email} (${name})`);
-  issuePersonLoginCode(req, res, person, 'signup');
+  audit('AUTHENTICATION AGENT', 'person signup removed', 'flag', `GET /signup/person hit — redirected to /signup (person registration removed)`);
+  res.redirect('/signup?msg=' + encodeURIComponent('Dealzoin is a companies-only network — register your company here.'));
 });
 
 // ----- Person order history: every order this individual buyer has placed -----
@@ -6491,7 +6452,7 @@ app.get('/my/orders', requirePerson, (req, res) => {
     </div>
     <a class="btn btn-sm btn-outline" href="/products">← Browse products</a>
   </div>
-  <p class="muted" style="margin-bottom:12px">"Requested" orders are purchase inquiries — the seller contacts you to arrange payment. Orders "awaiting payment" can be settled online via PayPal with the Pay now button. Paid orders are <b>held in escrow</b> 🔒 — the money only reaches the seller after you confirm delivery.</p>
+  <p class="muted" style="margin-bottom:12px">"Requested" orders are purchase inquiries — the seller contacts you to arrange payment directly. Online escrow checkout launches with a licensed payment partner (Phase 2).</p>
   ${ordersTableHtml(orders, names, { showSeller: true, payNow: req.user, actor: req.user })}`;
   res.send(page('My Orders', body, req.user, req.query.msg, req.query.err, 'contracts'));
 });
@@ -6698,7 +6659,7 @@ app.get('/products/new', requireCompany, (req, res) => {
       <label>Who can see &amp; order this? (required)</label>
       <select name="audience" required>
         <option value="companies">Companies only (default — full network features)</option>
-        <option value="everyone">Companies + individual buyers (persons can order via PayPal)</option>
+        <option value="everyone">Companies + individual buyers</option>
       </select>
       <label>Indicative price (optional)</label>
       <input type="text" name="price_text" maxlength="${PRODUCT_FIELD_MAX}" placeholder="e.g. $12–15 / kg — negotiable">
@@ -6706,7 +6667,7 @@ app.get('/products/new', requireCompany, (req, res) => {
         <div><label>Unit price (number — optional)</label><input type="number" name="price_amount" min="0" step="0.01" placeholder="e.g. 12.50"></div>
         <div><label>Price currency</label><select name="price_currency">${optionsHtml(DEAL_CURRENCIES, 'USD')}</select></div>
       </div>
-      <p class="muted" style="margin-top:-4px;font-size:12px">Set a numeric unit price to let buyers pay online via PayPal when ordering; leave it empty and orders arrive as purchase inquiries you settle manually.</p>
+      <p class="muted" style="margin-top:-4px;font-size:12px">Set a numeric unit price so buyers see the order total; orders arrive as purchase inquiries you settle with the buyer (online escrow checkout launches with a licensed payment partner — Phase 2).</p>
       <label>Description</label>
       <textarea name="description" rows="5" maxlength="${PRODUCT_DESC_MAX}" placeholder="Specifications, packaging, certifications, lead time, export experience…"></textarea>
       <label>Photos (up to ${PRODUCT_MAX_PHOTOS} — PNG, JPG, WebP or GIF, max 5 MB each)</label>
@@ -6788,7 +6749,7 @@ app.get('/product/:id', requireViewer, (req, res) => {
     <form method="POST" action="/product/${p.id}/order" style="margin-top:8px;display:flex;gap:10px;flex-wrap:wrap;align-items:end">
       <div style="max-width:170px"><label>Quantity${moqNum ? ` (MOQ: ${moqNum})` : ''}</label>
         <input type="number" name="qty" value="${moqNum || 1}" min="${moqNum || 1}" step="1" required></div>
-      <button class="btn" type="submit">${p.price_amount != null && paypalConfigured() ? '🛒 Order & pay with PayPal' : '📨 Send order request'}</button>
+      <button class="btn" type="submit">${p.price_amount != null && paypalCheckoutEnabled() ? '🛒 Order & pay with PayPal' : '📨 Send order request'}</button>
     </form>
     <p class="muted" style="margin-top:8px;font-size:12px">
       ${p.price_amount != null
@@ -6886,6 +6847,12 @@ const PAYPAL_ENV = String(process.env.PAYPAL_ENV || 'sandbox').toLowerCase() ===
 const PAYPAL_API_BASE = PAYPAL_ENV === 'live' ? 'https://api-m.paypal.com' : 'https://api-m.sandbox.paypal.com';
 /** True only when BOTH credentials are set — every PayPal call is skipped (quote-only flow) otherwise. */
 function paypalConfigured() { return !!(PAYPAL_CLIENT_ID && PAYPAL_CLIENT_SECRET); }
+/** Checkout stays OFF until a licensed payment partner is signed. Capturing buyer funds into
+ *  the platform's own PayPal account means holding customer money — in the UAE that requires a
+ *  licence or a licensed partner, and PayPal's terms restrict holding funds for third parties
+ *  outside its marketplace product. Set PAYPAL_CHECKOUT=on ONLY once the partner/licensing is
+ *  in place. With checkout off, orders arrive as requests and the parties settle directly. */
+function paypalCheckoutEnabled() { return paypalConfigured() && String(process.env.PAYPAL_CHECKOUT || '').toLowerCase() === 'on'; }
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS product_orders (
@@ -7005,7 +6972,7 @@ function ordersTableHtml(orders, names, opts) {
   if (!orders.length) return '<p class="muted">No orders yet.</p>';
   const rows = orders.map(o => {
     const prod = db.prepare('SELECT id, title FROM products WHERE id = ?').get(o.product_id);
-    const payNow = opts.payNow && o.status === 'awaiting_payment' && isOrderBuyer(opts.payNow, o) && paypalConfigured()
+    const payNow = opts.payNow && o.status === 'awaiting_payment' && isOrderBuyer(opts.payNow, o) && paypalCheckoutEnabled()
       ? `<form method="POST" action="/order/${o.id}/pay" style="display:inline"><button class="btn btn-sm btn-green" type="submit">💳 Pay now</button></form>`
       : '';
     // ----- Escrow actions (Round 4): rendered only for the actual counterparty -----
@@ -7078,7 +7045,7 @@ app.post('/product/:id/order', requireViewer, rateLimitRoute('product-order', 20
     const buyerLabel = req.user.isPerson ? `${req.user.name} (individual buyer)` : req.user.name;
 
     // Online payment only when the listing has a numeric price AND PayPal credentials are configured.
-    if (total != null && paypalConfigured()) {
+    if (total != null && paypalCheckoutEnabled()) {
       try {
         const base = `${req.protocol}://${req.get('host')}`;
         const pp = await paypalCreateOrder(total, currency, `${base}/paypal/return`, `${base}/paypal/cancel`);
@@ -7156,7 +7123,7 @@ app.post('/order/:id/pay', requireViewer, rateLimitRoute('order-pay', 20, 60 * 6
     if (order.status !== 'awaiting_payment' || order.total_amount == null) {
       return res.redirect(home + '?err=' + encodeURIComponent('This order is not awaiting online payment.'));
     }
-    if (!paypalConfigured()) return res.redirect(home + '?err=' + encodeURIComponent('Online payment is not configured right now — the seller will arrange payment with you.'));
+    if (!paypalCheckoutEnabled()) return res.redirect(home + '?err=' + encodeURIComponent('Online checkout is not available yet — the seller will arrange payment with you directly.'));
     const base = `${req.protocol}://${req.get('host')}`;
     const pp = await paypalCreateOrder(order.total_amount, order.currency, `${base}/paypal/return`, `${base}/paypal/cancel`);
     db.prepare(`UPDATE product_orders SET paypal_order_id = ? WHERE id = ? AND status = 'awaiting_payment'`).run(pp.id, order.id);
@@ -7308,7 +7275,7 @@ app.get('/orders', requireCompany, (req, res) => {
     <a class="btn btn-sm btn-outline" href="/products">← Catalog</a>
   </div>
   <h2 class="sec-h">📥 Orders for my products (${incoming.length})</h2>
-  <p class="muted" style="margin:-6px 0 10px">Buyers' requests and paid orders on your listings. "Requested" orders are inquiries — contact the buyer to arrange payment. Paid orders are <b>held in Dealzoin escrow</b> 🔒: mark them shipped when dispatched — the funds are released when the buyer confirms delivery.</p>
+  <p class="muted" style="margin:-6px 0 10px">Buyers' requests on your listings. "Requested" orders are inquiries — contact the buyer to arrange payment directly. Online escrow checkout launches with a licensed payment partner (Phase 2).</p>
   ${ordersTableHtml(incoming, names, { showBuyer: true, actor: req.user })}
   <h2 class="sec-h" style="margin-top:18px">📤 Orders I placed (${placed.length})</h2>
   ${ordersTableHtml(placed, names, { showSeller: true, payNow: req.user, actor: req.user })}`;
@@ -7320,6 +7287,7 @@ app.get('/admin/orders', requireAdmin, (req, res) => {
   const names = companyNameMap();
   const orders = db.prepare('SELECT * FROM product_orders ORDER BY id DESC LIMIT 500').all();
   const configured = paypalConfigured();
+  const checkoutOn = paypalCheckoutEnabled();
   const body = `
   <div class="feed-head" style="margin-bottom:10px">
     <div>
@@ -7328,7 +7296,7 @@ app.get('/admin/orders', requireAdmin, (req, res) => {
     </div>
     <div><a class="btn btn-sm" href="/admin/escrow">🔒 Escrow console</a> <a class="btn btn-sm btn-outline" href="/admin/dashboard">← Dashboard</a></div>
   </div>
-  <p class="muted" style="margin-bottom:12px">PayPal checkout is <b>${configured ? `configured (${PAYPAL_ENV})` : 'NOT configured'}</b> — orders ${configured ? 'with a numeric price are captured into escrow (held until delivery confirmation)' : 'are recorded as seller-handled requests'}. Resolve held/disputed orders in the <a href="/admin/escrow">escrow console</a>.</p>
+  <p class="muted" style="margin-bottom:12px">PayPal checkout is <b>${checkoutOn ? `ON (${PAYPAL_ENV}) — custody mode` : 'OFF — orders arrive as requests'}</b> (API keys ${configured ? 'present' : 'not set'}${checkoutOn ? '' : '; set PAYPAL_CHECKOUT=on once a licensed payment partner is in place'}). Resolve held/disputed orders in the <a href="/admin/escrow">escrow console</a>.</p>
   ${ordersTableHtml(orders, names, { showBuyer: true, showSeller: true })}`;
   res.send(page('Product orders', body, req.user, req.query.msg, req.query.err));
 });
