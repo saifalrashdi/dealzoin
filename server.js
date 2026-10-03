@@ -505,6 +505,10 @@ CREATE TABLE IF NOT EXISTS event_participants (
 `);
 // Stage C graceful column upgrades (old databases keep booting).
 try { db.exec('ALTER TABLE sessions ADD COLUMN member_id INTEGER'); } catch (e) { /* column already exists */ }
+// Sub-account authority toggles — the company owner decides what each member may do (default: full access).
+try { db.exec('ALTER TABLE company_members ADD COLUMN can_sign INTEGER DEFAULT 1'); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE company_members ADD COLUMN can_post_deals INTEGER DEFAULT 1'); } catch (e) { /* column already exists */ }
+try { db.exec('ALTER TABLE company_members ADD COLUMN can_loi INTEGER DEFAULT 1'); } catch (e) { /* column already exists */ }
 // Person accounts (individual buyers): a session belongs to either a company (+optional member) OR a person.
 try { db.exec('ALTER TABLE sessions ADD COLUMN person_id INTEGER'); } catch (e) { /* column already exists */ }
 try { db.exec('ALTER TABLE posts ADD COLUMN author_name TEXT'); } catch (e) { /* column already exists */ }
@@ -3335,7 +3339,7 @@ const CSS = `
   [data-theme="light"] .card__glare { background: radial-gradient(circle, rgba(232,119,42,.12), transparent 55%); }
   .js-tilt:hover .card__glare { opacity: 1; }
   .js-tilt { transform: perspective(800px) rotateX(var(--rx,0)) rotateY(var(--ry,0)); will-change: transform; }
-  .js-tilt.is-tilting { transition: transform .05s linear; }
+  .js-tilt.is-tilting { transition: transform .14s ease-out; }
   .js-tilt:not(.is-tilting) { transition: transform .5s var(--ez-spring), box-shadow .2s ease, border-color .18s ease; }
   /* The tilt transform owns the element while physics are attached — hover lifts must not fight it */
   .card-deal.js-tilt:hover, .card.js-tilt:hover, .stat.js-tilt:hover, .card--cut.js-tilt:hover { transform: perspective(800px) rotateX(var(--rx,0)) rotateY(var(--ry,0)); }
@@ -4061,9 +4065,9 @@ ${termsGate ? `<noscript><div class="card" style="position:fixed;left:16px;right
       var r=t.getBoundingClientRect(),
       x=(e.clientX-r.left)/r.width-.5,y=(e.clientY-r.top)/r.height-.5;
       t.classList.add('is-tilting');
-      t.style.setProperty('--rx',(-y*8).toFixed(2)+'deg');  /* ±4 deg max */
-      t.style.setProperty('--ry',( x*8).toFixed(2)+'deg');
-      t.style.setProperty('--gx',(x*130)+'px');t.style.setProperty('--gy',(y*130)+'px');
+      t.style.setProperty('--rx',(-y*3.4).toFixed(2)+'deg');  /* ±1.7 deg max — subtle */
+      t.style.setProperty('--ry',( x*3.4).toFixed(2)+'deg');
+      t.style.setProperty('--gx',(x*80)+'px');t.style.setProperty('--gy',(y*80)+'px');
     });
     t.addEventListener('pointerleave',function(){
       t.classList.remove('is-tilting');
@@ -4523,6 +4527,20 @@ function dealBuyerId(deal) {
   }
   return null;
 }
+/** The SELLER company id for a deal — the party that ships the goods and therefore owns
+ *  shipment-status updates. Sell deal: the owner sells. Buy deal (tender): the contracted
+ *  counterparty sells to the owner. Returns null before a counterparty is contracted. */
+function dealSellerId(deal) {
+  if (!deal) return null;
+  const t = DEAL_TYPES.includes(deal.deal_type) ? deal.deal_type : 'sell';
+  return t === 'buy' ? dealBuyerId(deal) : deal.company_id;
+}
+/** The assigned shipping company for a deal (accepted shipping bid), or null. */
+function dealShipper(deal) {
+  if (!deal) return null;
+  return db.prepare(`SELECT b.company_id, c.name FROM shipping_bids b JOIN companies c ON c.id = b.company_id
+                     WHERE b.deal_id = ? AND b.status = 'accepted' LIMIT 1`).get(deal.id) || null;
+}
 /** Themed gold shipment stepper (open → production → dispatched → shipped → delivered).
  *  Commission-gated deals (payment_status pending_payment/paid) behave differently: the stepper
  *  tracks the post-contract SHIPMENT progress instead of forcing all-done, and while the payment
@@ -4933,10 +4951,10 @@ function currentUser(req) {
       } else {
         const c = db.prepare('SELECT id, name, status, lang, license_expiry FROM companies WHERE id = ?').get(sess.company_id);
         if (c && c.status === 'approved') {
-          // Sub-account session: resolve the member (must still be active) and attach attribution info.
+          // Sub-account session: resolve the member (must still be active) and attach attribution info + owner-set permissions.
           if (sess.member_id) {
-            const m = db.prepare(`SELECT id, name, role, status FROM company_members WHERE id = ? AND company_id = ?`).get(sess.member_id, c.id);
-            if (m && m.status === 'active') user = { id: c.id, name: c.name, isAdmin: false, memberId: m.id, memberName: m.name, memberRole: m.role, lang: c.lang || 'en', licenseExpiry: c.license_expiry || '' };
+            const m = db.prepare(`SELECT id, name, role, status, can_sign, can_post_deals, can_loi FROM company_members WHERE id = ? AND company_id = ?`).get(sess.member_id, c.id);
+            if (m && m.status === 'active') user = { id: c.id, name: c.name, isAdmin: false, memberId: m.id, memberName: m.name, memberRole: m.role, memberCanSign: !!m.can_sign, memberCanPostDeals: !!m.can_post_deals, memberCanLoi: !!m.can_loi, lang: c.lang || 'en', licenseExpiry: c.license_expiry || '' };
           } else {
             user = { id: c.id, name: c.name, isAdmin: false, lang: c.lang || 'en', licenseExpiry: c.license_expiry || '' };
           }
@@ -4946,6 +4964,20 @@ function currentUser(req) {
   }
   _reqUserMemo.set(req, user);
   return user;
+}
+/** Sub-account authority — owners and admins may do everything; members are limited by
+ *  the owner-set toggles on their account ('sign' | 'postDeals' | 'loi'). */
+function memberAllowed(user, perm) {
+  if (!user || !user.memberId) return true;
+  if (perm === 'sign') return !!user.memberCanSign;
+  if (perm === 'postDeals') return !!user.memberCanPostDeals;
+  if (perm === 'loi') return !!user.memberCanLoi;
+  return true;
+}
+/** 403 page + audit for a member acting beyond their owner-granted authority. */
+function memberDenied(req, res, what) {
+  audit('TEAM AGENT', 'member permission guard', 'fail', `Member ${req.user.memberName} (${req.user.name}) tried to ${what} without the owner's permission`);
+  return res.status(403).send(page('Forbidden', `<div class="card"><h2>403 — Not permitted</h2><p class="muted">Your company owner has not given your account permission to ${what}. Ask the main account holder to enable it under Profile → Team.</p></div>`, req.user));
 }
 /** Paths a company may POST to even when their T&C agreement is stale (else they could never re-agree or log out). */
 const TERMS_STALE_POST_WHITELIST = new Set(['/terms/agree', '/logout', '/lang', '/license-renew']);
@@ -5856,7 +5888,7 @@ function feedCard(item, user, names, idx, socCache) {
   const contractBadge = (item.kind !== 'post' && item.contract_state === 'approved')
     ? `<div style="margin-top:10px"><span class="badge badge-contract">Contract approved ✓${item.contract_party ? ' (with ' + esc(item.contract_party) + ')' : ''}</span></div>` : '';
 
-  const signBtn = (item.kind !== 'post' && user && !user.isAdmin && !isOwn && item.company_id !== user.id && item.contract_state !== 'approved')
+  const signBtn = (item.kind !== 'post' && user && !user.isAdmin && !isOwn && item.company_id !== user.id && item.contract_state !== 'approved' && memberAllowed(user, 'loi'))
     ? `<a class="btn btn-sm btn-green" href="/deal/${targetId}/loi">${esc(t(lang, 'feed.loi'))}</a>` : '';
   const repostBtn = (item.kind !== 'post' && user && !user.isAdmin && item.orig_company !== user.id && item.company_id !== user.id)
     ? `<form method="POST" action="/repost/${targetId}"><button class="btn btn-sm btn-outline" type="submit">${esc(t(lang, 'feed.repost'))}</button></form>` : '';
@@ -6004,6 +6036,7 @@ app.get('/deals/new', requireCompany, (req, res) => {
 });
 
 app.post('/deals', requireCompany, dealUpload, ah(async (req, res) => {
+  if (!memberAllowed(req.user, 'postDeals')) return memberDenied(req, res, 'post deals');
   const title = String(req.body.title || '').trim();
   const desc = String(req.body.description || '').trim();
   const value = String(req.body.value || '').trim().slice(0, 80);
@@ -7439,7 +7472,9 @@ app.get('/deal/:id', requireCompanyOrAdmin, ah(async (req, res) => {
   const signBtn = !req.user.isAdmin && req.user.id !== deal.company_id && deal.contract_state !== 'approved'
     ? (myDealNeg
       ? `<a class="btn btn-green" href="/negotiation/${myDealNeg.id}">View negotiation ${statusBadge(myDealNeg.state)}</a>`
-      : `<a class="btn btn-green" href="/deal/${deal.id}/loi">Express interest (LOI)</a>`) : '';
+      : (memberAllowed(req.user, 'loi')
+        ? `<a class="btn btn-green" href="/deal/${deal.id}/loi">Express interest (LOI)</a>`
+        : `<p class="muted" style="margin:0">🔒 Your company owner has not given your account permission to send LOIs.</p>`)) : '';
 
   // ---- Commission payment gate card (finalized deals only; parties + admin — amounts stay private) ----
   let paymentHtml = '';
@@ -7509,14 +7544,30 @@ app.get('/deal/:id', requireCompanyOrAdmin, ah(async (req, res) => {
         ${deal.tracking_url ? ` · <a href="${esc(deal.tracking_url)}" rel="noopener noreferrer nofollow">Track shipment →</a>` : ''}</p>` : '';
     const note = deal.status_note ? `<p class="muted" style="margin-top:8px">📝 ${esc(deal.status_note)}</p>` : '';
     // Commission gate: finalized deals stay locked until payment_status='paid'; legacy deals keep the old rule.
-    const canUpdate = (isOwner || isBuyer || req.user.isAdmin)
+    // Who may drive the pipeline: the SELLER always; the assigned shipping company for shipped/delivered;
+    // the admin as back office. The buyer watches but never updates.
+    const sellerId = dealSellerId(deal);
+    const isSeller = !req.user.isAdmin && !req.user.isPerson && !!sellerId && sellerId === req.user.id;
+    const shipperRow = dealShipper(deal);
+    const isShipper = !req.user.isAdmin && !req.user.isPerson && !!shipperRow && shipperRow.company_id === req.user.id;
+    const canDrive = isSeller || isShipper || req.user.isAdmin;
+    const canUpdate = canDrive
       && (paymentGateApplies(deal) ? deal.payment_status === 'paid' : (deal.contract_state !== 'approved' && deal.status !== 'closed'));
+    // Role-filtered status choices mirror the POST guard (defense in depth, same rules).
+    const curStatus = DEAL_STATUSES.includes(deal.status) ? deal.status : 'open';
+    let allowedStatuses = DEAL_STATUSES;
+    if (!req.user.isAdmin) {
+      if (isShipper && !isSeller) allowedStatuses = ['shipped', 'delivered'];
+      else if (isSeller && shipperRow && !isShipper) allowedStatuses = DEAL_STATUSES.filter(s => s !== 'shipped' && s !== 'delivered');
+    }
+    const watcherNote = (!canDrive && (isOwner || isBuyer)) ? `
+      <p class="muted" style="margin-top:10px">🛡️ Only the seller updates the shipment status${shipperRow ? ` — with a shipping company assigned, <b>${esc(shipperRow.name)}</b> is the only one who marks it shipped or delivered` : ''}.</p>` : '';
     const updateForm = canUpdate ? `
       <hr class="sep">
-      <h4 style="margin-bottom:8px">Advance status</h4>
+      <h4 style="margin-bottom:8px">Advance status${isShipper && !isSeller ? ' <span class="muted" style="font-weight:400">· you are the assigned shipping company</span>' : ''}</h4>
       <form method="POST" action="/deal/${deal.id}/status">
         <label>New status</label>
-        <select name="status">${optionsHtml(DEAL_STATUSES, DEAL_STATUSES.includes(deal.status) ? deal.status : 'open')}</select>
+        <select name="status">${optionsHtml(allowedStatuses, allowedStatuses.includes(curStatus) ? curStatus : allowedStatuses[0])}</select>
         <div class="grid2" style="gap:10px">
           <div><label>Tracking number (optional)</label><input type="text" name="tracking_number" maxlength="120" value="${esc(deal.tracking_number || '')}"></div>
           <div><label>Tracking URL (optional, https://)</label><input type="url" name="tracking_url" maxlength="300" value="${esc(deal.tracking_url || '')}" placeholder="https://carrier.example/track/…"></div>
@@ -7526,8 +7577,8 @@ app.get('/deal/:id', requireCompanyOrAdmin, ah(async (req, res) => {
           <div><label>Origin pin (optional, lat,lng)</label><input type="text" name="origin_pin" maxlength="60" placeholder="e.g. ${deal.origin_lat != null && deal.origin_lng != null ? esc(deal.origin_lat + ',' + deal.origin_lng) : '25.2048,55.2708'}"></div>
           <div><label>Destination pin (optional, lat,lng)</label><input type="text" name="dest_pin" maxlength="60" placeholder="e.g. ${deal.dest_lat != null && deal.dest_lng != null ? esc(deal.dest_lat + ',' + deal.dest_lng) : '51.5074,-0.1278'}"></div>
         </div>
-        ${isOwner ? `<div class="grid2" style="gap:10px">
-          <div><label>Deduct from warehouse on delivery (optional)</label><select name="stockout_item"><option value="">— no stock change —</option>${db.prepare('SELECT id, sku, name, quantity, unit FROM warehouse_items WHERE company_id = ? ORDER BY name LIMIT 100').all(deal.company_id).map(wi => `<option value="${wi.id}"${deal.warehouse_item_id === wi.id ? ' selected' : ''}>${esc(wi.sku)} — ${esc(wi.name)} (${fmtAmount(wi.quantity)} ${esc(wi.unit)})${deal.warehouse_item_id === wi.id ? ' 🔗 linked to this deal' : ''}</option>`).join('')}</select></div>
+        ${isSeller ? `<div class="grid2" style="gap:10px">
+          <div><label>Deduct from warehouse on delivery (optional)</label><select name="stockout_item"><option value="">— no stock change —</option>${db.prepare('SELECT id, sku, name, quantity, unit FROM warehouse_items WHERE company_id = ? ORDER BY name LIMIT 100').all(req.user.id).map(wi => `<option value="${wi.id}"${deal.warehouse_item_id === wi.id ? ' selected' : ''}>${esc(wi.sku)} — ${esc(wi.name)} (${fmtAmount(wi.quantity)} ${esc(wi.unit)})${deal.warehouse_item_id === wi.id ? ' 🔗 linked to this deal' : ''}</option>`).join('')}</select></div>
           <div><label>Quantity to deduct</label><input type="number" name="stockout_qty" min="0" step="any" placeholder="0" inputmode="decimal" value="${deal.warehouse_item_id && deal.cargo_qty ? String(deal.cargo_qty) : ''}"></div>
         </div>
         <p class="muted" style="margin:-6px 0 10px">When you set the status to <b>delivered</b>, the chosen quantity is booked out of your warehouse automatically (reason: Sale / delivery, linked to this deal).</p>` : ''}
@@ -7538,6 +7589,7 @@ app.get('/deal/:id', requireCompanyOrAdmin, ah(async (req, res) => {
       <h3>📦 Deal status <span class="muted" style="font-weight:400">· ${esc(deal.incoterm || 'CIF')} terms</span></h3>
       ${stepperHtml(deal)}
       ${tracking}${note}
+      ${watcherNote}
       ${updateForm}
     </div>`;
   }
@@ -7694,7 +7746,7 @@ app.get('/deal/:id', requireCompanyOrAdmin, ah(async (req, res) => {
   }
 
   const body = `
-  <div class="card card-deal js-tilt">
+  <div class="card card-deal">
     <div class="card__glare" aria-hidden="true"></div>
     <div class="feed-head"><h2>${esc(deal.title)}</h2>
       ${dealValueHtml}</div>
@@ -7738,9 +7790,15 @@ app.post('/deal/:id/status', (req, res) => {
   const isOwner = !user.isAdmin && !user.isPerson && user.id === deal.company_id;
   const buyerId = dealBuyerId(deal);
   const isBuyer = !user.isAdmin && !user.isPerson && buyerId === user.id;
-  if (!user.isAdmin && !isOwner && !isBuyer) {
-    audit('DEAL AGENT', 'status update guard', 'fail', `${user.name} attempted to update status on deal #${deal.id} without being a party`);
-    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Parties only</h2><p class="muted">Only the deal owner, the contracted buyer and the admin can advance the deal status.</p></div>', user));
+  // Shipment status is the SELLER's job — the buyer watches but never updates.
+  // Once a shipping bid is accepted, ONLY the assigned shipping company marks shipped / delivered.
+  const sellerId = dealSellerId(deal);
+  const isSeller = !user.isAdmin && !user.isPerson && !!sellerId && sellerId === user.id;
+  const shipper = dealShipper(deal);
+  const isShipper = !user.isAdmin && !user.isPerson && !!shipper && shipper.company_id === user.id;
+  if (!user.isAdmin && !isSeller && !isShipper) {
+    audit('DEAL AGENT', 'status update guard', 'fail', `${user.name} attempted to update status on deal #${deal.id} — only the seller (or the assigned shipping company for shipped/delivered) may do that`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Seller only</h2><p class="muted">Only the seller updates the shipment status. Once a shipping bid is accepted, the assigned shipping company is the only one who can mark the deal shipped or delivered.</p></div>', user));
   }
   // Commission gate: finalized deals are locked until the admin approves the commission payment.
   if (deal.payment_status === 'pending_payment') {
@@ -7753,6 +7811,19 @@ app.post('/deal/:id/status', (req, res) => {
   const newStatus = String(req.body.status || '');
   if (!DEAL_STATUSES.includes(newStatus)) {
     return res.redirect(back + '?err=' + encodeURIComponent('Invalid status. Choose one of: ' + DEAL_STATUSES.join(', ') + '.'));
+  }
+  // Role gates on the two transport legs (admin is the back-office exception):
+  //  · the assigned shipping company may ONLY mark shipped / delivered;
+  //  · the seller may NOT mark shipped / delivered while a shipping company is assigned.
+  if (!user.isAdmin) {
+    if (isShipper && !isSeller && newStatus !== 'shipped' && newStatus !== 'delivered') {
+      audit('DEAL AGENT', 'status update guard', 'fail', `${user.name} (shipping company) tried to set deal ${deal.deal_number || '#' + deal.id} to "${newStatus}" — shippers only mark shipped/delivered`);
+      return res.redirect(back + '?err=' + encodeURIComponent('As the assigned shipping company you can only mark this deal shipped or delivered.'));
+    }
+    if (isSeller && !isShipper && shipper && (newStatus === 'shipped' || newStatus === 'delivered')) {
+      audit('DEAL AGENT', 'status update guard', 'fail', `${user.name} (seller) tried to set deal ${deal.deal_number || '#' + deal.id} to "${newStatus}" while ${shipper.name} is the assigned shipper`);
+      return res.redirect(back + '?err=' + encodeURIComponent(`${shipper.name} is the assigned shipping company for this deal — only they can mark it shipped or delivered.`));
+    }
   }
   const note = String(req.body.status_note || '').trim().slice(0, 300);
   let trackingNumber = String(req.body.tracking_number || '').trim().slice(0, 120);
@@ -7783,7 +7854,7 @@ app.post('/deal/:id/status', (req, res) => {
   } catch (e) { /* pin update is best-effort — never break the status update */ }
   // WAREHOUSE CONNECTION: delivering can book stock out of the seller's warehouse automatically.
   let stockMsg = '';
-  if (newStatus === 'delivered' && isOwner) {
+  if (newStatus === 'delivered' && isSeller) {
     try {
       const wiId = parseInt(req.body.stockout_item, 10) || 0;
       const wiQty = parseFloat(req.body.stockout_qty) || 0;
@@ -7804,10 +7875,10 @@ app.post('/deal/:id/status', (req, res) => {
   // Payment-milestone hook: reaching an agreed milestone's stage raises an admin release request.
   try { triggerMilestoneReleases(deal, newStatus, user); } catch (e) { /* never break the status update */ }
   audit('DEAL AGENT', 'status update', 'pass', `${user.isAdmin ? 'Admin' : user.name} advanced deal ${deal.deal_number || '#' + deal.id} to "${newStatus}"${note ? ` — note: ${note}` : ''}${trackingNumber ? ` — tracking ${trackingNumber}` : ''}`);
-  // Notify the other party (admin updates notify both parties).
+  // Notify the parties (admin updates notify both; the acting party never notifies itself).
   const label = `${user.isAdmin ? 'The platform' : user.name} updated deal ${deal.deal_number || '#' + deal.id} ("${deal.title}") to "${newStatus.toUpperCase()}"${note ? ` — ${note}` : ''}`;
-  if (user.isAdmin || isBuyer) notify(deal.company_id, 'deal_status', label, `/deal/${deal.id}`);
-  if (user.isAdmin || isOwner) { if (buyerId) notify(buyerId, 'deal_status', label, `/deal/${deal.id}`); }
+  if (user.isAdmin || !isOwner) notify(deal.company_id, 'deal_status', label, `/deal/${deal.id}`);
+  if (user.isAdmin || !isBuyer) { if (buyerId) notify(buyerId, 'deal_status', label, `/deal/${deal.id}`); }
   res.redirect(back + '?msg=' + encodeURIComponent(`Deal status updated to "${newStatus}".${stockMsg}`));
 });
 
@@ -8510,6 +8581,7 @@ app.get('/deal/:id/sign', (req, res) => {
 
 // ----- Signing step 1: AUTHENTICATION AGENT re-verifies the signer, then issues a signing OTP -----
 app.post('/deal/:id/sign', requireCompany, (req, res) => {
+  if (!memberAllowed(req.user, 'sign')) return memberDenied(req, res, 'sign contracts');
   const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
   if (!deal) return res.redirect('/timeline?err=' + encodeURIComponent('Deal not found.'));
 
@@ -8620,6 +8692,7 @@ app.get('/deal/:id/sign/verify', requireCompany, (req, res) => {
 });
 
 app.post('/deal/:id/sign/verify', requireCompany, (req, res) => {
+  if (!memberAllowed(req.user, 'sign')) return memberDenied(req, res, 'sign contracts');
   const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
   if (!deal) return res.redirect('/timeline?err=' + encodeURIComponent('Deal not found.'));
   const code = String(req.body.code || '').trim();
@@ -8942,6 +9015,7 @@ app.get('/deals/inbox', requireCompany, (req, res) => {
 
 // ----- Owner decisions on contracts (party-only: the deal owner) -----
 app.post('/contracts/:id/owner-approve', requireCompany, (req, res) => {
+  if (!memberAllowed(req.user, 'sign')) return memberDenied(req, res, 'approve contracts');
   const ct = db.prepare('SELECT * FROM contracts WHERE id = ?').get(parseInt(req.params.id, 10));
   if (!ct || ct.owner_company_id !== req.user.id) {
     return res.redirect('/deals/inbox?err=' + encodeURIComponent('Contract not found.'));
@@ -9166,6 +9240,7 @@ function milestoneFormRowsHtml(prefill) {
 
 // ----- LOI (Letter of Intent): the buyer's entry point into the pipeline -----
 app.get('/deal/:id/loi', requireCompany, (req, res) => {
+  if (!memberAllowed(req.user, 'loi')) return memberDenied(req, res, 'send LOIs');
   const deal = getDealOr404(req, res);
   if (!deal) return;
   if (deal.company_id === req.user.id) {
@@ -9207,6 +9282,7 @@ app.get('/deal/:id/loi', requireCompany, (req, res) => {
 });
 
 app.post('/deal/:id/loi', requireCompany, (req, res) => {
+  if (!memberAllowed(req.user, 'loi')) return memberDenied(req, res, 'send LOIs');
   const deal = db.prepare('SELECT * FROM deals WHERE id = ?').get(parseInt(req.params.id, 10));
   if (!deal) return res.redirect('/timeline?err=' + encodeURIComponent('Deal not found.'));
   if (deal.company_id === req.user.id) {
@@ -9810,6 +9886,7 @@ app.get('/contracts', requireCompany, (req, res) => {
 
 // ----- Create: POST /contracts -----
 app.post('/contracts', requireCompany, (req, res) => {
+  if (!memberAllowed(req.user, 'sign')) return memberDenied(req, res, 'create contracts');
   const recipientId = parseInt(req.body.recipient, 10);
   const title = String(req.body.title || '').trim().slice(0, 160);
   const terms = String(req.body.terms || '').trim().slice(0, 4000);
@@ -9996,6 +10073,7 @@ function loadPcOtpContext(req, pcId) {
 
 // ----- Recipient signing step 1: password + declarations, then a signing OTP -----
 app.post('/contracts/:id/sign', requireCompany, (req, res) => {
+  if (!memberAllowed(req.user, 'sign')) return memberDenied(req, res, 'sign contracts');
   const pc = getPrivateContract(req.params.id);
   if (!pc) return res.redirect('/contracts?err=' + encodeURIComponent('Contract not found.'));
   if (pc.recipient_company_id !== req.user.id) {
@@ -10068,6 +10146,7 @@ app.get('/contracts/:id/sign/verify', requireCompany, (req, res) => {
 });
 
 app.post('/contracts/:id/sign/verify', requireCompany, (req, res) => {
+  if (!memberAllowed(req.user, 'sign')) return memberDenied(req, res, 'sign contracts');
   const pc = getPrivateContract(req.params.id);
   if (!pc) return res.redirect('/contracts?err=' + encodeURIComponent('Contract not found.'));
   if (pc.recipient_company_id !== req.user.id) {
@@ -10185,7 +10264,8 @@ app.get('/new', requireCompany, (req, res) => {
     <p class="muted">Deals carry a value and can be signed into contracts; feed posts keep the network warm.</p>
   </div>
   <div class="grid2">
-    <div class="card card-deal create-card js-tilt">
+    ${memberAllowed(req.user, 'postDeals') ? `
+    <div class="card card-deal create-card">
       <div class="card__glare" aria-hidden="true"></div>
       <div class="big-ic">📄</div>
       <h2>Post a deal</h2>
@@ -10195,7 +10275,12 @@ app.get('/new', requireCompany, (req, res) => {
         <label>Photo or video (optional — image ≤ 5 MB, video ≤ 25 MB)</label>${mediaInput}
         <button class="btn js-magnet" type="submit">Publish deal</button>
       </form>
-    </div>
+    </div>` : `
+    <div class="card create-card">
+      <div class="big-ic">🔒</div>
+      <h2>Post a deal</h2>
+      <p class="muted">Your company owner has not given your account permission to post deals. Ask the main account holder to enable it under Profile → Team.</p>
+    </div>`}
     <div class="card create-card">
       <div class="big-ic">💬</div>
       <h2>Post a feed</h2>
@@ -10206,7 +10291,7 @@ app.get('/new', requireCompany, (req, res) => {
         <button class="btn" type="submit">Post update</button>
       </form>
     </div>
-    <div class="card create-card js-tilt">
+    <div class="card create-card">
       <div class="big-ic">📣</div>
       <h2>Promote</h2>
       <p class="muted">The ADVERTISING AGENT drafts a polished marketing post for your product or service — you review, edit and publish it.</p>
@@ -10449,16 +10534,26 @@ function teamSectionHtml(user, company) {
       Only the main company account can manage the team.</p></div>`;
   }
   const members = db.prepare('SELECT * FROM company_members WHERE company_id = ? ORDER BY created_at ASC').all(company.id);
+  const permBadge = (on, label) => `<span class="badge ${on ? 'badge-pass' : 'badge-rejected'}">${label}: ${on ? 'yes' : 'no'}</span>`;
   const rows = members.length ? members.map(m => `
-    <div class="feed-head" style="padding:8px 0;border-top:1px dashed var(--border-soft)">
-      <div>${avatarHtml(m.name, null)}<b>${esc(m.name)}</b> <span class="badge ${m.status === 'active' ? 'badge-pass' : 'badge-rejected'}">${esc(m.status)}</span>
-        <span class="badge badge-sealed">${esc(m.role)}</span><br>
-        <span class="muted" style="margin-left:42px">${esc(m.email)} · added ${esc(m.created_at.slice(0, 10))}</span></div>
-      ${m.status === 'active' ? `<form method="POST" action="/profile/team/${m.id}/deactivate" onsubmit="return confirm('Deactivate this team member? Their sessions are revoked.')"><button class="btn btn-sm btn-danger" type="submit">Deactivate</button></form>` : ''}
+    <div style="padding:10px 0;border-top:1px dashed var(--border-soft)">
+      <div class="feed-head">
+        <div>${avatarHtml(m.name, null)}<b>${esc(m.name)}</b> <span class="badge ${m.status === 'active' ? 'badge-pass' : 'badge-rejected'}">${esc(m.status)}</span>
+          <span class="badge badge-sealed">${esc(m.role)}</span><br>
+          <span class="muted" style="margin-left:42px">${esc(m.email)} · added ${esc(m.created_at.slice(0, 10))}</span></div>
+        ${m.status === 'active' ? `<form method="POST" action="/profile/team/${m.id}/deactivate" onsubmit="return confirm('Deactivate this team member? Their sessions are revoked.')"><button class="btn btn-sm btn-danger" type="submit">Deactivate</button></form>` : ''}
+      </div>
+      <div style="margin:6px 0 8px 42px">${permBadge(!!m.can_sign, '✍️ sign contract')} ${permBadge(!!m.can_post_deals, '📄 post deals')} ${permBadge(!!m.can_loi, '📨 send LOI')}</div>
+      ${m.status === 'active' ? `<form method="POST" action="/profile/team/${m.id}/perms" style="margin-left:42px;display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+        <div><label>Sign contract</label><select name="can_sign">${optionsHtml(['yes', 'no'], m.can_sign ? 'yes' : 'no')}</select></div>
+        <div><label>Post deals</label><select name="can_post_deals">${optionsHtml(['yes', 'no'], m.can_post_deals ? 'yes' : 'no')}</select></div>
+        <div><label>Send LOI</label><select name="can_loi">${optionsHtml(['yes', 'no'], m.can_loi ? 'yes' : 'no')}</select></div>
+        <button class="btn btn-sm" type="submit">Save permissions</button>
+      </form>` : ''}
     </div>`).join('') : '<p class="muted">No team members yet.</p>';
   return `<div class="card" data-reveal>
     <h3>👥 Team — sub-accounts</h3>
-    <p class="muted">Team members sign in with their own email &amp; password and act as <b>${esc(company.name)}</b> — posts, deals, chats and signatures show a "— by {name}" attribution. Members cannot manage the team or edit the profile.</p>
+    <p class="muted">Team members sign in with their own email &amp; password and act as <b>${esc(company.name)}</b> — posts, deals, chats and signatures show a "— by {name}" attribution. Members cannot manage the team or edit the profile. <b>You set each member's authority</b>: signing contracts, posting deals and sending LOIs can each be switched yes/no per member.</p>
     ${rows}
     <hr class="sep">
     <h4 style="margin-bottom:8px">Add a team member</h4>
@@ -10471,8 +10566,13 @@ function teamSectionHtml(user, company) {
         <div><label>Password (min 8 characters)</label><input type="password" name="password" required minlength="8"></div>
         <div><label>Role</label><select name="role">${optionsHtml(['member', 'manager'], 'member')}</select></div>
       </div>
+      <div class="grid2" style="gap:10px">
+        <div><label>Sign contract</label><select name="can_sign">${optionsHtml(['yes', 'no'], 'yes')}</select></div>
+        <div><label>Post deals</label><select name="can_post_deals">${optionsHtml(['yes', 'no'], 'yes')}</select></div>
+        <div><label>Send LOI</label><select name="can_loi">${optionsHtml(['yes', 'no'], 'yes')}</select></div>
+      </div>
       <button class="btn" type="submit">Add member</button>
-      <p class="muted" style="margin-top:6px">Member sign-in is protected by the same 2FA email codes. All member logins are audit-logged.</p>
+      <p class="muted" style="margin-top:6px">Member sign-in is protected by the same 2FA email codes. All member logins and every denied action are audit-logged.</p>
     </form>
   </div>`;
 }
@@ -10487,6 +10587,9 @@ app.post('/profile/team/add', requireCompany, (req, res) => {
   const email = String(req.body.email || '').trim().toLowerCase().slice(0, 200);
   const pw = String(req.body.password || '');
   const role = req.body.role === 'manager' ? 'manager' : 'member';
+  const canSign = req.body.can_sign === 'no' ? 0 : 1;
+  const canPostDeals = req.body.can_post_deals === 'no' ? 0 : 1;
+  const canLoi = req.body.can_loi === 'no' ? 0 : 1;
   if (!name || !email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
     return res.redirect('/profile?err=' + encodeURIComponent('Name and a valid member email are required.'));
   }
@@ -10495,10 +10598,27 @@ app.post('/profile/team/add', requireCompany, (req, res) => {
     return res.redirect('/profile?err=' + encodeURIComponent('That email is already in use on Dealzoin.'));
   }
   const salt = newSalt();
-  db.prepare('INSERT INTO company_members (company_id, name, email, password_hash, salt, role, status, created_at) VALUES (?,?,?,?,?,?,?,?)')
-    .run(req.user.id, name, email, hashPassword(pw, salt), salt, role, 'active', now());
-  audit('TEAM AGENT', 'member added', 'pass', `${req.user.name} added team member ${name} <${email}> (role: ${role})`);
+  db.prepare('INSERT INTO company_members (company_id, name, email, password_hash, salt, role, status, can_sign, can_post_deals, can_loi, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+    .run(req.user.id, name, email, hashPassword(pw, salt), salt, role, 'active', canSign, canPostDeals, canLoi, now());
+  audit('TEAM AGENT', 'member added', 'pass', `${req.user.name} added team member ${name} <${email}> (role: ${role}, sign: ${canSign ? 'yes' : 'no'}, deals: ${canPostDeals ? 'yes' : 'no'}, loi: ${canLoi ? 'yes' : 'no'})`);
   res.redirect('/profile?msg=' + encodeURIComponent(`Team member ${name} added. They can sign in with their own email & password.`));
+});
+
+/** POST /profile/team/:id/perms — the main account updates a member's authority toggles. */
+app.post('/profile/team/:id/perms', requireCompany, (req, res) => {
+  if (req.user.memberId) {
+    audit('TEAM AGENT', 'member perms guard', 'fail', `Member ${req.user.memberName} attempted to change team permissions of ${req.user.name}`);
+    return res.status(403).send(page('Forbidden', '<div class="card"><h2>403 — Only the main company account can manage the team.</h2></div>', req.user));
+  }
+  const m = db.prepare('SELECT * FROM company_members WHERE id = ? AND company_id = ?').get(parseInt(req.params.id, 10), req.user.id);
+  if (!m) return res.redirect('/profile?err=' + encodeURIComponent('Team member not found.'));
+  const canSign = req.body.can_sign === 'no' ? 0 : 1;
+  const canPostDeals = req.body.can_post_deals === 'no' ? 0 : 1;
+  const canLoi = req.body.can_loi === 'no' ? 0 : 1;
+  db.prepare('UPDATE company_members SET can_sign = ?, can_post_deals = ?, can_loi = ? WHERE id = ?')
+    .run(canSign, canPostDeals, canLoi, m.id);
+  audit('TEAM AGENT', 'member permissions updated', 'pass', `${req.user.name} set permissions for ${m.name} <${m.email}> — sign: ${canSign ? 'yes' : 'no'}, deals: ${canPostDeals ? 'yes' : 'no'}, loi: ${canLoi ? 'yes' : 'no'}`);
+  res.redirect('/profile?msg=' + encodeURIComponent(`Permissions updated for ${m.name} — applies on their next request (live sessions pick it up immediately).`));
 });
 
 app.post('/profile/team/:id/deactivate', requireCompany, (req, res) => {
